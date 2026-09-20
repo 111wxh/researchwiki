@@ -255,10 +255,12 @@ GLM-5.3 的上下文窗口为 200K tokens。（正文只写这一条事实）
 
 ### 阶段 6 · 打磨与开源（~10%，可压缩；Web 前端已在阶段 1 完成，不再是打磨项）
 
-- [ ] README：动图 demo、quickstart（陌生人 30 分钟内复现）、架构图、评测表
+- [x] README：quickstart（陌生人 30 分钟内复现）、架构图、评测表（2026-09-20 首版：定位与差异点、免 key 快速开始、阶段进度、关键设计；**动图 demo 与评测数字待评测阶段回填**）
+- [x] **Docker 一键部署（两档：mock 零 key 演示 / 完整接真模型 + wiki 持久化）**（2026-09-20，提前完成：Dockerfile + web/Dockerfile(standalone) + docker-compose.yml + docker-compose.full.yml + .env.example；本机未构建镜像验证，首次部署时需实测）
+- [x] MIT 协议 + GitHub 公开仓库（2026-09-20：https://github.com/111wxh/researchwiki）
 - [ ] MCP server 发布说明（`uvx` 一键安装进 Claude Code 的配置片段）
 - [ ] 博文一篇：讲 harness 设计（compaction / 三层记忆 / 对账），带评测数字
-- [ ] License、示例 wiki 数据（脱敏小样例）、FAQ
+- [ ] 示例 wiki 数据（脱敏小样例）、FAQ、CI（GitHub Actions 跑 pytest + ruff）
 - [ ] 安全合规检查：抓取遵守 robots.txt 与限速；API key 走 .env 且不入库；示例数据脱敏；MCP server 仅监听本地
 
 **验收**：发到社交平台/社区，附 demo；收到至少 1 个外部用户跑通反馈。

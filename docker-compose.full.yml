@@ -1,0 +1,52 @@
+# 完整模式：接真实模型（OpenAI 兼容协议），跑真实 agent loop
+#
+# 准备三步：
+#   1. 在 config.toml 填好 [llm.strong] / [llm.cheap] 的 model 与 base_url
+#      （base_url 留空会回退 mock，等于白跑）
+#   2. 在项目根目录建 .env，写入 key（变量名见 .env.example）
+#   3. docker compose -f docker-compose.full.yml up --build
+#
+# 与 mock 版的差别：RESEARCHWIKI_MODE=real 覆盖配置里的 mode，挂载你自己的 config.toml，
+# 并把 wiki-data/ 挂出来持久化——wiki 沉淀的研究成果重启不丢。
+
+services:
+  backend:
+    build: .
+    image: researchwiki-backend:latest
+    environment:
+      RESEARCHWIKI_MODE: real
+      RESEARCHWIKI_HOST: 0.0.0.0
+      RESEARCHWIKI_CORS_ORIGINS: "*"
+      # strong 档 key 必填；其余缺省时对应能力自动降级（cheap 复用 strong、搜索回退 mock）
+      RESEARCHWIKI_STRONG_API_KEY: ${RESEARCHWIKI_STRONG_API_KEY:?请在 .env 中设置 RESEARCHWIKI_STRONG_API_KEY}
+      RESEARCHWIKI_CHEAP_API_KEY: ${RESEARCHWIKI_CHEAP_API_KEY:-}
+      RESEARCHWIKI_EMBEDDING_API_KEY: ${RESEARCHWIKI_EMBEDDING_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./wiki-data:/app/wiki-data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    image: researchwiki-web:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy

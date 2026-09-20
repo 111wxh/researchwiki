@@ -1,0 +1,43 @@
+# Mock 演示模式：零配置、零 API key，两条命令看到完整交互
+#
+#   docker compose up --build
+#
+# 然后打开 http://localhost:3000 输入研究问题（如「agent 记忆方案对比」）。
+# 数据完全由脚本化 mock 生成，不联网、不花钱，用于快速看前端交互与事件协议。
+#
+# 接真实模型请用：docker compose -f docker-compose.full.yml up --build
+
+services:
+  backend:
+    build: .
+    image: researchwiki-backend:latest
+    environment:
+      RESEARCHWIKI_HOST: 0.0.0.0
+      # 本服务无鉴权、无 cookie；自托管演示放开来源限制，避免换端口/域名后跨域被拦
+      RESEARCHWIKI_CORS_ORIGINS: "*"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: ./web
+      args:
+        # 浏览器侧访问后端的地址。本机部署用 localhost；
+        # 部署到服务器时改成 http://<域名或IP>:8000（构建期注入，改完要重新 build）
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    image: researchwiki-web:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy

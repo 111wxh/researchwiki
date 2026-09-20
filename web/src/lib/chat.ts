@@ -24,7 +24,10 @@ export interface ConflictData {
   action: string;
 }
 
-export const BACKEND_URL = "http://localhost:8000/api/chat";
+/** 后端地址：本地开发直连 8000；容器/远程部署用 NEXT_PUBLIC_API_URL 覆盖（构建期注入）。 */
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+export const BACKEND_URL = `${API_BASE}/api/chat`;
 
 export function useResearchChat() {
   return useChat({

@@ -8,7 +8,33 @@
 
 ## 快速开始
 
-无需任何 API key：仓库自带 **mock 模式**，用脚本化的假数据跑通完整链路，开箱即可看到全部交互。
+### 方式一：Docker（推荐，两条命令）
+
+**A. 演示模式** —— 零配置、零 API key、不联网、不花钱，数据全部由脚本化 mock 生成：
+
+```bash
+docker compose up --build
+```
+
+打开 http://localhost:3000 即可。适合快速看前端交互与完整事件流。
+
+**B. 完整模式** —— 接真实模型，跑真实 agent loop：
+
+```bash
+cp .env.example .env        # 填入 key
+# 并在 config.toml 里填好 [llm.strong] / [llm.cheap] 的 model 与 base_url
+docker compose -f docker-compose.full.yml up --build
+```
+
+完整模式会把 `config.toml` 和 `wiki-data/` 挂进容器：前者用你自己的模型配置，后者让 wiki 沉淀的研究成果**重启不丢**。
+
+部署到服务器时，把浏览器要访问的后端地址传进去（构建期注入）：
+
+```bash
+NEXT_PUBLIC_API_URL=http://<你的域名或IP>:8000 docker compose up --build
+```
+
+### 方式二：本地开发
 
 ```bash
 # 后端（需要 uv 与 Python 3.12+）
@@ -97,8 +123,14 @@ src/researchwiki/
 └── cli.py       开发用单命令入口（serve / lint / consolidate / arbitrate / serve-mcp）
 web/             Next.js 前端（流式输出、思考折叠、过程可视化、报告文档视图、wiki 面板）
 tests/           59 个离线测试
+Dockerfile             后端镜像（uv + Python 3.12）
+web/Dockerfile         前端镜像（next standalone 多阶段构建）
+docker-compose.yml         演示模式（mock，零 key）
+docker-compose.full.yml    完整模式（真实模型 + wiki 持久化）
 PLAN.md          完整设计文档与分阶段验收标准
 ```
+
+运行模式由 `config.toml` 的 `[server].mode` 决定，可被环境变量 `RESEARCHWIKI_MODE` 覆盖（容器部署用）。**mock 是默认值**——误配真模型配置也不会带着空 key 去联网，会安静地回退到 mock。
 
 ## 评测计划
 

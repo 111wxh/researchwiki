@@ -1,0 +1,20 @@
+# 后端构建上下文：只留 pyproject / uv.lock / src / config.toml / README
+.venv/
+.git/
+.gitignore
+.zcode/
+.zcodeignore
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+*.pyc
+
+wiki-data/
+docs/
+vendor/
+web/
+tokens.jsonl
+
+.env
+.env.local

@@ -27,9 +27,20 @@ from researchwiki.tools import get_search_provider
 
 app = FastAPI(title="ResearchWiki API")
 
+
+def _cors_origins() -> list[str]:
+    """允许的前端来源。默认只放本地；容器/远程部署用 RESEARCHWIKI_CORS_ORIGINS 覆盖
+    （逗号分隔，填 `*` 表示不限制来源——本服务无鉴权、无 cookie，自托管场景可接受）。"""
+    raw = os.environ.get(
+        "RESEARCHWIKI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    )
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins or ["http://localhost:3000"]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -85,9 +96,13 @@ def load_config() -> dict:
 
 
 def real_loop_enabled(config: dict) -> bool:
-    """mode="real" 且 strong 档 base_url 非空才走真实 loop，其余一律 mock。"""
+    """mode="real" 且 strong 档 base_url 非空才走真实 loop，其余一律 mock。
+
+    mode 可被环境变量 RESEARCHWIKI_MODE 覆盖——容器部署时不必改挂载的 config.toml。
+    """
     server_cfg = config.get("server") or {}
-    mode = str(server_cfg.get("mode") or "mock").strip().lower()
+    mode = os.environ.get("RESEARCHWIKI_MODE") or server_cfg.get("mode") or "mock"
+    mode = str(mode).strip().lower()
     if mode != "real":
         return False
     strong = (config.get("llm") or {}).get("strong") or {}
