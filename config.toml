@@ -27,3 +27,18 @@ api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
 [runtime]
 # 上下文超过窗口该比例触发 compaction（阶段 3）
 compaction_threshold = 0.7
+
+[embedding]
+# 检索索引的向量通道（OpenAI 兼容 POST {base_url}/embeddings）。
+# base_url 或 model 留空 = MockEmbeddingProvider：确定性 bigram 特征哈希，
+# 无需 key、零网络，测试与演示全链路可跑（与 llm 路由同一 skeleton-first 哲学）。
+model = ""                # 例："embedding-3"（智谱）或 "BAAI/bge-m3"（SiliconFlow）
+base_url = ""             # 例："https://open.bigmodel.cn/api/paas/v4"（不含 /embeddings）
+api_key_env = "RESEARCHWIKI_EMBEDDING_API_KEY"
+
+[wiki]
+# 关键词索引 tokenizer：auto（优先探测 vendor 的 simple+jieba 词库，失败退 trigram）|
+# simple | trigram。本地缓存命中嵌入向量存 wiki-data/index.db（与索引同库）。
+fts_tokenizer = "auto"
+# 新鲜度半衰期（天）：volatile 每 30 天检索分衰减一半，drifting 90 天，stable 不衰减
+half_life_days = { volatile = 30, drifting = 90 }

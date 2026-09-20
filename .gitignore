@@ -14,3 +14,6 @@ tokens.jsonl
 .env.local
 
 .zcode/
+
+# 可选分词扩展（16MB 二进制，不入库；需要时按 README 说明下载到 vendor/）
+vendor/

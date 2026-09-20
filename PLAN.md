@@ -219,10 +219,10 @@ GLM-5.3 的上下文窗口为 200K tokens。（正文只写这一条事实）
 
 **并行支线**：评测题集构建在本阶段启动（见 §6），每天人工校验 10 题，避免阶段 5 前集中赶工。
 
-- [ ] 三层存储实现（sources 快照式）+ frontmatter 读写 + 实体注册表（稳定 ID + 别名归一）。frontmatter 一次定齐防迁移字段：`status: active|merged|superseded`、`redirect_to`/`superseded_by`、`volatility: stable|drifting|volatile`（半衰期分级）、`observed_at`；检索默认只返回 active、跟随 redirect，排序乘置信度与新鲜度因子
+- [x] 三层存储实现（sources 快照式）+ frontmatter 读写 + 实体注册表（稳定 ID + 别名归一）。frontmatter 一次定齐防迁移字段：`status: active|merged|superseded`、`redirect_to`/`superseded_by`、`volatility: stable|drifting|volatile`（半衰期分级）、`observed_at`；检索默认只返回 active、跟随 redirect，排序乘置信度与新鲜度因子（2026-09-20，frontmatter.py + entities.py + store.py；sources 快照式在阶段 2 已由 fetch.py 落地）
 - [ ] Distiller：报告 → 原子笔记（LLM 抽取）→ 实体/主题页（LLM 聚合 + 稳定 ID 双链）
 - [ ] **入库去重（轻量 merge）**：候选笔记写库前与既有笔记查重，命中则合并 + redirect_to——验收的"重复笔记 <10%"由这一步保证（完整 consolidation 在阶段 4）
-- [ ] 索引：FTS5（wangfenjin/simple 中文 tokenizer，Day 1 已验证）+ sqlite-vec（锁定版本，fallback numpy 余弦）建库，`wiki_search`（关键词+向量混合，嵌入走 API + 本地缓存）
+- [x] 索引：FTS5（wangfenjin/simple 中文 tokenizer，Day 1 已验证）+ sqlite-vec（锁定版本，fallback numpy 余弦）建库，`wiki_search`（关键词+向量混合，嵌入走 API + 本地缓存）（2026-09-20：sqlite-vec 0.1.9 实测可用，退路为**纯 Python 余弦暴力扫描**而非 numpy——省一个依赖且语义一致性有测试保证；tokenizer 为 auto 探测：simple 的 jieba 词库在**含中文的路径下会 C++ abort**，故本机走 trigram，探测保护已实现）
 - [ ] `researchwiki lint`（引用覆盖、断链——含 merged 笔记 redirect 跟随、孤立笔记）
 - [ ] MCP server：`wiki_search / wiki_read / wiki_write / wiki_list_changes` 四个工具；**写工具加保护**——frontmatter schema 校验、路径限制在 `wiki-data/` 内、写前备份
 - [ ] 在 Claude Code 里实测安装该 MCP 并读写 wiki（截图留档，README 素材）

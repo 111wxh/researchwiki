@@ -75,7 +75,7 @@ api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
 | 5 | 评测（~100 题 QA 集，冷启动 vs 暖启动对照实验） | 计划中 |
 | 6 | 打磨与开源 | 计划中 |
 
-测试：**59 passed**（全部离线：MockTransport 假 HTTP、脚本化 Provider、零真实网络），`ruff` 零告警。
+测试：**102 passed**（全部离线：MockTransport 假 HTTP、脚本化 Provider、零真实网络），`ruff` 零告警。
 
 ## 架构
 
@@ -111,6 +111,23 @@ api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
 
 **自建 harness**：不依赖 LangChain / LangGraph，loop、工具注册表、路由、记账都是自己实现的——这是本项目想展示的核心能力。
 
+## 中文检索：tokenizer 取舍
+
+中文没有空格，SQLite 内置的 `unicode61` 分词器对中文基本不可用。默认路径用 **trigram**（SQLite ≥3.34 自带）：三元组子串索引，中文召回成立，`< 3` 字的短查询走 LIKE 兜底。
+
+可选地，把项目放在**纯 ASCII 路径**下时，可以启用 [wangfenjin/simple](https://github.com/wangfenjin/simple)（Apache-2.0）做词级分词进一步提升召回：
+
+```bash
+# 下载对应平台的 release，解压到仓库根的 vendor/ 下
+# 目录结构需为 vendor/libsimple-windows-x64/{simple.dll,dict/}
+```
+
+⚠️ 踩过的坑：simple 的 jieba 词库用 C++ 文件流读取，**路径含中文时 Windows 下会触发不可捕获的进程崩溃**（不是异常，是 `abort`）。代码因此做了探测保护——路径非 ASCII 或词库不全时自动回退 trigram，绝不盲目加载。这也是为什么本仓库默认不启用它。
+
+`config.toml` 的 `[wiki].fts_tokenizer` 可选 `auto`（默认，探测后决定）/ `simple` / `trigram`。
+
+向量检索用 [sqlite-vec](https://github.com/asg017/sqlite-vec)（可加载扩展）；扩展不可用时自动退回纯 Python 余弦暴力扫描，两条路径的过滤语义有测试保证一致——所以任何环境都能跑，不会因为装不上扩展就瘸一条腿。
+
 ## 项目结构
 
 ```
@@ -118,11 +135,11 @@ src/researchwiki/
 ├── llm/         Provider 抽象、OpenAI 兼容实现、模型路由、录制回放、token 记账
 ├── tools/       搜索、网页抓取与快照、沙箱文件系统
 ├── loop/        AgentLoop、工具注册表、ResearchSubagent、笔记存储
-├── wiki/        三层存储、实体注册表、混合检索（阶段 3）
+├── wiki/        三层存储、实体注册表、混合检索（FTS5 + sqlite-vec + RRF 融合）
 ├── server/      FastAPI + SSE
 └── cli.py       开发用单命令入口（serve / lint / consolidate / arbitrate / serve-mcp）
 web/             Next.js 前端（流式输出、思考折叠、过程可视化、报告文档视图、wiki 面板）
-tests/           59 个离线测试
+tests/           102 个离线测试
 Dockerfile             后端镜像（uv + Python 3.12）
 web/Dockerfile         前端镜像（next standalone 多阶段构建）
 docker-compose.yml         演示模式（mock，零 key）
