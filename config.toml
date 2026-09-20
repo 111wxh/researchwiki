@@ -1,0 +1,29 @@
+# ResearchWiki 运行配置（骨架阶段仅 mock；真模型接入时改这里，不动代码）
+
+[server]
+# mock = 演示模式（默认，行为与阶段 1 完全一致，无 key 可跑）；
+# real = 走真实 agent loop，但还要求 [llm.strong].base_url 非空，否则自动回退 mock。
+mode = "mock"
+
+[mock]
+# 演示事件间停顿秒数
+delay = 0.04
+
+[llm]
+# strong / cheap 两档，OpenAI 兼容协议（POST {base_url}/chat/completions，SSE 流式）。
+# base_url 留空 = mock 模式：无需 API key，全链路可跑（router 返回 MockProvider）。
+# 接入真模型时填 model / base_url，key 放到 api_key_env 指定的环境变量（如 .env）。
+
+[llm.strong]
+model = ""                # 例："glm-4.7"
+base_url = ""             # 例："https://open.bigmodel.cn/api/paas/v4"（不含 /chat/completions）
+api_key_env = "RESEARCHWIKI_STRONG_API_KEY"
+
+[llm.cheap]
+model = ""                # 例："glm-4.7-flash"
+base_url = ""
+api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
+
+[runtime]
+# 上下文超过窗口该比例触发 compaction（阶段 3）
+compaction_threshold = 0.7

@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+:root {
+  --background: #161616;
+  --foreground: #e8e8e8;
+  --surface: #1d1d1d;
+  --surface-2: #262626;
+  --border: #2b2b2b;
+  --muted: #8a8a8a;
+  --accent: #5e8bff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border-subtle: var(--border);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+/* ---- 思考流 shimmer ---- */
+@keyframes shimmer-slide {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.shimmer-text {
+  background: linear-gradient(90deg, #6e6e6e 0%, #e8e8e8 45%, #6e6e6e 90%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer-slide 1.8s linear infinite;
+}
+
+.shimmer-bar {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(94, 139, 255, 0.35) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer-slide 1.6s linear infinite;
+}
+
+/* ---- 卡片入场 ---- */
+@keyframes fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fade-slide-in 0.35s ease-out both;
+}
+
+/* ---- 流式光标 ---- */
+@keyframes cursor-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.cursor-blink {
+  animation: cursor-blink 1s step-start infinite;
+}
+
+/* ---- 报告文档排版 ---- */
+.md-report {
+  font-size: 0.925rem;
+  line-height: 1.75;
+  color: var(--foreground);
+}
+.md-report h2 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0 0 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.md-report h3 {
+  font-size: 1rem;
+  font-weight: 650;
+  margin: 1.25rem 0 0.5rem;
+  color: #d6d6d6;
+}
+.md-report p {
+  margin: 0.5rem 0;
+  color: #b8b8b8;
+}
+.md-report ul {
+  margin: 0.5rem 0;
+  padding-left: 1.1rem;
+  list-style: disc;
+}
+.md-report li {
+  margin: 0.3rem 0;
+  color: #b8b8b8;
+}
+.md-report strong {
+  color: var(--foreground);
+  font-weight: 650;
+}
+.md-report code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+.md-report a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.md-report a:hover {
+  text-decoration: underline;
+}
+
+/* ---- 滚动条 ---- */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2c313a;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
