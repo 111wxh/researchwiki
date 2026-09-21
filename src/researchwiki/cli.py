@@ -27,7 +27,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     lint_parser.add_argument("--json", action="store_true", help="输出 JSON（便于 CI 消费）")
     sub.add_parser("arbitrate", help="冲突人工仲裁入口（阶段 3）")
-    sub.add_parser("serve-mcp", help="启动 wiki MCP server（阶段 2）")
+    mcp_parser = sub.add_parser(
+        "serve-mcp", help="启动 wiki MCP server（标准 MCP 客户端如 Claude Code 用 stdio）"
+    )
+    mcp_parser.add_argument(
+        "--root", default=None, help="wiki 目录（默认 wiki-data，可用 RESEARCHWIKI_WIKI_DATA 覆盖）"
+    )
+    mcp_parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http", "sse", "streamable-http"],
+        help="MCP 传输方式，默认 stdio",
+    )
+    mcp_parser.add_argument("--host", default="127.0.0.1", help="http/sse 传输的监听地址")
+    mcp_parser.add_argument("--port", type=int, default=8765, help="http/sse 传输的监听端口")
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -37,6 +50,15 @@ def main(argv: list[str] | None = None) -> int:
             "researchwiki.server.main:app", host=args.host, port=args.port, reload=False
         )
         return 0
+
+    if args.command == "serve-mcp":
+        # 参数语义与 `python -m researchwiki.mcp_server` 保持单一实现，这里只做转发
+        from researchwiki.mcp_server.server import main as mcp_main
+
+        forwarded = ["--transport", args.transport, "--host", args.host, "--port", str(args.port)]
+        if args.root:
+            forwarded += ["--root", args.root]
+        return mcp_main(forwarded)
 
     if args.command == "lint":
         # 延迟导入：lint 之外的命令不需要拉起 wiki 子系统

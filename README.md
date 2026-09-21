@@ -128,6 +128,39 @@ api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
 
 向量检索用 [sqlite-vec](https://github.com/asg017/sqlite-vec)（可加载扩展）；扩展不可用时自动退回纯 Python 余弦暴力扫描，两条路径的过滤语义有测试保证一致——所以任何环境都能跑，不会因为装不上扩展就瘸一条腿。
 
+## 装进 Claude Code（MCP）
+
+wiki 通过 MCP server 暴露给任何支持 MCP 的客户端——研究沉淀下来的知识，可以直接在你日常写代码的地方被检索和追加。
+
+```bash
+uv run researchwiki serve-mcp                     # stdio 传输（本地客户端用这个）
+uv run researchwiki serve-mcp --transport http --port 8765   # 或走 HTTP/SSE
+uv run researchwiki lint                          # 健康度检查：引用覆盖率 / 断链 / 孤立笔记
+```
+
+在 Claude Code 里注册（路径换成你的实际路径）：
+
+```json
+{
+  "mcpServers": {
+    "researchwiki": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/researchwiki", "researchwiki", "serve-mcp"]
+    }
+  }
+}
+```
+
+暴露的工具：
+
+| 工具 | 用途 |
+|---|---|
+| `wiki_search` | 混合检索（FTS5 + 向量 + RRF 融合），带置信度与新鲜度加权 |
+| `wiki_read` | 读笔记全文；`merged`/`superseded` 笔记自动跟随 `redirect_to` 并标注原 ID |
+| `wiki_write` | 新增原子笔记：frontmatter schema 校验 + 路径沙箱 + 写前备份（备份失败即拒写） |
+| `wiki_list_changes` | 增量同步（`since` 游标 + 分页），供客户端拉取最近变更 |
+| `wiki_health` | 笔记/页面/冲突计数与索引状态自检 |
+
 ## 项目结构
 
 ```

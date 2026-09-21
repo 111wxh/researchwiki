@@ -24,6 +24,7 @@ from researchwiki.llm.router import ModelRouter
 from researchwiki.loop.agent_loop import AgentLoop
 from researchwiki.loop.research_run import ResearchRun
 from researchwiki.tools import get_search_provider
+from researchwiki.wiki.embeddings import get_embedding_provider
 
 app = FastAPI(title="ResearchWiki API")
 
@@ -124,13 +125,18 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # 真实 agent loop：strong 驱动主循环，搜索 provider 与记账共用一套配置
         llm_cfg = config.get("llm") or {}
         server_cfg = config.get("server") or {}
+        wiki_cfg = config.get("wiki") or {}
+        wiki_root = Path(str(server_cfg.get("wiki_data_dir") or "wiki-data"))
         iterator = AgentLoop(
             question,
             router=ModelRouter(llm_cfg),
             llm_config=llm_cfg,
             accountant=accountant,
             search_provider=get_search_provider(config),
-            wiki_root=Path(str(server_cfg.get("wiki_data_dir") or "wiki-data")),
+            wiki_root=wiki_root,
+            # [wiki] / [embedding] 段的配置必须显式传入，否则去重阈值与嵌入模型会被静默忽略
+            wiki_config=wiki_cfg,
+            embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
         ).events()
     else:
         iterator = ResearchRun(question, accountant=accountant).events()
