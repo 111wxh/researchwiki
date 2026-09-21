@@ -42,3 +42,9 @@ api_key_env = "RESEARCHWIKI_EMBEDDING_API_KEY"
 fts_tokenizer = "auto"
 # 新鲜度半衰期（天）：volatile 每 30 天检索分衰减一半，drifting 90 天，stable 不衰减
 half_life_days = { volatile = 30, drifting = 90 }
+# 入库去重（轻量 merge）：候选笔记与既有 active 笔记「向量余弦 ≥ dedup_similarity
+# 且实体重叠 ≥ dedup_entity_overlap」时判为重复 → 合并进既有笔记（保留其规范 ID，
+# 新证据并入 sources，并写一条 status=merged + redirect_to 的留痕记录）。
+# 向量用 [embedding] 段的模型（留空 = 确定性 Mock）；实体名按 slugify 归一后比较。
+dedup_similarity = 0.9
+dedup_entity_overlap = 1

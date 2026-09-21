@@ -19,7 +19,13 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, default=int(os.environ.get("RESEARCHWIKI_PORT", "8000"))
     )
     sub.add_parser("consolidate", help="后台 consolidation：merge / refresh / conflict（阶段 3）")
-    sub.add_parser("lint", help="wiki 健康度检查（阶段 2）")
+    lint_parser = sub.add_parser("lint", help="wiki 健康度检查（阶段 2）")
+    lint_parser.add_argument(
+        "--root",
+        default=os.environ.get("RESEARCHWIKI_WIKI_DATA", "wiki-data"),
+        help="wiki 数据目录（默认 wiki-data，可用 RESEARCHWIKI_WIKI_DATA 覆盖）",
+    )
+    lint_parser.add_argument("--json", action="store_true", help="输出 JSON（便于 CI 消费）")
     sub.add_parser("arbitrate", help="冲突人工仲裁入口（阶段 3）")
     sub.add_parser("serve-mcp", help="启动 wiki MCP server（阶段 2）")
     args = parser.parse_args(argv)
@@ -31,6 +37,21 @@ def main(argv: list[str] | None = None) -> int:
             "researchwiki.server.main:app", host=args.host, port=args.port, reload=False
         )
         return 0
+
+    if args.command == "lint":
+        # 延迟导入：lint 之外的命令不需要拉起 wiki 子系统
+        import json
+
+        from researchwiki.wiki.lint import lint_wiki
+        from researchwiki.wiki.store import WikiStore
+
+        store = WikiStore(args.root)
+        report = lint_wiki(store)
+        if args.json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(report.format_text(root=str(args.root)))
+        return report.exit_code()
 
     print(f"「{args.command}」在后续阶段实现，见 PLAN.md 对应任务。", file=sys.stderr)
     return 1

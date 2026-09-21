@@ -22,13 +22,12 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import Message, Provider, TokenUsage, chunk_text
-from researchwiki.loop.notes import NoteStore
 from researchwiki.loop.registry import Tool, ToolRegistry
-from researchwiki.loop.subagent import ResearchSubagent, SubagentResult, extract_json
+from researchwiki.loop.subagent import ResearchSubagent, SubagentResult
 from researchwiki.tools import (
     DEFAULT_WIKI_DATA_ROOT,
     FetchResult,
@@ -40,6 +39,15 @@ from researchwiki.tools import (
     safe_write,
 )
 from researchwiki.tools.search import SearchProvider
+
+if TYPE_CHECKING:
+    # 仅类型标注用：wiki 层在方法内延迟导入（见 AgentLoop._build_wiki_layer）——
+    # wiki.store → loop.notes → loop/__init__ → loop.agent_loop 的包初始化顺序会让
+    # 模块级「loop 导入 wiki」形成循环导入。
+    from researchwiki.wiki.distiller import CandidateNote
+    from researchwiki.wiki.embeddings import EmbeddingProvider
+    from researchwiki.wiki.frontmatter import SourceRef
+    from researchwiki.wiki.store import Note
 
 # ---- 提示词 --------------------------------------------------------------
 
@@ -71,15 +79,9 @@ ACT_SYSTEM = (
 
 REPORT_REQUEST = "请基于以上研究过程与工具结果，撰写最终研究报告。"
 
-DISTILL_SYSTEM = (
-    "你是研究信息蒸馏器。从研究记录中抽取原子笔记与矛盾点。\n"
-    "输出严格 JSON（不要输出任何其他文本）：\n"
-    '{"notes": [{"text": "单一事实、自包含、不超过 80 字", "entities": ["实体名"], '
-    '"confidence": "high|medium|low"}], '
-    '"conflicts": [{"summary": "矛盾描述", "action": "建议动作"}]}\n'
-    "笔记只保留与研究问题相关的事实；confidence 反映来源间的相互印证程度；"
-    "不同来源明显矛盾的事实写入 conflicts；没有则输出空数组。"
-)
+# 蒸馏提示词已迁到 wiki/distiller.py（EXTRACT_SYSTEM，含 volatility / source_urls 契约），
+# 由 Distiller.extract_notes 统一持有——loop 不再自带一份，避免两处措辞漂移。
+
 
 _FORCED_REASONS = {
     "max_steps": "研究步数已达上限（max_steps）",
@@ -140,20 +142,36 @@ class SourcePool:
     """本次 run 实际检索 / 抓取到的来源池（按 URL 去重）。
 
     报告的 [n] 引用编号与 source-url 事件都从这里生成，保证引用可溯。
+    抓取成功时同时记下 content_hash（网页快照定位），蒸馏入库时写进笔记
+    frontmatter.sources；只检索未抓取的来源 hash 为空串。
     """
 
     entries: list[dict[str, str]] = field(default_factory=list)
+    hashes: dict[str, str] = field(default_factory=dict)
     _seen: set[str] = field(default_factory=set)
 
-    def add(self, url: str, title: str = "") -> bool:
+    def add(self, url: str, title: str = "", content_hash: str = "") -> bool:
         if not url or url in self._seen:
+            if url and content_hash and not self.hashes.get(url):
+                self.hashes[url] = content_hash
             return False
         self._seen.add(url)
         self.entries.append({"url": url, "title": title or url})
+        if content_hash:
+            self.hashes[url] = content_hash
         return True
 
     def numbered(self) -> list[dict[str, Any]]:
         return [{"n": i, **e} for i, e in enumerate(self.entries, start=1)]
+
+    def source_refs(self) -> list[SourceRef]:
+        """来源池 → SourceRef 列表（保序，带 content_hash），供蒸馏入库写 frontmatter。"""
+        from researchwiki.wiki.frontmatter import SourceRef  # 延迟导入，见文件头 TYPE_CHECKING 说明
+
+        return [
+            SourceRef(url=e["url"], content_hash=self.hashes.get(e["url"], ""))
+            for e in self.entries
+        ]
 
 
 @dataclass
@@ -185,8 +203,12 @@ class RunContext:
             }
         )
 
-    def add_source(self, url: str, title: str = "") -> None:
-        self.source_pool.add(url, title)
+    def add_source(self, url: str, title: str = "", content_hash: str = "") -> None:
+        self.source_pool.add(url, title, content_hash=content_hash)
+
+    def source_refs(self) -> list[SourceRef]:
+        """来源池的 SourceRef 视图（蒸馏入库写 frontmatter.sources 用）。"""
+        return self.source_pool.source_refs()
 
 
 # ---- 具体工具接线 ----------------------------------------------------------
@@ -248,7 +270,11 @@ def _register_research_tools(
             transport=ctx.fetch_transport,
             timeout=ctx.fetch_timeout,
         )
-        ctx.add_source(result.final_url or url, _title_from_text(result.text, url))
+        ctx.add_source(
+            result.final_url or url,
+            _title_from_text(result.text, url),
+            result.content_hash,
+        )
         return json.dumps(
             {
                 "url": result.url,
@@ -452,6 +478,9 @@ class AgentLoop:
         fetch_transport: Any = None,
         max_fetch_chars: int = 8000,
         clock: Callable[[], float] = time.perf_counter,
+        embedding: EmbeddingProvider | None = None,
+        wiki_config: Mapping[str, Any] | None = None,
+        build_pages: bool = False,
     ) -> None:
         self.question = question
         self.router = router
@@ -485,20 +514,61 @@ class AgentLoop:
         self.subagent_budget = subagent_token_budget
         self.subagent_steps = subagent_max_steps
 
-        self.note_store = NoteStore(self.wiki_root / "notes", trace_id=self.trace_id)
-
+        # wiki 三层存储（notes/ pages/ conflicts/，与 loop 层既有目录布局互读兼容）：
+        # run 内蒸馏走 Distiller（报告素材 → 原子笔记）→ Ingestor（查重合并 + 规范 ID）。
+        self._build_wiki_layer(embedding=embedding, wiki_config=wiki_config)
+        self.build_pages = build_pages
         # 滚动状态（state.md 的数据源）
         self.input_tokens = 0
         self.output_tokens = 0
         self.step_count = 0
         self.tool_calls_count = 0
+        self.notes_written = 0
         self.plan_text = ""
         self.report_text = ""
         self.research_summary = ""
         self.forced_reason = ""
-        self.pending_notes: list[dict[str, Any]] = []  # 子 agent 带回的笔记，蒸馏阶段一并发出
+        # 子 agent 带回的候选笔记，蒸馏阶段与主循环抽取结果一并入库
+        self.pending_candidates: list[CandidateNote] = []
 
     # ---- 基础设施 ----------------------------------------------------------
+
+    def _build_wiki_layer(
+        self, *, embedding: EmbeddingProvider | None, wiki_config: Mapping[str, Any] | None
+    ) -> None:
+        """装配 wiki 层：WikiStore / EntityRegistry / Ingestor（去重）/ Distiller（蒸馏）。
+
+        方法内延迟导入的原因见文件头 TYPE_CHECKING 注释：wiki.store 反向依赖
+        loop.notes，模块级导入会在「先 import wiki 包」的顺序下形成循环导入。
+        """
+        from researchwiki.wiki.distiller import Distiller
+        from researchwiki.wiki.entities import EntityRegistry
+        from researchwiki.wiki.ingest import Ingestor, dedup_settings
+        from researchwiki.wiki.store import WikiStore
+
+        # 去重阈值：config [wiki] 段（dedup_similarity / dedup_entity_overlap）可覆盖
+        self.dedup = dedup_settings(wiki_config)
+        self.wiki_store = WikiStore(self.wiki_root)
+        self.entity_registry = EntityRegistry(self.wiki_root)
+        self.ingestor = Ingestor(
+            self.wiki_store,
+            embedding=embedding,
+            similarity_threshold=self.dedup.similarity,
+            entity_overlap_min=self.dedup.entity_overlap_min,
+            trace_id=self.trace_id,
+            clock=self.clock,
+            on_usage=self._absorb_usage,
+        )
+        self.distiller = Distiller(
+            self.wiki_store,
+            provider=self.distill_provider,
+            entity_registry=self.entity_registry,
+            accountant=self.accountant,
+            trace_id=self.trace_id,
+            clock=self.clock,
+            step="distill",
+            on_usage=self._absorb_usage,
+        )
 
     def _run_subagent(self, topic: str, brief: str) -> SubagentResult:
         sub = ResearchSubagent(
@@ -513,10 +583,19 @@ class AgentLoop:
             clock=self.clock,
         )
         result = sub.run()
-        # 子 agent 产物汇入本次 run：笔记进蒸馏队列，来源进引用池
-        self.pending_notes.extend(result.notes)
+        # 子 agent 产物汇入本次 run：笔记进蒸馏队列（同样走入库去重），来源进引用池
         for s in result.sources:
             self.ctx.add_source(str(s.get("url") or ""), str(s.get("title") or ""))
+        # 子 agent 未按条给出来源，这里把它检索到的来源集合作为其笔记的候选来源
+        # （粗粒度溯源：至少能定位到证据集合，比空 sources 更接近证据链）
+        from researchwiki.wiki.distiller import CandidateNote  # 延迟导入，见文件头说明
+
+        refs = self.ctx.source_refs()
+        urls = [str(s.get("url") or "") for s in result.sources if str(s.get("url") or "")]
+        self.pending_candidates.extend(
+            CandidateNote.from_dict({**note, "source_urls": urls}, sources=refs)
+            for note in result.notes
+        )
         return result
 
     def _absorb_usage(self, usage: TokenUsage | None) -> None:
@@ -565,7 +644,7 @@ class AgentLoop:
             f"- Token：input {self.input_tokens} / output {self.output_tokens}"
             f"（预算 {self.token_budget}，已用 {pct}%）",
             f"- 来源：{len(self.ctx.source_pool.entries)} 个",
-            f"- 笔记：本次已写 {self.note_store.progress()} 条",
+            f"- 笔记：本次已写 {self.notes_written} 条",
         ]
         if self.forced_reason:
             lines.append(f"- 熔断：{self.forced_reason}")
@@ -701,54 +780,69 @@ class AgentLoop:
             yield {"type": "reasoning-end", "id": "observe"}
         self._write_state("distilling")
 
-        # ---- 阶段 3：蒸馏（cheap 档；笔记编号接续现有 wiki；冲突成台账事件）----
+        # ---- 阶段 3：蒸馏（cheap 档；报告素材 → Distiller 抽取 → Ingestor 去重入库）----
+        #
+        # 顺序说明（与既有事件协议/调用序列的取舍）：data-note 出现在报告正文之前
+        # （与 mock 演示 ResearchRun 同构，前端零改动），且 LLM 调用序列里 distill
+        # 必须先于 report（tests/test_loop.py 断言了调用顺序与记账步骤），因此这里
+        # 蒸馏的是**报告素材**（研究总结 + 工具结果摘编，与随后的报告同源），而不是
+        # 报告成品。Distiller.extract_notes 的输入契约仍是报告正文：阶段 4 的
+        # consolidation / 单跑蒸馏可以直接把 run_dir/report.md 喂给它。
         task_distill = self.ctx.next_task_id()
         self.ctx.push_task(task_distill, "蒸馏原子笔记 → wiki", "running", "抽取事实中")
         yield from self._drain_tasks()
 
-        distilled: list[dict[str, Any]] = []
-        conflicts: list[dict[str, Any]] = []
-        digest = self._tool_digest(history)
-        distill_prompt = (
-            f"研究问题：{self.question}\n\n"
-            f"研究过程记录（工具结果摘编）：\n{digest}\n\n"
-            "请抽取原子笔记与矛盾点，输出严格 JSON。"
+        sources = self.ctx.source_refs()
+        material = self._report_material(history)
+        extracted = self.distiller.extract_notes(
+            material, question=self.question, sources=sources
         )
-        distill_raw = self._call_llm_text(
-            self.distill_provider,
-            messages=[Message(role="user", content=distill_prompt)],
-            system=DISTILL_SYSTEM,
-            step="distill",
-        )
-        parsed = extract_json(distill_raw) or {}
-        for n in parsed.get("notes") or []:
-            if isinstance(n, dict) and str(n.get("text") or "").strip():
-                distilled.append(n)
-        for c in parsed.get("conflicts") or []:
-            if isinstance(c, dict) and str(c.get("summary") or "").strip():
-                conflicts.append(c)
+        candidates = [*self.pending_candidates, *extracted]
 
         note_seq = 0
-        for raw_note in [*self.pending_notes, *distilled]:
-            saved = self.note_store.save(raw_note)
+        created = 0
+        merged = 0
+        ingested: list[Note] = []
+        for candidate in candidates:
+            result = self.ingestor.add(candidate, trace_id=self.trace_id)
             note_seq += 1
-            yield {"type": "data-note", "id": f"note-{note_seq}", "data": saved}
-        for i, c in enumerate(conflicts, start=1):
+            self.notes_written += 1
+            created += 1 if result.action == "created" else 0
+            merged += 1 if result.action == "merged" else 0
+            ingested.append(result.note)
+            # data-note 结构不变；data.id 恒为规范 ID（合并命中时引用既有笔记）
+            yield {
+                "type": "data-note",
+                "id": f"note-{note_seq}",
+                "data": {
+                    "id": result.note.id,
+                    "text": result.note.body.strip(),
+                    "entities": list(result.note.entities),
+                    "confidence": result.note.confidence,
+                },
+            }
+        conflicts = self.distiller.last_conflicts
+        for i, conflict in enumerate(conflicts, start=1):
             yield {
                 "type": "data-conflict",
                 "id": f"conflict-{i}",
                 "data": {
-                    "id": f"C-{i:04d}",
-                    "summary": str(c.get("summary") or ""),
-                    "action": str(c.get("action") or ""),
+                    "id": conflict.id,
+                    "summary": conflict.summary,
+                    "action": conflict.action,
                 },
             }
+        if self.build_pages and ingested:
+            # 页面聚合（LLM）默认关闭：run 内多一次模型调用就会拉长时延，
+            # 由调用方显式开启（阶段 4 的 consolidation 或 MCP 侧写路径）
+            for draft in self.distiller.build_pages(ingested):
+                self.wiki_store.save_page(draft.slug, draft.title, draft.body)
         if task_distill:
             self.ctx.push_task(
                 task_distill,
                 "蒸馏原子笔记 → wiki",
                 "done",
-                f"新增 {note_seq} 条笔记 · {len(conflicts)} 条冲突",
+                f"新增 {created} 条笔记 · 合并 {merged} 条 · {len(conflicts)} 条冲突",
             )
             yield from self._drain_tasks()
         self._write_state("reporting")
@@ -789,26 +883,18 @@ class AgentLoop:
 
     # ---- 辅助 ----------------------------------------------------------
 
-    def _call_llm_text(
-        self,
-        provider: Provider,
-        *,
-        messages: list[Message],
-        system: str,
-        step: str,
-    ) -> str:
-        """整段消费一次 LLM 调用（不向事件流转发），用于蒸馏等后台步骤。"""
-        t0 = self.clock()
+    def _report_material(self, history: list[Message]) -> str:
+        """蒸馏输入 = 研究总结 + 工具结果摘编（研究问题由 extract_notes 的 question 参数带入）。
+
+        见 events() 蒸馏阶段的顺序说明：既有事件协议与 LLM 调用序列都要求蒸馏发生在
+        报告生成之前，所以这里喂给 Distiller 的是"报告素材"而非报告成品；
+        Distiller.extract_notes 的输入契约仍是报告正文（阶段 4 可消费 report.md）。
+        """
         parts: list[str] = []
-        usage: TokenUsage | None = None
-        for ev in provider.stream(messages, system=system, tools=None):
-            if ev.type == "text_delta":
-                parts.append(ev.delta)
-            elif ev.type == "usage" and ev.usage is not None:
-                usage = ev.usage
-        self._absorb_usage(usage)
-        self._record(step, provider, usage, t0)
-        return "".join(parts)
+        if self.research_summary.strip():
+            parts.append(f"研究总结：\n{self.research_summary.strip()}")
+        parts.append(f"研究过程记录（工具结果摘编）：\n{self._tool_digest(history)}")
+        return "\n\n".join(parts)
 
     def _tool_digest(self, history: list[Message], *, per_result_chars: int = 800) -> str:
         """工具结果摘编：每个 role="tool" 消息截取前 N 字，作为蒸馏输入。"""
