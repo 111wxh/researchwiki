@@ -580,8 +580,12 @@ class AgentLoop:
         # 子 agent 带回的候选笔记，蒸馏阶段与主循环抽取结果一并入库
         self.pending_candidates: list[CandidateNote] = []
         # 本轮**真正入库**的候选（过完 formation）：记忆更新阶段把它们当"新证据"
-        # （被拒绝的候选不构成新记忆，见 events() 蒸馏阶段）
+        # （被拒绝的候选不构成新记忆，见 events() 蒸馏阶段）；ingested_note_ids 与
+        # 之一一对应（下标 = 证据下标），supersede 据此复用本轮入库笔记当替代版本
+        # ——同一段证据既入库又另建替代会留下两条正文相同的 active 记忆（RQ3 检索
+        # 重复命中、Prior 预算双份消耗）
         self.ingested_candidates: list[CandidateNote] = []
+        self.ingested_note_ids: list[str] = []
         # Prior 检索结果（events() 开头填充；None = 未启用或尚未检索）与入库动作计数
         self.prior_context: PriorContext | None = None
         self.notes_created = 0
@@ -1065,8 +1069,11 @@ class AgentLoop:
             self.notes_written += 1
             self.formation_stats["persisted"] += 1
             # 真正入库的候选 = 本轮"新记忆"：记忆更新阶段把它们当新证据与命中
-            # Prior 比较（被 formation 拒绝的候选不构成新记忆，不进证据集）
+            # Prior 比较（被 formation 拒绝的候选不构成新记忆，不进证据集）；
+            # 同时记下 Ingestor 给的**规范 ID**（新建 = 新 ID，命中合并 = 既有
+            # 规范 ID），supersede 可直接复用它当替代版本
             self.ingested_candidates.append(candidate)
+            self.ingested_note_ids.append(result.note.id)
             if decision is not None:
                 # importance/kind 写进 frontmatter，判定理由写进 extra（辅助产物，
                 # 失败不推翻入库）
@@ -1086,7 +1093,9 @@ class AgentLoop:
                 },
             }
         # 入库动作计数 → run-metrics.json（IngestResult.action 只有 created/merged，
-        # superseded 在阶段 1 恒为 0，字段保位以稳住 §4.4 契约）
+        # 蒸馏阶段自身不产生 superseded；真正的替代计数在**记忆更新阶段**填入
+        # notes_superseded——见 _apply_memory_updates，字段集不变、只是值语义，
+        # §4.4 契约仍由 metrics.RunMetrics 的字段清单锁定）
         self.notes_created = created
         self.notes_merged = merged
         self.notes_superseded = 0
@@ -1221,7 +1230,19 @@ class AgentLoop:
                 now=now,
                 dry_run=settings.dry_run,
                 trace_id=self.trace_id,
+                # 证据下标 → 本轮入库笔记的规范 ID：supersede 复用它当替代版本，
+                # 不再另建一条正文相同的 active 记忆（见 apply_comparisons docstring）
+                evidence_notes={
+                    index: note_id for index, note_id in enumerate(self.ingested_note_ids)
+                },
             )
+            # run-metrics 的 notes_superseded 记**真实**替代次数（字段集不变，只是
+            # 值语义：此前恒 0，因为 run 内没有 supersede 路径；修复轮 1/5 M-5）。
+            # notes_created / notes_merged 仍只由蒸馏入库阶段记账——记忆更新的
+            # "合并"是**修订既有记忆**（不是两条笔记合并），混进 notes_merged 会
+            # 让 §4.4 的"wiki 写入动作"语义漂移；它记在 memory-update.json 与
+            # state.md 的"合并"计数里。
+            self.notes_superseded = int(report.counts.get("superseded", 0))
         self.memory_update_report = report
         self._write_memory_update_file(report, now)
 

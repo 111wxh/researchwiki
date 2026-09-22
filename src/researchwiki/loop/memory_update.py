@@ -10,10 +10,13 @@
 
 - ``consistent`` → ``refresh_reviewed_at``：只刷新 ``reviewed_at=now``（只改这一个
   字段；sources 原样不动；其余 frontmatter 字段逐字段透传）。
-- ``newer`` → ``supersede``：新笔记 + 旧笔记 ``superseded_by``；**必须带来源**，
-  无可用 URL → 降级 ``open_conflict``（宁可开台账，也不造无证据的替代记忆）。
+- ``newer`` → ``supersede``：旧笔记 ``superseded_by`` 指向替代版本；**必须带来源**
+  （URL **与 content_hash 都非空**），否则降级 ``open_conflict``（宁可开台账，也不造
+  无证据/悬空来源的替代记忆）。替代版本优先**复用本轮入库笔记**（``evidence_notes``
+  映射），无映射时才新建。
 - ``more_specific`` → ``merge``：update 语义（正文追加要点 + 来源追加 + 刷新
-  reviewed_at），保留规范 ID；正文由本模块拼接（见 ``_merged_body``）。
+  reviewed_at），保留规范 ID；正文由本模块拼接（见 ``_merged_body``）。无实际变更
+  （正文已含该证据、来源无新增）时如实记 skipped。
 - ``conflicting`` → ``open_conflict``：``store.save_conflict``，**必须带两侧证据**
   （旧 note ID + 正文摘录 + 来源；新证据正文 + 来源 + 冲突槽位取值）。
 - ``uncertain`` → ``none``：不写盘，只计数（计入 skipped 桶，理由写明 uncertain）。
@@ -26,12 +29,14 @@
    extra（``supersede_reason`` / ``update_reasons``，字段名与 P2-D 的 MCP 通道
    一致）或冲突台账；旧笔记在 supersede 后按状态机原样保留（``status=superseded``
    + ``superseded_by`` 链）。
-2. **幂等**：幂等键 ``update_key(prior_note_id, evidence_text)`` =
-   ``{prior_id}:{sha1(正文)[:16]}``（见该函数 docstring 的选型理由）。键记在
-   **旧笔记** extra 的 ``memory_update_keys`` 列表里（supersede 后旧笔记仍可读，
-   所以重跑能查到），同一批内重复的证据也会被去重。命中已记录的键 → 不写盘、
-   计入 skipped。冲突台账没有独立 extra 槽，键写进两侧 claim 的
-   ``memory_update_key`` 字段并按它查重。
+2. **幂等**：双通道键 —— ``update_key(prior, body)`` = ``{prior_id}:{sha1(正文)[:16]}``
+   与 ``body_key(body)`` = ``sha1(正文)[:16]``（不带 prior 前缀，见其 docstring：
+   supersede 之后 Prior 检索只回 active 的替代版本，带前缀的键在那里永远对不上，
+   跨 run 的重放只能靠正文哈希键拦住）。两个键都记进被处置笔记 extra
+   （``memory_update_keys`` / ``memory_update_body_keys``，各自保留最近
+   ``MAX_RECORDED_KEYS`` 条）与冲突台账两侧 claim（``memory_update_key`` /
+   ``memory_update_body_key``）；命中任一 → 不写盘、计入 skipped。同一批内重复的
+   证据也会被去重。
 3. **dry_run**：``dry_run=True`` 只返回报告，零写盘（不落笔记、不写台账、不改
    extra），但幂等与护栏判定照常执行——所以"先 dry 后真"看到的动作集合一致。
    ``[memory_update] dry_run = true`` 是生产侧的同款影子开关。
@@ -48,15 +53,16 @@ P2-D 的 ``memory_supersede`` / ``memory_update`` 带 ``source_urls`` 证据入�
 - 签名与依赖：本模块按简报接收 ``store``（纯 wiki 层），
   ``WikiService`` 还要 root/config/索引/线程锁与 JSON 错误协议，都是执行
   动作不需要的东西；
-- 可审计性等价：来源按 (url, hash) 去重后写入新笔记、reason 落 extra、
+- 可审计性等价：来源按 (url, hash) 去重后写入替代版本、reason 落 extra、
   旧笔记保留（MCP 那层的备份/索引同步留给交互式写路径；本研究 run 的写路径
   本来就统一走 ``WikiStore``，例如 Ingestor 合并与 formation 标注）。
 
-风险控制与 P2-D 一致：**不允许造出无证据的替代记忆**（新证据无 URL 时降级为
-开冲突台账），也不为"新证据"继承旧证据的 confidence（一律 ``medium``，见
-``_apply_supersede``）。差别只有一处、且更严格：新笔记带上
-``observed_at = 证据观察时间``（MCP 通道不知道证据时间，只能回退 created），
-这与 P2-A freshness 的时间基准口径一致。
+风险控制与 P2-D 一致：**不允许造出无证据的替代记忆**（新证据无 URL 或无
+content_hash 时降级为开冲突台账）；confidence 也不为"新证据"继承旧值——按
+**formation 的确定性口径**现算（``_supersede_confidence``：有来源 + 具体事实要素
+→ high），这样自动通道也能给出 high，而不是被硬编码成 medium 塞进 Prior 注入块。
+替代版本带上 ``observed_at = 证据观察时间``（MCP 通道不知道证据时间，只能回退
+created），与 P2-A freshness 的时间基准口径一致。
 
 判官越权拦截（防御纵深）
 ------------------------
@@ -77,6 +83,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from researchwiki.wiki.distiller import CandidateNote
+from researchwiki.wiki.formation import evaluate_candidate
 from researchwiki.wiki.frontmatter import SourceRef
 from researchwiki.wiki.store import Note, WikiStore
 from researchwiki.wiki.verification import (
@@ -113,13 +120,23 @@ COUNT_KEYS: tuple[str, ...] = ("reviewed", "superseded", "merged", "conflicts", 
 # 让"研究 run 自动更新"与"交互式写入"两条路径在同一套字段上可互相审计。
 
 MEMORY_UPDATE_KEYS = "memory_update_keys"  # list[str]，幂等键（按处置顺序去重累积）
+MEMORY_UPDATE_BODY_KEYS = "memory_update_body_keys"  # list[str]，正文哈希键（跨 run 幂等）
 MEMORY_UPDATE_REASONS = "memory_update_reasons"  # list[dict]，本模块的动作留痕
 UPDATE_REASONS_KEY = "update_reasons"  # P2-D 同名字段：修订原因列表（merge 用）
 SUPERSEDE_REASON_KEY = "supersede_reason"  # P2-D 同名字段（supersede 用）
 CONFLICT_KEY_FIELD = "memory_update_key"  # 冲突台账两侧 claim 里的幂等键字段
+CONFLICT_BODY_KEY_FIELD = "memory_update_body_key"  # 台账里的正文哈希键（跨 run 幂等）
 EXCERPT_CHARS = 300  # 台账/理由里正文摘录的截断长度
+# 键/留痕列表的保留上限（修复轮 1/5 M-4）：只留最近的 N 条，防止 frontmatter 随
+# run 次数无限膨胀（口径与 mark_source_changed 的"上界 = URL 数"一致）
+MAX_RECORDED_KEYS = 50
 
 MAX_ACTIONS_IN_REASON = 3  # 理由里最多列几个冲突槽位
+
+# 护栏触发时**接线层**允许放行的动作（修复轮 1/5 Minor M-1）：与 verification 的
+# CONSERVATIVE_VERDICTS（conflicting / uncertain）一一镜像——只有开台账与不做动作
+# 两种，refresh_reviewed_at（宣称"仍然成立"）也一并拒绝，避免"假一致"绕过护栏。
+GUARD_ALLOWED_ACTIONS: tuple[str, ...] = (ACTION_NONE, ACTION_OPEN_CONFLICT)
 
 
 def _now_iso() -> str:
@@ -193,8 +210,8 @@ class MemoryUpdateAction:
       ``merged`` / ``conflict_opened`` / ``skipped``（``merged`` 是简报
       ``applied`` 清单的**增项**：``more_specific → merge`` 真的并入时要有个
       可读的名字，不能记成 reviewed 或 skipped 而看不出发生过修订）。
-    - ``note_id``：新建/目标笔记 ID（reviewed/merged 为原笔记 ID；supersede 为
-      新笔记 ID；冲突为台账 ID；skipped 为 None）。
+    - ``note_id``：新建/目标笔记 ID（reviewed/merged 为原笔记 ID；supersede 为新的
+      或**复用的**替代版本 ID；冲突为台账 ID；skipped 为 None）。
     - ``key``：幂等键（审计用；跳过时也写明是"哪个证据"被跳过）。
     """
 
@@ -257,6 +274,21 @@ class MemoryUpdateReport:
 # ---- 幂等键 -----------------------------------------------------------------
 
 
+def body_key(evidence_text: str) -> str:
+    """证据**正文**的哈希键（不带 prior 前缀）：跨 run 幂等的"内容指纹"。
+
+    为什么需要它（修复轮 1/5 Important I-1）：带 prior 前缀的 ``update_key`` 只
+    能回答"这条 prior 处置过这段证据吗"，回答不了"这段证据在本 wiki 里处置过吗"。
+    典型失效场景是 supersede 之后：下一轮 Prior 检索只回 **active**（链尾）——
+    也就是替代笔记，它身上记的键是 ``{旧 prior id}:{hash}``，而按新笔记 id 算出的
+    键是 ``{新 note id}:{hash}``，两者永不相等，于是同一段证据每次 run 都重新
+    supersede 一遍（旧笔记则因为 ``status != active`` 根本不会被读到）。
+    "旧笔记仍可读"不等于"会被去读"——所以键必须有一条**不依赖 prior 身份**的
+    形态，落在被处置笔记的 extra 里。
+    """
+    return hashlib.sha1(str(evidence_text or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
 def update_key(prior_note_id: str, evidence_text: str) -> str:
     """幂等键：``{prior_note_id}:{sha1(证据正文)[:16]}``（纯函数、确定性）。
 
@@ -271,16 +303,39 @@ def update_key(prior_note_id: str, evidence_text: str) -> str:
     - 16 位（64 bit）截断：碰撞概率对"一次 run 内每条 prior 的十几条证据"可忽略，
       同时让 frontmatter 里的键列表保持可读。
     """
-    digest = hashlib.sha1(str(evidence_text or "").strip().encode("utf-8")).hexdigest()
-    return f"{prior_note_id}:{digest[:16]}"
+    digest = body_key(evidence_text)
+    return f"{prior_note_id}:{digest}"
 
 
 def recorded_keys(note: Note) -> list[str]:
-    """旧笔记 extra 里已记录的幂等键（形态容错：非列表 / 非字符串一律忽略）。"""
-    raw = dict(note.meta.extra).get(MEMORY_UPDATE_KEYS)
+    """旧笔记 extra 里已记录的**带 prior 前缀**的幂等键（形态容错，非列表回空）。"""
+    return _string_list(note.meta.extra, MEMORY_UPDATE_KEYS)
+
+
+def recorded_body_keys(note: Note) -> list[str]:
+    """旧笔记 extra 里已记录的**不带前缀**的正文哈希键（跨 run 幂等的查重依据）。"""
+    return _string_list(note.meta.extra, MEMORY_UPDATE_BODY_KEYS)
+
+
+def _string_list(extra: Mapping[str, Any], field_name: str) -> list[str]:
+    """extra 里某个键的字符串列表视图（非列表 / 非字符串项一律忽略，容错）。"""
+    raw = dict(extra).get(field_name)
     if not isinstance(raw, list):
         return []
     return [str(item) for item in raw]
+
+
+def _bounded(values: Sequence[str], *, limit: int = MAX_RECORDED_KEYS) -> list[str]:
+    """键列表保留**最近** ``limit`` 条（修复轮 1/5 Minor M-4：无上限累积）。
+
+    取舍与 ``store.mark_source_changed`` 的"上界 = 引用过的 URL 数"一致：留痕要
+    可审计，但不能随 run 次数无限膨胀（每次 run 的每条证据都会添一个键）。
+    退化代价明确且方向安全：被裁掉的老键若再次出现同一段证据，会**多做一次**动作
+    （而不是漏做）；同一段证据通常在自己的 run 里就已处置过，跨 run 重放概率极低。
+    """
+    if limit <= 0 or len(values) <= limit:
+        return list(values)
+    return list(values[-limit:])
 
 
 # ---- 证据构造 ---------------------------------------------------------------
@@ -369,15 +424,37 @@ def evidence_from_run(
 
 
 def _evidence_source_refs(item: EvidenceItem) -> list[SourceRef]:
-    """证据条目 → 可写入 frontmatter 的来源列表（无 URL 即空列表 = 无可用来源）。
+    """证据条目 → 可写入 frontmatter 的来源列表（**URL 与 content_hash 都非空**才算可用）。
 
     ``EvidenceItem`` 只有单来源槽位，所以这里最多一条；返回空列表是 supersede
     路径的降级信号（见 ``apply_comparisons``）。
+
+    `content_hash` **必须非空**（修复轮 1/5 Minor M-6）：候选的 ``source_urls``
+    里可能有"模型自造 / 只被检索到、从未抓取"的 URL（来源池里的 hash 是空串），
+    放行它会让 supersede 造出一条**带无哈希来源**的替代记忆——frontmatter 上有 URL
+    但定位不到任何快照，与 ``store.missing_snapshots`` 把空哈希视作"悬空证据"
+    的口径直接冲突。空哈希一律按"证据链不完整"处理 → 降级开台账（宁可少一次
+    自动更新，不可多一条无法追溯的替代记忆）。
     """
     url = str(item.source_url or "").strip()
-    if not url:
+    content_hash = str(item.content_hash or "").strip()
+    if not url or not content_hash:
         return []
-    return [SourceRef(url=url, content_hash=str(item.content_hash or ""))]
+    return [SourceRef(url=url, content_hash=content_hash)]
+
+
+def _source_gap(item: EvidenceItem) -> str:
+    """supersede 降级时的一句话原因（区分"无 URL"与"无 content_hash"两种退化）。"""
+    if not str(item.source_url or "").strip():
+        return (
+            "新证据没有可用来源（无 URL）→ 降级为 open_conflict："
+            "宁可开冲突台账，也不造一条无证据的替代记忆"
+        )
+    return (
+        f"新证据的来源 {str(item.source_url).strip()} 没有 content_hash"
+        "（无法定位快照 → 证据链不完整）→ 降级为 open_conflict："
+        "宁可开冲突台账，也不造一条带悬空来源的替代记忆"
+    )
 
 
 def _merge_sources(
@@ -412,6 +489,7 @@ def apply_comparisons(
     now: str,
     dry_run: bool = False,
     trace_id: str = "",
+    evidence_notes: Mapping[int, str] | None = None,
 ) -> MemoryUpdateReport:
     """按判定执行动作（分发表见模块 docstring）；``dry_run=True`` 零写盘。
 
@@ -420,15 +498,23 @@ def apply_comparisons(
     ``EvidenceComparison`` 时下标错了会把**别的**证据当作本次证据处置（幂等键、
     正文摘录、来源都会错位）。判定-执行分离的前提就是这个下标契约。
 
+    ``evidence_notes``（修复轮 1/5 Important I-4，接口演进）：``{证据下标: 笔记 ID}``
+    ——本轮蒸馏候选经 Ingestor 入库后得到的**规范笔记 ID**（新建 = 新 ID，命中合并
+    = 既有规范 ID）。给了映射且目标笔记存在时，``newer`` 路径**复用它当替代版本**
+    （只退役旧记忆、不再另建笔记），避免"同一段证据既入库又 supersede"留下两条正文
+    相同的 active 记忆（RQ3 检索重复命中、Prior 预算双份消耗）。缺省 None = 老行为
+    （新建替代笔记）。
+
     逐条独立的防御：旧记忆不存在 / ``evidence_index`` 越界 / 批内重复 /
-    幂等命中 / 护栏拦截 / 非 active 状态 / 本轮已被替代 —— 都只记一条 skipped
-    动作，不抛异常、不中断后续比较（写入失败同样降级为 skipped：收尾阶段的
-    辅助产物不得推翻已完成的 run）。
+    幂等命中（带前缀键或正文哈希键）/ 护栏拦截 / 非 active 状态 / 本轮已被替代 /
+    替代目标就是旧记忆本身 —— 都只记一条 skipped 动作，不抛异常、不中断后续比较
+    （写入失败同样降级为 skipped：收尾阶段的辅助产物不得推翻已完成的 run）。
     """
     actions: list[MemoryUpdateAction] = []
     seen_keys: set[str] = set()
-    ledger_keys = _conflict_keys(store)  # 台账侧已用过的幂等键（冲突不进笔记 extra）
+    ledger = _conflict_keys(store)  # 台账侧已用过的键（冲突不进笔记 extra）
     retired: set[str] = set()  # 本轮已被替代的旧记忆（后续比较不再落到它身上）
+    note_map: Mapping[int, str] = evidence_notes if evidence_notes is not None else {}
     for comparison in comparisons:
         prior = store.get_note(comparison.prior_note_id)
         if prior is None:
@@ -448,18 +534,27 @@ def apply_comparisons(
             )
             continue
         key = update_key(prior.id, item.text)
+        content_key = body_key(item.text)
         if key in seen_keys:
             actions.append(
                 _skip(comparison, "同一批证据内重复：同一 prior 的同一正文已处置", prior, key)
             )
             continue
         seen_keys.add(key)
-        if key in recorded_keys(prior) or key in ledger_keys:
+        # 幂等双通道：带 prior 前缀的键（本轮内/同 prior 重放）+ 不带前缀的正文哈希键
+        # （跨 run 重放：supersede 后 prior 检索只回 active 的替代笔记，那时按新 ID
+        # 算出的前缀键永远对不上，只能靠正文哈希键命中——修复轮 1/5 I-1）。
+        if (
+            key in recorded_keys(prior)
+            or content_key in recorded_body_keys(prior)
+            or key in ledger["keys"]
+            or content_key in ledger["body_keys"]
+        ):
             actions.append(
                 _skip(
                     comparison,
                     "幂等：该证据此前已处置过"
-                    f"（键见 {MEMORY_UPDATE_KEYS} / 冲突台账），跳过",
+                    f"（键见 {MEMORY_UPDATE_KEYS} / {MEMORY_UPDATE_BODY_KEYS} / 冲突台账），跳过",
                     prior,
                     key,
                 )
@@ -481,15 +576,18 @@ def apply_comparisons(
             )
             continue
         action = comparison.suggested_action
-        # 防御纵深（判官越权拦截的接线侧复核）：护栏非 None 时拒绝覆盖类动作。
-        # verification 层已保证不可达（护栏触发 → uncertain/none 或 conflicting），
-        # 这里作为断言保留——漏一次就是一次静默覆盖。
-        if comparison.guard is not None and action in (ACTION_SUPERSEDE, ACTION_MERGE):
+        # 防御纵深（判官越权拦截的接线侧复核）：护栏非 None 时只放行 open_conflict /
+        # none——与 verification 的 CONSERVATIVE_VERDICTS 一一镜像（修复轮 1/5 M-1）。
+        # 原来只拦 supersede/merge，会照旧放行 refresh_reviewed_at（"一致 → 仍然成立"），
+        # 而"一致"恰恰是 verification 在实体不交时特意拒绝的另一类结论：主体同一性
+        # 都没确认就宣称旧断言仍然成立，等于用弱信号给旧记忆背书。护栏触发时一律拒绝。
+        if comparison.guard is not None and action not in GUARD_ALLOWED_ACTIONS:
             actions.append(
                 _skip(
                     comparison,
                     f"护栏「{comparison.guard}」触发：拒绝执行 {action}"
-                    "（主体同一性未确认时不得覆盖旧记忆）",
+                    f"（护栏触发时只放行 {'/'.join(GUARD_ALLOWED_ACTIONS)}；"
+                    "主体同一性未确认时不得覆盖旧记忆、也不得宣称旧断言仍然成立）",
                     prior,
                     key,
                 )
@@ -513,16 +611,22 @@ def apply_comparisons(
                             now,
                             dry_run,
                             trace_id,
-                            degraded=(
-                                "新证据没有可用来源（无 URL）→ 降级为 open_conflict："
-                                "宁可开冲突台账，也不造一条无证据的替代记忆"
-                            ),
+                            degraded=_source_gap(item),
                         )
                     )
                 else:
                     actions.append(
                         _apply_supersede(
-                            store, prior, item, comparison, key, now, dry_run, trace_id, sources
+                            store,
+                            prior,
+                            item,
+                            comparison,
+                            key,
+                            now,
+                            dry_run,
+                            trace_id,
+                            sources,
+                            reuse_note_id=note_map.get(comparison.evidence_index, ""),
                         )
                     )
                     retired.add(prior.id)
@@ -659,20 +763,26 @@ def _reason(
 def _audit_extra(
     extra: Mapping[str, Any],
     key: str,
+    content_key: str,
     reason: str,
     comparison: EvidenceComparison,
     now: str,
 ) -> dict[str, Any]:
-    """在 extra 上追加本次处置的留痕（键列表 + 理由记录），其余键原样保留。"""
+    """在 extra 上追加本次处置的留痕（前缀键 + 正文哈希键 + 理由记录），其余键保留。
+
+    两个键列表都按 ``MAX_RECORDED_KEYS`` 保留最近若干条（修复轮 1/5 M-4）：键要能
+    被无限次重跑查到，但不能让 frontmatter 随 run 次数无限膨胀。
+    """
     out = dict(extra)
-    keys = out.get(MEMORY_UPDATE_KEYS)
-    recorded = [str(item) for item in keys] if isinstance(keys, list) else []
-    if key and key not in recorded:
-        recorded.append(key)
-    out[MEMORY_UPDATE_KEYS] = recorded
-    records = out.get(MEMORY_UPDATE_REASONS)
-    history = list(records) if isinstance(records, list) else []
-    history.append(
+    out[MEMORY_UPDATE_KEYS] = _bounded(
+        _append_unique(_string_list(out, MEMORY_UPDATE_KEYS), key)
+    )
+    out[MEMORY_UPDATE_BODY_KEYS] = _bounded(
+        _append_unique(_string_list(out, MEMORY_UPDATE_BODY_KEYS), content_key)
+    )
+    history = out.get(MEMORY_UPDATE_REASONS)
+    records = list(history) if isinstance(history, list) else []
+    records.append(
         {
             "at": now,
             "reason": reason,
@@ -680,8 +790,27 @@ def _audit_extra(
             "suggested_action": comparison.suggested_action,
         }
     )
-    out[MEMORY_UPDATE_REASONS] = history
+    out[MEMORY_UPDATE_REASONS] = records[-MAX_RECORDED_KEYS:]
     return out
+
+
+def _append_unique(values: Sequence[str], value: str) -> list[str]:
+    """把 value 追加进列表（空串 / 已存在则原样返回，保序）。"""
+    out = list(values)
+    if value and value not in out:
+        out.append(value)
+    return out
+
+
+def _audit_only_extra(
+    key: str,
+    content_key: str,
+    reason: str,
+    comparison: EvidenceComparison,
+    now: str,
+) -> dict[str, Any]:
+    """给**新建笔记**用的留痕 extra（不从任何既有 extra 继承，防旧来源标记漂移）。"""
+    return _audit_extra({}, key, content_key, reason, comparison, now)
 
 
 def _save_preserving(
@@ -759,9 +888,31 @@ def _apply_reviewed(
             store,
             prior,
             reviewed_at=now,
-            extra=_audit_extra(prior.meta.extra, key, reason, comparison, now),
+            extra=_audit_extra(
+                prior.meta.extra, key, body_key(item.text), reason, comparison, now
+            ),
         )
     return _action(comparison, APPLIED_REVIEWED_AT, note_id=prior.id, reason=reason, key=key)
+
+
+def _supersede_confidence(text: str, entities: Sequence[str], sources: Sequence[SourceRef]) -> str:
+    """按 **formation 的确定性口径**给替代记忆定 confidence（修复轮 1/5 I-3）。
+
+    口径只有一份：直接复用 ``formation.evaluate_candidate`` 的 ``confidence``
+    ——``has_source and has_specifics → high``、``has_source → medium``、否则 low。
+    不这么做就会有可见后果：同一 run 里同一段证据留下两条 active 记忆，入库的那条
+    拿 distiller 的 confidence、替代的那条硬编码 medium（``prior.py`` 会把
+    "置信度: medium" 直接注入模型的核验上下文）——而 RQ2 的自动通道**没有交互式
+    调用方**可以补一个 high（MCP 的 ``memory_supersede(confidence=...)`` 那条路径
+    是给显式调用者的），不在这里落地就永远落不了地。
+
+    ``similarity_max=None``：近乎重复是**入库**的拒绝规则（防堆积），不是给替代
+    记忆定置信度的依据；此处不重复判它。
+    """
+    decision = evaluate_candidate(
+        text, entities=list(entities), sources=list(sources), similarity_max=None
+    )
+    return decision.confidence
 
 
 def _apply_supersede(
@@ -774,53 +925,82 @@ def _apply_supersede(
     dry_run: bool,
     trace_id: str,
     sources: Sequence[SourceRef],
+    *,
+    reuse_note_id: str = "",
 ) -> MemoryUpdateAction:
     """newer → 用新证据内容替代旧记忆（**必须带来源**，调用方已保证非空）。
 
-    新笔记：正文 = 证据正文，sources = 证据来源（不继承旧来源——旧证据不该被
-    当作新结论的证据），entities/volatility/kind/importance 继承旧记忆（身份
-    连续性），confidence 一律 ``medium``（不继承旧证据的置信度，与 P2-D 的
-    「有来源 → medium」口径一致），``observed_at`` = 证据观察时间（时间基准追到
-    证据本身）。
-    旧笔记：``status=superseded`` + ``superseded_by=新 ID``，reason 与幂等键写进
-    extra（旧笔记原样保留，沿链可达新记忆）。
+    两种落盘形态：
+
+    - **复用本轮入库笔记**（``reuse_note_id`` 指向本轮 Ingestor 产出的规范笔记，且
+      该笔记存在、active、不等于旧记忆本身；修复轮 1/5 I-4）：把旧记忆退役到该笔记
+      上（``superseded_by=入库笔记 ID``），不再另建——"同一段证据既入库又 supersede"
+      会留下两条正文相同的 active 记忆，RQ3 检索重复命中、Prior 预算双份消耗。
+      同时把幂等键/理由写进该笔记 extra、必要时补上证据来源（入库时若被合并进别的
+      规范笔记，来源可能不含本次证据）。
+    - **新建替代笔记**（无映射，或映射目标不合格）：正文 = 证据正文，sources =
+      证据来源（不继承旧来源——旧证据不该被当作新结论的证据），entities /
+      volatility / kind / importance 继承旧记忆（身份连续性），``observed_at`` =
+      证据观察时间（时间基准追到证据本身）。
+
+    两侧共同的硬约束：confidence 按 formation 口径算（``_supersede_confidence``；
+    不继承旧证据的置信度）；旧笔记 ``status=superseded`` + ``superseded_by`` 链 +
+    reason/键留痕（旧笔记原样保留，沿链可达替代版本）。
     """
+    content_key = body_key(item.text)
+    target = store.get_note(reuse_note_id) if reuse_note_id else None
+    if target is not None and target.id == prior.id:
+        # 候选被 Ingestor 合并进了这条旧记忆本身：事实已经在旧记忆里了，
+        # 再"退役到它自己"只会把一条 active 记忆标成 superseded_by 指向自己。
+        return _skip(
+            comparison,
+            f"本轮候选已被 Ingestor 合并进该记忆本身（{prior.id}）：事实已并入，"
+            "无需再 supersede/merge（不写盘）",
+            prior,
+            key,
+        )
+    if target is not None and target.meta.status != "active":
+        target = None  # 目标不是 active（异常状态）：退回新建路径，不把链挂到退役版本上
+    confidence = _supersede_confidence(item.text, prior.meta.entities, sources)
+    target_note = f"复用本轮入库笔记 {reuse_note_id}" if target is not None else "新建替代笔记"
     reason = _reason(
         comparison,
         item,
-        f"更新替代：{prior.id} → 新笔记（证据更新，旧 ID 沿 superseded_by 可达）",
+        f"更新替代：{prior.id} → {target_note}"
+        f"（证据更新，旧 ID 沿 superseded_by 可达；confidence={confidence}）",
         sources=sources,
     )
     new_id: str | None = None
     if not dry_run:
-        written = store.save_note(
-            item.text,
-            title=_derive_title(item.text, fallback=prior.title or "替代记忆"),
-            entities=list(prior.meta.entities),
-            confidence="medium",
-            volatility=prior.meta.volatility,
-            kind=prior.meta.kind,
-            importance=prior.meta.importance,
-            observed_at=item.observed_at or now,
-            reviewed_at=now,
-            trace_id=trace_id or prior.meta.trace_id,
-            sources=list(sources),
-            extra={
-                MEMORY_UPDATE_KEYS: [key],
-                MEMORY_UPDATE_REASONS: [
-                    {
-                        "at": now,
-                        "reason": reason,
-                        "verdict": comparison.verdict,
-                        "suggested_action": comparison.suggested_action,
-                    }
-                ],
-                SUPERSEDE_REASON_KEY: reason,
-                "superseded_from": prior.id,
-            },
-        )
-        new_id = written.id
-        old_extra = _audit_extra(prior.meta.extra, key, reason, comparison, now)
+        extra = _audit_only_extra(key, content_key, reason, comparison, now)
+        extra[SUPERSEDE_REASON_KEY] = reason
+        extra["superseded_from"] = prior.id
+        if target is not None:
+            merged_sources, _ = _merge_sources(target.meta.sources, sources)
+            _save_preserving(
+                store,
+                target,
+                sources=merged_sources,
+                extra={**dict(target.meta.extra), **extra},
+            )
+            new_id = target.id
+        else:
+            written = store.save_note(
+                item.text,
+                title=_derive_title(item.text, fallback=prior.title or "替代记忆"),
+                entities=list(prior.meta.entities),
+                confidence=confidence,
+                volatility=prior.meta.volatility,
+                kind=prior.meta.kind,
+                importance=prior.meta.importance,
+                observed_at=item.observed_at or now,
+                reviewed_at=now,
+                trace_id=trace_id or prior.meta.trace_id,
+                sources=list(sources),
+                extra=extra,
+            )
+            new_id = written.id
+        old_extra = _audit_extra(prior.meta.extra, key, content_key, reason, comparison, now)
         old_extra[SUPERSEDE_REASON_KEY] = reason
         _save_preserving(
             store,
@@ -829,10 +1009,12 @@ def _apply_supersede(
             superseded_by=new_id,
             extra=old_extra,
         )
+    elif target is not None:
+        new_id = target.id  # dry_run：目标已存在，如实报出（不是伪造的占位值）
     return _action(
         comparison,
         APPLIED_SUPERSEDED,
-        note_id=new_id,  # dry_run 下恒 None：新 ID 是写入时才分配的，不伪造占位值
+        note_id=new_id,
         reason=reason,
         key=key,
     )
@@ -869,10 +1051,24 @@ def _apply_merge(
     (url, hash) 去重追加、刷新 reviewed_at、保留 ID、reason 落 extra），
     "合并"正是调用方的职责——所以本模块选定 **merge**（简报的首选分支），
     由 ``_merged_body`` 拼接正文、``_merge_sources`` 追加来源。
+
+    **无实际变更时如实记 skipped**（修复轮 1/5 M-2）：正文里已有该证据、
+    来源也没有新增时，没有任何东西可写——此时若仍记 ``applied=merged``，报告会说
+    "改了"而盘上没改（幂等键也没持久化）。变更 = 正文变化 **或** 来源有新增；
+    来源有新增就照常落盘（那也是真实的修订）。
     """
     sources = _evidence_source_refs(item)
     merged_body = _merged_body(prior.body, item.text, now)
     merged_sources, added = _merge_sources(prior.meta.sources, sources)
+    changed = merged_body != prior.body or added > 0
+    if not changed:
+        return _skip(
+            comparison,
+            "并入无实际变更：正文已包含该证据、证据来源也已记录（幂等第二道闸）→ "
+            "不写盘（不把未发生的修订记成 merged）",
+            prior,
+            key,
+        )
     # 理由在写盘前一次成形（新增来源条数也进去）：笔记 extra 里的 update_reasons
     # 与报告/state 里的 reason 必须是**同一串**，否则审计时两处对不上。
     reason = _reason(
@@ -881,13 +1077,13 @@ def _apply_merge(
     if sources:
         reason += f"｜新增来源 {added} 条"
     else:
-        reason += "｜证据无可用来源：只并入正文要点"
-    extra = _audit_extra(prior.meta.extra, key, reason, comparison, now)
+        reason += "｜证据无可用来源（无 URL 或 content_hash）：只并入正文要点"
+    extra = _audit_extra(prior.meta.extra, key, body_key(item.text), reason, comparison, now)
     records = extra.get(UPDATE_REASONS_KEY)
     history = list(records) if isinstance(records, list) else []
     history.append({"reason": reason, "at": now})
     extra[UPDATE_REASONS_KEY] = history
-    if not dry_run and merged_body != prior.body:
+    if not dry_run:
         _save_preserving(
             store,
             prior,
@@ -921,10 +1117,12 @@ def _apply_conflict(
 
     - claim_a（旧记忆）：note_id / 标题 / 正文摘录 / 来源（url+hash）/ 判定字段；
     - claim_b（新证据）：正文摘录 / 来源 URL + hash / 观察时间 / 命中槽位取值；
-    - 两侧都带 ``memory_update_key``：台账没有独立 extra 槽，幂等键按它查重
-      （``_conflict_exists``），重跑不会重复开台账。
+    - 两侧都带 ``memory_update_key``（带 prior 前缀）与 ``memory_update_body_key``
+      （正文哈希，跨 run 幂等）：台账没有独立 extra 槽，幂等查重就按这两个字段
+      （``_conflict_keys``），重跑不会重复开台账、换了一条 prior 命中同一段证据也
+      不会重复开。
 
-    ``degraded`` 非空 = "newer 但没有可用来源"的降级路径：verdict 记 newer、
+    ``degraded`` 非空 = "newer 但来源不可用"的降级路径：verdict 记 newer、
     applied 记 conflict_opened，理由写明降级原因（动作分发表里的硬约束）。
     """
     tail = degraded or (
@@ -949,6 +1147,7 @@ def _apply_conflict(
             "guard": comparison.guard,
             "reason": reason,
             CONFLICT_KEY_FIELD: key,
+            CONFLICT_BODY_KEY_FIELD: body_key(item.text),
         }
         claim_b: dict[str, Any] = {
             "evidence_index": comparison.evidence_index,
@@ -961,6 +1160,7 @@ def _apply_conflict(
             "similarity": comparison.similarity,
             "reason": reason,
             CONFLICT_KEY_FIELD: key,
+            CONFLICT_BODY_KEY_FIELD: body_key(item.text),
         }
         conflict_id = store.save_conflict(
             _conflict_question(prior, comparison, degraded=degraded),
@@ -983,7 +1183,7 @@ def _conflict_question(
     """冲突台账的问题行：引用具体槽位与取值（人类可读，第一眼看出矛盾在哪）。"""
     label = prior.title or prior.id
     if degraded:
-        return f"{label}（{prior.id}）本轮证据更新缺少来源，无法自动替代：{degraded}"
+        return f"{label}（{prior.id}）本轮证据更新缺少可用来源，无法自动替代：{degraded}"
     described = "；".join(
         conflict.describe() for conflict in comparison.conflicts[:MAX_ACTIONS_IN_REASON]
     )
@@ -997,26 +1197,42 @@ def conflict_has_key(conflict: Any, key: str) -> bool:
 
     公开给测试与后续 refresh 包复用；容错：claim 非映射 / 无该字段都当 False。
     """
+    return _conflict_claim_has(conflict, CONFLICT_KEY_FIELD, key)
+
+
+def conflict_has_body_key(conflict: Any, content_key: str) -> bool:
+    """冲突台账条目是否由该**正文哈希键**开出（跨 run 幂等查重用）。"""
+    return _conflict_claim_has(conflict, CONFLICT_BODY_KEY_FIELD, content_key)
+
+
+def _conflict_claim_has(conflict: Any, field_name: str, value: str) -> bool:
+    """台账两侧 claim 的某个字段是否等于给定值（容错：非映射/缺字段当 False）。"""
     for claim in (getattr(conflict, "claim_a", None), getattr(conflict, "claim_b", None)):
-        if isinstance(claim, Mapping) and str(claim.get(CONFLICT_KEY_FIELD) or "") == key:
+        if isinstance(claim, Mapping) and str(claim.get(field_name) or "") == value:
             return True
     return False
 
 
-def _conflict_keys(store: WikiStore) -> set[str]:
-    """台账里出现过的全部幂等键（``status=None``：已裁决的冲突同样算处置过）。
+def _conflict_keys(store: WikiStore) -> dict[str, set[str]]:
+    """台账里出现过的幂等键：``{"keys": {带前缀键}, "body_keys": {正文哈希键}}``。
 
-    冲突路径不写笔记，所以"这条证据处置过"只记在台账里；重跑时要按它去重，
-    否则同一批证据每跑一次就多开一条冲突（幂等要求）。
+    冲突路径不写笔记，所以"这条证据处置过"只记在台账里；重跑（或换了一条 prior
+    命中同一段证据）时要按它去重，否则同一批证据每跑一次就多开一条冲突。
+    ``status=None``：已裁决的冲突同样算处置过。
     """
     keys: set[str] = set()
+    body_keys: set[str] = set()
     for conflict in store.list_conflicts(status=None):
         for claim in (conflict.claim_a, conflict.claim_b):
-            if isinstance(claim, Mapping):
-                found = str(claim.get(CONFLICT_KEY_FIELD) or "")
-                if found:
-                    keys.add(found)
-    return keys
+            if not isinstance(claim, Mapping):
+                continue
+            found = str(claim.get(CONFLICT_KEY_FIELD) or "")
+            if found:
+                keys.add(found)
+            found_body = str(claim.get(CONFLICT_BODY_KEY_FIELD) or "")
+            if found_body:
+                body_keys.add(found_body)
+    return {"keys": keys, "body_keys": body_keys}
 
 
 __all__ = [
@@ -1025,8 +1241,12 @@ __all__ = [
     "APPLIED_REVIEWED_AT",
     "APPLIED_SKIPPED",
     "APPLIED_SUPERSEDED",
+    "CONFLICT_BODY_KEY_FIELD",
     "CONFLICT_KEY_FIELD",
     "COUNT_KEYS",
+    "GUARD_ALLOWED_ACTIONS",
+    "MAX_RECORDED_KEYS",
+    "MEMORY_UPDATE_BODY_KEYS",
     "MEMORY_UPDATE_KEYS",
     "MEMORY_UPDATE_REASONS",
     "MemoryUpdateAction",
@@ -1035,10 +1255,13 @@ __all__ = [
     "SUPERSEDE_REASON_KEY",
     "UPDATE_REASONS_KEY",
     "apply_comparisons",
+    "body_key",
     "candidate_source_refs",
+    "conflict_has_body_key",
     "conflict_has_key",
     "evidence_from_run",
     "memory_update_settings",
+    "recorded_body_keys",
     "recorded_keys",
     "update_key",
 ]
