@@ -17,3 +17,6 @@ tokens.jsonl
 
 # 可选分词扩展（16MB 二进制，不入库；需要时按 README 说明下载到 vendor/）
 vendor/
+
+# 冒烟运行产物（报告/结果 JSON，本地留档用）
+smoke_out/
