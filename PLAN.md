@@ -209,9 +209,12 @@ GLM-5.3 的上下文窗口为 200K tokens。（正文只写这一条事实）
 - [x] **最小 state 落盘 + 工具结果统一截断**（完整 compaction 留到阶段 4，但不做这两样一个复杂问题就会撑爆上下文）（2026-09-17，runs/{ts}-{trace}/research-plan.md + state.md + report.md，registry 统一截断）
 - [x] Research 子 agent：独立上下文 + 独立 token_budget + 固定返回 schema（2026-09-17，ResearchSubagent，工具集无 dispatch_research 防递归）
 - [x] 主 agent 的 `research-plan.md` / `state.md` 文件约定（2026-09-17，atomic_write_text 每步重写）
-- [ ] 两道技术闸（需要 API key，见文末 Day 1 清单）：cheap 模型工具调用稳定性；中文检索栈召回
+- [x] 两道技术闸（需要 API key，见文末 Day 1 清单）：cheap 模型工具调用稳定性；中文检索栈召回（2026-09-22 实测通过，脚本见 `scripts/gate_*.py`）
+  - **闸 1（工具调用稳定性）**：glm-4.5-air 单次 20 回合 → 总体合格率 **90.0%**、工具名正确率 **93.8%**、参数合法率 **93.8%**，p50 2.25s / p95 6.5s。失败样本集中在「让它写文件却先去搜索」——中文"整理成文件"型指令的典型偏差，正是需要靠提示词或工具描述补的地方。**注意 90% 恰好压在阈值上，重跑会漂几个百分点**（计划：评测阶段扩到 100+ 回合并报告置信区间）
+  - **闸 2（中文检索召回）**：hybrid Recall@5 **1.000** / MRR@5 0.958（vector 单通道同样 1.000，fts 0.167）。负信号更有价值：**易混笔记能进 top5 但常排在第 2 位**（"记忆中间件"紧随"记忆方案"）——召回够、精排不足，是后续 rerank / 相似度阈值的直接输入
+  - 附带结论：本机 tokenizer 解析为 trigram；fts 通道对口语化长查询几乎全灭（字面子串匹配），查询越术语化表现越好——这不是"坏了"，是通道特性，混合检索正是为此存在
 - [x] server 接真实 loop（config 开关，mock 保留为默认演示模式）（2026-09-17，config.toml `[server] mode`，默认 mock 已验证不变）
-- [ ] 真模型冒烟：1 个陌生主题端到端 → 报告进 Web 文档视图，每条结论有来源 URL；`tokens.jsonl` 能算出本次总成本；全程无人工干预
+- [x] 真模型冒烟：1 个陌生主题端到端 → 报告进 Web 文档视图，每条结论有来源 URL；`tokens.jsonl` 能算出本次总成本；全程无人工干预（2026-09-22：`scripts/real_run_smoke.py`，主题「MCP 传输机制与安全边界」→ 415s、报告 4580 字含 24 处行内引用、11 个来源全部真实抓取落盘（modelcontextprotocol.io 规范页）、8 条笔记入库 N-0001..N-0008、23 行记账可复算。**遗留**：搜索未配 key 时回退 MockSearch，来源 URL 由模型自行判断给出——检索这一步不是全网搜索，需 Tavily/博查 key 才算完整）
 
 **验收**：config 切到真模型后，同一 Web UI 跑通陌生主题研究；子 agent 全程 cheap 档；一次 run 的成本可从记账 JSONL 精确复算。
 
