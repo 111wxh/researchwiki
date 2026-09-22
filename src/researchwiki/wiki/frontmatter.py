@@ -2,7 +2,7 @@
 
 字段一次定齐（防后续迁移）：id / title / entities / confidence / status /
 redirect_to / superseded_by / volatility / observed_at / reviewed_at /
-created / trace_id / sources / kind / importance。
+valid_from / valid_until / created / trace_id / sources / kind / importance。
 
 设计约定：
 - 未知字段一律收进 ``extra``，round-trip 不丢数据（向后兼容未来扩展）。
@@ -76,6 +76,10 @@ class NoteMeta:
     - kind: knowledge（世界知识）| user（用户画像/偏好）| experience（经验教训）。
     - importance: 0.0–1.0 的主观重要性；None 表示未评估（序列化时省略）。
     - observed_at: 断言的观察时间（ISO 字符串）；缺省时新鲜度回退 created。
+    - valid_from / valid_until: 断言的有效期窗口（ISO 字符串，均可缺省）。
+      valid_until 为 None = 未声明显式失效时间，靠在 freshness.py 里按
+      volatility 衰减判断；两者非 ISO 时不报错，原样保留、由计算侧按
+      "不可解析"处理（见 wiki/freshness.py 规则 2）。
     - extra: 未知字段原样保留，round-trip 不丢。
     """
 
@@ -91,6 +95,8 @@ class NoteMeta:
     importance: float | None = None
     observed_at: str | None = None
     reviewed_at: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
     created: str = ""
     trace_id: str = ""
     sources: list[SourceRef] = field(default_factory=list)
@@ -103,7 +109,15 @@ class NoteMeta:
             if f.name == "extra":
                 continue
             value = getattr(self, f.name)
-            optional = ("redirect_to", "superseded_by", "observed_at", "reviewed_at", "importance")
+            optional = (
+                "redirect_to",
+                "superseded_by",
+                "observed_at",
+                "reviewed_at",
+                "valid_from",
+                "valid_until",
+                "importance",
+            )
             if value is None and f.name in optional:
                 continue
             if f.name == "sources":
@@ -144,6 +158,9 @@ class NoteMeta:
             importance=_importance(data.get("importance")),
             observed_at=_scalar_str(data.get("observed_at")),
             reviewed_at=_scalar_str(data.get("reviewed_at")),
+            # 有效期窗口：宽容透传（非 ISO 字符串原样保留，由 freshness 计算侧按不可解析处理）
+            valid_from=_scalar_str(data.get("valid_from")),
+            valid_until=_scalar_str(data.get("valid_until")),
             created=_scalar_str(data.get("created")) or "",
             trace_id=_scalar_str(data.get("trace_id")) or "",
             sources=sources,

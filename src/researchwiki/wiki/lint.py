@@ -1,4 +1,5 @@
-"""wiki 健康度检查（``researchwiki lint``）：引用覆盖 / 断链 / merged 跟随 / 孤立笔记。
+"""wiki 健康度检查（``researchwiki lint``）：引用覆盖 / 断链 / merged 跟随 / 孤立笔记
+/ 时效（freshness）/ 未裁决冲突。
 
 指标定义（生成侧与检查侧共用同一套"断言行"定义，见 iter_assertion_lines，
 Distiller 生成页面时会用同一套规则做确定性兜底标注）：
@@ -12,10 +13,16 @@ Distiller 生成页面时会用同一套规则做确定性兜底标注）：
 - **merged 跟随**：引用的是 merged/superseded 笔记时，沿 redirect_to / superseded_by
   走到最终 active 笔记；判定通过但记入 merged_chains，提示改写成规范 ID
   （引用应指向规范条目，但历史 ID 永不消失，故"引用旧 ID"不是错误）；
-- **孤立笔记**：没有任何页面引用的 active 笔记（页面引用的 merged 记录会跟随到规范 ID）。
+- **孤立笔记**：没有任何页面引用的 active 笔记（页面引用的 merged 记录会跟随到规范 ID）；
+- **时效（P2 freshness）**：对 active 笔记算 freshness 状态分布
+  （fresh / review_due / stale，口径见 wiki/freshness.py），并列出生效的待复核队列
+  （stale 优先、同级按年龄降序）。它**只统计与提示，不影响结论与退出码**——
+  陈旧是"该复核"，不是"wiki 坏了"，故不进 healthy 判定；
+- **未裁决冲突**：``conflicts/`` 里 status=open 的台账条数（``conflicts_open``）。
 
 退出码约定（给 CI 用）：**有断链**，或"存在断言行且引用覆盖率为 0" → 1，否则 0。
 没有任何断言行（空 wiki）时覆盖率取 1.0（真空真），避免空库把 CI 判红。
+freshness / conflicts_open 是新增的**观测字段**，不参与退出码（既有契约不变）。
 """
 
 from __future__ import annotations
@@ -23,9 +30,17 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from researchwiki.wiki.entities import EntityRegistry
+from researchwiki.wiki.freshness import (
+    FRESHNESS_STATES,
+    FreshnessSettings,
+    evaluate_freshness,
+    freshness_counts,
+    freshness_queue,
+)
 
 if TYPE_CHECKING:  # 仅类型标注用：避免 wiki.index → store → loop.notes 的循环导入
     from researchwiki.wiki.index import SearchIndex
@@ -37,6 +52,10 @@ NOTE_ID_RE = re.compile(r"\bN-\d+\b")
 ENTITY_LINK_RE = re.compile(r"\[\[entity:([^\]|]+?)(?:\|[^\]]*)?\]\]")
 # 笔记双链写法 [[note:N-0001|...]]（其中 N-0001 也会被 NOTE_ID_RE 命中）
 NOTE_LINK_RE = re.compile(r"\[\[note:([^\]|]+?)(?:\|[^\]]*)?\]\]")
+
+# 待复核队列在报告里最多展示几条（details.freshness_queue 全量、文本只列前几条）
+QUEUE_SHOWN = 10
+QUEUE_TEXT_SHOWN = 3
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _HEADING_RE = re.compile(r"^#{1,6}\s")
@@ -108,7 +127,11 @@ class MergedRef:
 
 @dataclass
 class LintReport:
-    """一次 lint 的完整结果（字段即对外契约，CLI 的 --json 直接序列化）。"""
+    """一次 lint 的完整结果（字段即对外契约，CLI 的 --json 直接序列化）。
+
+    freshness / conflicts_open 是 P2 新增的**观测字段**：只统计与提示，
+    不参与 healthy / exit_code 判定（既有退出码契约不变）。
+    """
 
     citation_coverage: float = 1.0
     orphan_notes: list[str] = field(default_factory=list)
@@ -117,6 +140,10 @@ class LintReport:
     notes_total: int = 0
     pages_total: int = 0
     details: dict[str, Any] = field(default_factory=dict)
+    # active 笔记的时效状态分布（键恒为 FRESHNESS_STATES：fresh / review_due / stale）
+    freshness: dict[str, int] = field(default_factory=lambda: dict.fromkeys(FRESHNESS_STATES, 0))
+    # conflicts/ 里 status=open 的台账条数（未裁决冲突）
+    conflicts_open: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -148,6 +175,20 @@ class LintReport:
             f"- 引用覆盖：{self.citation_coverage * 100:.1f}%"
             f"（{cited}/{total} 行断言带笔记 ID 标注）"
         )
+        lines.append(
+            f"- 时效（active）：fresh {self.freshness.get('fresh', 0)}"
+            f" · review_due {self.freshness.get('review_due', 0)}"
+            f" · stale {self.freshness.get('stale', 0)}"
+        )
+        queue = self.details.get("freshness_queue") or []
+        for item in queue[:QUEUE_TEXT_SHOWN]:
+            lines.append(
+                f"  - 待复核：{item['note_id']}（{item['state']}"
+                f"，年龄 {float(item['age_days']):.1f} 天，decay {float(item['decay']):.3f}）"
+            )
+        if len(queue) > QUEUE_TEXT_SHOWN:
+            lines.append(f"  - 其余 {len(queue) - QUEUE_TEXT_SHOWN} 条见 --json 的 freshness_queue")
+        lines.append(f"- 未裁决冲突：{self.conflicts_open} 条")
         if self.orphan_notes:
             shown = "、".join(self.orphan_notes[:12])
             more = f" 等 {len(self.orphan_notes)} 条" if len(self.orphan_notes) > 12 else ""
@@ -174,11 +215,22 @@ class LintReport:
         return "\n".join(lines)
 
 
-def lint_wiki(store: WikiStore, *, index: SearchIndex | None = None) -> LintReport:
-    """体检一个 wiki：引用覆盖、断链、merged 跟随、孤立笔记。
+def lint_wiki(
+    store: WikiStore,
+    *,
+    index: SearchIndex | None = None,
+    now: datetime | None = None,
+    freshness_settings: FreshnessSettings | None = None,
+) -> LintReport:
+    """体检一个 wiki：引用覆盖、断链、merged 跟随、孤立笔记、时效与冲突。
 
     index 可选：传入检索索引时顺带做一次"索引是否落后于 md"的粗检查
     （best-effort，读不到索引内部表就跳过，不影响其它指标）。
+    now / freshness_settings 可选：时效统计的时钟与参数（缺省 = 真实时钟 +
+    freshness 默认参数，config 的 ``[freshness]`` 段由调用方经
+    ``freshness.from_config`` 传入；CLI 不读配置，保持既有行为）。
+    时效统计只覆盖 active 笔记（与 notes_total 同口径：merged/superseded 已退役，
+    不再参与"当前事实"判定）。
     """
     registry = EntityRegistry(store.root)
     all_notes = store.list_notes(status=None)
@@ -226,12 +278,22 @@ def lint_wiki(store: WikiStore, *, index: SearchIndex | None = None) -> LintRepo
 
     orphans = sorted(n.id for n in active_notes if n.id not in cited_canonical_in_pages)
     coverage = cited_lines / assertion_lines if assertion_lines else 1.0
+
+    # 3) 时效（P2 freshness）：只统计 active 笔记；陈旧是"该复核"而非"不健康"，
+    #    故不参与 healthy / exit_code。
+    freshness_states = [
+        evaluate_freshness(note, now=now, settings=freshness_settings) for note in active_notes
+    ]
+    pending = freshness_queue(active_notes, now=now, settings=freshness_settings)
+
     details: dict[str, Any] = {
         "assertion_lines": assertion_lines,
         "cited_lines": cited_lines,
         "uncited_lines": uncited,
         "active_notes": len(active_notes),
         "records_total": len(all_notes),
+        "freshness_queue": [state.to_dict() for state in pending[:QUEUE_SHOWN]],
+        "freshness_queue_total": len(pending),
     }
     stale = _index_lag(index, {n.id for n in all_notes})
     if stale is not None:
@@ -245,6 +307,8 @@ def lint_wiki(store: WikiStore, *, index: SearchIndex | None = None) -> LintRepo
         notes_total=len(active_notes),
         pages_total=len(pages),
         details=details,
+        freshness=freshness_counts(freshness_states),
+        conflicts_open=len(store.list_conflicts(status="open")),
     )
 
 

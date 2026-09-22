@@ -69,6 +69,16 @@ class Note:
     def importance(self) -> float | None:
         return self.meta.importance
 
+    # 时效字段（P2 freshness）：只读透传，与 volatility/kind/importance 同风格；
+    # 写入仍走 meta（frontmatter）或 save_note 的 valid_from / valid_until 参数
+    @property
+    def valid_from(self) -> str | None:
+        return self.meta.valid_from
+
+    @property
+    def valid_until(self) -> str | None:
+        return self.meta.valid_until
+
 
 @dataclass
 class Page:
@@ -137,6 +147,8 @@ class WikiStore:
         importance: float | None = None,
         observed_at: str | None = None,
         reviewed_at: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
         trace_id: str = "",
         sources: list[SourceRef] | None = None,
         extra: Mapping[str, object] | None = None,
@@ -160,6 +172,8 @@ class WikiStore:
             importance=importance,
             observed_at=observed_at,
             reviewed_at=reviewed_at,
+            valid_from=valid_from,
+            valid_until=valid_until,
             created=created or datetime.now(UTC).isoformat(timespec="seconds"),
             trace_id=trace_id,
             sources=list(sources or []),

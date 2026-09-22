@@ -1,13 +1,18 @@
-"""lint 单测：引用覆盖率、断链检出、merged 跟随、孤立笔记、CLI 退出码与 --json 输出。
+"""lint 单测：引用覆盖率、断链检出、merged 跟随、孤立笔记、时效统计、CLI 退出码与 --json。
 
 零网络、tmp_path 隔离；CLI 直接调 main() 并断言返回码（capsys 校验中文报告/JOSN）。
+时效统计用注入的固定时钟（FIXED_NOW），断言精确到数值。
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from researchwiki.cli import main
 from researchwiki.wiki.entities import EntityRegistry
+from researchwiki.wiki.freshness import FreshnessSettings
 from researchwiki.wiki.index import SearchIndex
 from researchwiki.wiki.lint import (
     LintReport,
@@ -17,6 +22,8 @@ from researchwiki.wiki.lint import (
     referenced_note_ids,
 )
 from researchwiki.wiki.store import WikiStore
+
+FIXED_NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
 def make_store(tmp_path: Path) -> WikiStore:
@@ -165,6 +172,78 @@ def test_empty_wiki_is_healthy(tmp_path: Path):
     assert report.exit_code() == 0
     assert report == LintReport(citation_coverage=1.0, details=report.details)
     assert "wiki 健康度报告" in report.format_text()
+    # P2 新增观测字段：空库恒为零，且不影响既有等值断言（字段有默认值）
+    assert report.freshness == {"fresh": 0, "review_due": 0, "stale": 0}
+    assert report.conflicts_open == 0
+
+
+# ---- 时效统计（P2 freshness）-------------------------------------------------
+
+
+def make_freshness_store(tmp_path: Path) -> WikiStore:
+    """四条 active 笔记覆盖三类状态 + 一条 merged（不应计入时效统计）+ 一条未裁决冲突。"""
+    store = make_store(tmp_path)
+    old = (FIXED_NOW - timedelta(days=60)).isoformat()
+    drifted = (FIXED_NOW - timedelta(days=90)).isoformat()
+    recent = (FIXED_NOW - timedelta(days=1)).isoformat()
+    store.save_note("稳定断言。", note_id="N-0001", volatility="stable",
+                    observed_at=old, created=old)
+    store.save_note("新鲜断言。", note_id="N-0002", volatility="volatile",
+                    observed_at=recent, created=recent)
+    store.save_note("陈旧断言。", note_id="N-0003", volatility="volatile",
+                    observed_at=old, created=old)
+    store.save_note("待复核断言。", note_id="N-0004", volatility="drifting",
+                    observed_at=drifted, created=drifted)
+    store.save_note("已合并记录。", note_id="N-0005", status="merged", redirect_to="N-0001",
+                    volatility="volatile", observed_at=old, created=old)
+    store.save_conflict("矛盾 A", {"note_id": "N-0001"}, {"note_id": "N-0003"})
+    return store
+
+
+def test_freshness_stats_conflicts_and_queue(tmp_path: Path):
+    store = make_freshness_store(tmp_path)
+    report = lint_wiki(store, now=FIXED_NOW)
+
+    # 只统计 active 笔记：merged 的 N-0005（同样陈旧）不计入
+    assert report.notes_total == 4
+    assert report.details["records_total"] == 5
+    assert report.freshness == {"fresh": 2, "review_due": 1, "stale": 1}
+    assert report.conflicts_open == 1
+    # 队列：stale 在前、同级按年龄降序
+    assert [item["note_id"] for item in report.details["freshness_queue"]] == ["N-0003", "N-0004"]
+    assert report.details["freshness_queue_total"] == 2
+    first = report.details["freshness_queue"][0]
+    assert first["state"] == "stale" and first["age_days"] == pytest.approx(60.0)
+    assert first["decay"] == pytest.approx(0.25)
+    # 陈旧是"该复核"不是"不健康"：退出码契约不变
+    assert report.exit_code() == 0 and report.healthy
+    payload = report.to_dict()
+    assert payload["freshness"] == {"fresh": 2, "review_due": 1, "stale": 1}
+    assert payload["conflicts_open"] == 1
+    assert payload["exit_code"] == 0
+
+
+def test_freshness_text_summary_lines(tmp_path: Path):
+    report = lint_wiki(make_freshness_store(tmp_path), now=FIXED_NOW)
+    text = report.format_text(root=str(tmp_path))
+    assert "- 时效（active）：fresh 2 · review_due 1 · stale 1" in text
+    assert "待复核：N-0003（stale，年龄 60.0 天，decay 0.250）" in text
+    assert "待复核：N-0004（review_due，年龄 90.0 天，decay 0.500）" in text
+    assert "- 未裁决冲突：1 条" in text
+
+
+def test_freshness_settings_injection(tmp_path: Path):
+    """freshness_settings 可注入（如 config 的 [freshness] 段）：判定随之改变。"""
+    store = make_store(tmp_path)
+    observed = (FIXED_NOW - timedelta(days=10)).isoformat()
+    store.save_note("断言。", note_id="N-0001", volatility="volatile",
+                    observed_at=observed, created=observed)
+    assert lint_wiki(store, now=FIXED_NOW).freshness == {
+        "fresh": 1, "review_due": 0, "stale": 0
+    }
+    strict = FreshnessSettings(review_due_ratio=0.95, stale_ratio=0.8)
+    report = lint_wiki(store, now=FIXED_NOW, freshness_settings=strict)
+    assert report.freshness == {"fresh": 0, "review_due": 0, "stale": 1}
 
 
 def test_missing_root_is_healthy(tmp_path: Path):
@@ -228,6 +307,26 @@ def test_cli_lint_json_output(tmp_path: Path, capsys):
     assert payload["exit_code"] == 1 and payload["healthy"] is False
     assert payload["notes_total"] == 1 and payload["pages_total"] == 1
     assert payload["orphan_notes"] == ["N-0001"]
+
+
+def test_cli_lint_json_includes_freshness_and_conflicts(tmp_path: Path, capsys):
+    """CLI --json 暴露 freshness 分布与 conflicts_open；退出码不受时效影响。"""
+    store = make_store(tmp_path)
+    old = "2020-01-01T00:00:00+00:00"  # 远早于任何合理"现在"
+    store.save_note("陈旧。", note_id="N-0001", volatility="volatile",
+                    observed_at=old, created=old)
+    store.save_note("稳定。", note_id="N-0002", volatility="stable",
+                    observed_at=old, created=old)
+    store.save_note("引用 N-0001 与 N-0002。", note_id="N-0003")
+    store.save_page("p", "P", "# P\n\n断言（N-0001、N-0002）。\n")
+    store.save_conflict("矛盾", {"note_id": "N-0001"}, {"note_id": "N-0002"})
+
+    assert main(["lint", "--root", str(tmp_path / "wiki-data"), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["freshness"] == {"fresh": 2, "review_due": 0, "stale": 1}
+    assert payload["conflicts_open"] == 1
+    assert payload["exit_code"] == 0  # 陈旧不判红
+    assert payload["details"]["freshness_queue"][0]["note_id"] == "N-0001"
 
 
 def test_cli_lint_missing_root_is_healthy(tmp_path: Path, capsys):
