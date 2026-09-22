@@ -100,6 +100,11 @@ class Note:
     def source_changed_at(self) -> str | None:
         return self.meta.source_changed_at
 
+    @property
+    def tombstone(self) -> bool:
+        """是否墓碑笔记（审计记录，默认不参与检索与 Prior 注入；见 NoteMeta.tombstone）。"""
+        return self.meta.tombstone
+
 
 @dataclass
 class Page:
@@ -166,6 +171,7 @@ class WikiStore:
         volatility: str = "stable",
         kind: str = "knowledge",
         importance: float | None = None,
+        tombstone: bool = False,
         observed_at: str | None = None,
         reviewed_at: str | None = None,
         valid_from: str | None = None,
@@ -180,6 +186,12 @@ class WikiStore:
 
         note_id 缺省时自动分配（续接编号）；传入已有 id 即原地更新，
         created 会保留原值（除非显式传入）。
+
+        ``tombstone`` 是墓碑标记（P2-F 裁定一）：True 表示这条笔记是"已失效记忆"
+        的审计记录（``memory_invalidate`` 生成），检索与 Prior 注入默认排除它。
+        与 kind / importance 同属"save_note 参数默认值会静默丢字段"的字段——
+        任何以既有 meta 重建笔记的调用方（update / supersede / mark_source_changed）
+        都必须**逐字段透传** ``tombstone=meta.tombstone``，否则标记会被静默清掉。
         """
         meta = NoteMeta(
             id=note_id or self.next_note_id(),
@@ -192,6 +204,7 @@ class WikiStore:
             volatility=volatility,
             kind=kind,
             importance=importance,
+            tombstone=bool(tombstone),
             observed_at=observed_at,
             reviewed_at=reviewed_at,
             valid_from=valid_from,
@@ -393,6 +406,9 @@ class WikiStore:
                 volatility=meta.volatility,
                 kind=meta.kind,
                 importance=meta.importance,
+                # 墓碑标记逐字段透传：本方法只改 source_changed_at / extra，
+                # 不参与墓碑生成，但重建 meta 时漏传会把标记静默清掉。
+                tombstone=meta.tombstone,
                 observed_at=meta.observed_at,
                 reviewed_at=meta.reviewed_at,
                 valid_from=meta.valid_from,

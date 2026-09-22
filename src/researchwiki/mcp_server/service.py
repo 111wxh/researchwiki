@@ -26,9 +26,18 @@
 
 索引一致性
 ----------
-写入后立即 ``SearchIndex.index_note``；检索前若发现 md 文件比 index.db 新、
-或索引条数与笔记数不符（外部进程改过 wiki），自动全量重建一次。
-每次调用新建 SearchIndex（sqlite 连接不跨线程；FastMCP 默认在线程池里跑同步工具）。
+写入后立即 ``SearchIndex.index_note``；检索前检查索引是否落后于 store——
+**判据与 loop 路径共用** ``wiki.index.index_drift``（id 集合 / status / 索引指纹
+三维），落后则整体重建一次。每次调用新建 SearchIndex（sqlite 连接不跨线程；
+FastMCP 默认在线程池里跑同步工具）。
+
+v1 的旧判据是"md 的 mtime 比 index.db 新，或索引条数与笔记数不符"，与 loop 路径
+（``prior.ensure_index_fresh`` 的指纹判定）分叉：同一 store/index 状态两条路径会
+给出不同答案，且任何"写 md 不写 index.db"的路径（``mark_source_changed`` 只改
+frontmatter、``index_note`` 失败后的补偿等）都会让 MCP 路径必然判 stale 并白做一次
+全量重建。P2-F 裁定二把这个判据抽成共享函数后，mtime 前置被删除：它只是"内容变过"
+的弱代理（同秒改写漏判、只改元数据的原地改写完全看不出来），而共享判据要读的
+``store.list_notes`` 本来就是 mtime 检查的必需步骤，删掉 mtime 不省任何 IO。
 
 memory_* 记忆接口（P1-A）
 ------------------------
@@ -38,6 +47,13 @@ memory_* 记忆接口（P1-A）
 invalidate（判定失效，自动生成墓碑笔记而非新增状态——"superseded 必须沿链可达
 active"的不变量与状态机都留给 P2）/ timeline（版本史）/ conflicts（冲突台账）/
 profile（User Memory 视图）。wiki_* 五工具保持原样作为兼容层。
+
+墓碑的检索可见性（P2-F 裁定一）
+------------------------------
+``memory_invalidate`` 生成的墓碑带 ``tombstone: true`` 标记（类型化 frontmatter
+字段 + ``note_meta.tombstone`` 列，进 ``note_index_hash`` 指纹）。它是**审计记录**
+而非当前知识，所以 search / recall **默认排除**，要审计时显式
+``include_tombstones=True``；``read`` / ``timeline`` / ``lint`` 照常可见。
 
 证据链入口（P2 carried 项④）
 ---------------------------
@@ -91,7 +107,7 @@ from researchwiki.wiki.frontmatter import (
     SourceRef,
     parse,
 )
-from researchwiki.wiki.index import SearchIndex, wiki_settings
+from researchwiki.wiki.index import SearchIndex, index_drift, wiki_settings
 from researchwiki.wiki.store import Note, WikiStore
 
 # 工具参数上限：防止客户端一次拉爆自己的上下文
@@ -442,29 +458,31 @@ class WikiService:
             half_life_days=self.settings.half_life_days,
         )
 
-    def _index_is_stale(self) -> bool:
-        """索引是否需要重建：md 比 index.db 新，或索引条数与笔记数不符（外部改动）。
+    def _index_is_stale(self, index: SearchIndex) -> str | None:
+        """索引落后于 store 的原因（``None`` = 新鲜，无需重建）。
 
-        必须在打开 SearchIndex 之前调用——打开索引本身会写 index.db（建表 + 写 meta），
-        之后 index.db 的 mtime 就永远比 md 新了。
+        **契约变更（P2-F 裁定二）**：v1 是"md 比 index.db 新，或索引条数与笔记数
+        不符"的 mtime + 条数口径，且必须在打开 SearchIndex 之前调用（打开索引会写
+        index.db，之后 mtime 判据永远失效）。现在判定委托给 loop 路径同一份
+        ``wiki.index.index_drift``（id 集合 / status / **索引指纹**三维），于是：
+
+        - 返回类型由 ``bool`` 变成 ``str | None``（落后原因，供 health/审计展示）；
+        - 调用时点反转：必须在**打开索引之后**调用（判据要读 note_meta 快照），
+          调用方先 ``_open_index()`` 再问"落后没有"；
+        - mtime 前置被删除（理由见模块 docstring）：它能漏掉的正是指纹维度要治的
+          那些原地改写，而共享判据本来就要全量扫一遍 store。
+
+        与 loop 路径的差别只剩"落后了怎么办"：这里重建失败不阻断检索（降级为旧
+        快照 + 结构化告警），``ensure_index_fresh`` 则直接抛给调用方。
         """
-        db_path = self.root / "index.db"
-        if not db_path.is_file():
-            return True
-        notes = self.store.list_notes(status=None)
-        if not notes:
-            return False
-        newest_md = max((n.path.stat().st_mtime for n in notes if n.path), default=0.0)
-        if newest_md > db_path.stat().st_mtime:
-            return True
-        indexed = _count_indexed_notes(db_path)
-        return indexed is not None and indexed != len(notes)
+        stale, reason = index_drift(self.store, index)
+        return reason if stale else None
 
     def _sync_index(self, index: SearchIndex, *, stale: bool) -> _IndexSync:
-        """按需重建索引（外部进程改过 wiki 时），失败不阻断检索（降级为旧快照）。
+        """按需重建索引（落后于 store 时），失败不阻断检索（降级为旧快照）。
 
-        ``stale`` 必须由调用方在打开 SearchIndex 之前算好：打开索引会写 index.db，
-        之后它的 mtime 就永远比 md 新，mtime 判据会失效。
+        ``stale`` 由调用方用 ``_index_is_stale`` 在打开索引之后算好（P2-F 起判据
+        是共享的 ``index_drift``，见该方法的契约说明）。
         """
         if not stale:
             return _IndexSync()
@@ -475,11 +493,21 @@ class WikiService:
         return _IndexSync(rebuilt=True, notes_indexed=count)
 
     @_structured_errors
-    def search(self, query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        kind: str | None = None,
+        include_tombstones: bool = False,
+    ) -> dict[str, Any]:
         """双通道检索（FTS5 + 向量 + RRF），返回 active 笔记；跟随 redirect 并标注来源。
 
         ``kind`` 给定时（knowledge/user/experience）只返回该类型笔记；
         非法取值抛 invalid_kind。
+
+        ``include_tombstones``（P2-F 裁定一）缺省 False = 墓碑（``memory_invalidate``
+        生成的失效裁定记录）**不出现在结果里**；传 True 才把墓碑当普通命中返回
+        （审计/排查用）。判定含重定向落点，见 ``SearchIndex.search``。
         """
         text = (query or "").strip()
         if not text:
@@ -487,10 +515,18 @@ class WikiService:
         if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= MAX_K:
             raise WikiToolError("invalid_argument", f"k 必须是 1..{MAX_K} 的整数，得到 {k!r}")
         normalized_kind = validate_kind(kind)
-        stale = self._index_is_stale()
+        if not isinstance(include_tombstones, bool):
+            raise WikiToolError(
+                "invalid_argument",
+                f"include_tombstones 必须是布尔值，得到 {include_tombstones!r}",
+            )
         with self._open_index() as index:
-            sync = self._sync_index(index, stale=stale)
-            matches = index.search(text, k=k, kind=normalized_kind)
+            # 判据是共享的 index_drift（读 note_meta 快照），故先开索引再判落后
+            stale_reason = self._index_is_stale(index)
+            sync = self._sync_index(index, stale=stale_reason is not None)
+            matches = index.search(
+                text, k=k, kind=normalized_kind, include_tombstones=include_tombstones
+            )
         results = [
             {
                 "note_id": m.note_id,
@@ -517,6 +553,7 @@ class WikiService:
         }
         if sync.rebuilt:
             payload["index_rebuilt"] = sync.notes_indexed
+            payload["index_stale_reason"] = stale_reason
         if sync.error:
             payload["index_warning"] = f"索引重建失败，本次检索基于旧快照：{sync.error}"
         if not results:
@@ -546,6 +583,9 @@ class WikiService:
                 "status": note.meta.status,
                 "kind": note.meta.kind,
                 "importance": note.meta.importance,
+                # 墓碑标记：read 是审计可见性的出口（墓碑默认不在检索结果里，
+                # 但要能读全文、能看出"这条是墓碑"）
+                "tombstone": note.meta.tombstone,
                 "confidence": note.meta.confidence,
                 "volatility": note.meta.volatility,
                 "entities": list(note.meta.entities),
@@ -596,12 +636,16 @@ class WikiService:
         sources: Sequence[SourceInput] | None = None,
         kind: str = "knowledge",
         importance: float | None = None,
+        tombstone: bool = False,
     ) -> dict[str, Any]:
         """新增一条原子笔记：校验 → 备份 → 落盘 → 同步索引。
 
         ``kind``/``importance`` 是记忆载体字段（P1-A）：wiki_write 不暴露它们
         （工具签名不变，走默认值），memory_store 经此通道透传。
         ``sources`` 的元素可以是 URL 字符串或 ``{"url", "content_hash"}`` 映射。
+        ``tombstone`` 是墓碑标记（P2-F 裁定一）：同样不暴露给 wiki_write，
+        只由 ``invalidate_memory`` 生成墓碑时传 True——客户端无法自行把普通
+        笔记标成墓碑（那是失效裁定，必须走 memory_invalidate 留 reason）。
         """
         fields = _validate_write_inputs(
             body=body,
@@ -612,6 +656,7 @@ class WikiService:
             sources=sources,
             kind=kind,
             importance=importance,
+            tombstone=tombstone,
         )
         warnings = list(fields.pop("warnings", []))
         with self._write_lock:
@@ -709,14 +754,22 @@ class WikiService:
         )
 
     @_structured_errors
-    def recall(self, query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+    def recall(
+        self,
+        query: str,
+        k: int = 5,
+        kind: str | None = None,
+        include_tombstones: bool = False,
+    ) -> dict[str, Any]:
         """动态召回入口（P3 的钩子位）：MVP = search + 重定向跟随 + 结构化透传。
 
         P3 将升级为 budget-aware 动态召回（按 token 预算与 importance 挑选记忆），
         当前为结构化透传：在 search 结果上为每条记忆标注 status / observed_at /
         kind（附 importance），让调用方按记忆状态自行取舍，不做预算裁剪。
+
+        ``include_tombstones`` 与 ``search`` 同语义（缺省 False = 墓碑不进召回）。
         """
-        payload = self.search(query, k=k, kind=kind)
+        payload = self.search(query, k=k, kind=kind, include_tombstones=include_tombstones)
         if not payload.get("ok"):
             return payload
         for item in payload["results"]:
@@ -808,6 +861,8 @@ class WikiService:
                     volatility=meta.volatility,
                     kind=meta.kind,
                     importance=meta.importance,
+                    # 墓碑标记透传（修订不该顺手把墓碑变回普通记忆）
+                    tombstone=meta.tombstone,
                     observed_at=meta.observed_at,
                     reviewed_at=now,
                     trace_id=meta.trace_id,
@@ -995,6 +1050,12 @@ class WikiService:
         kind=knowledge 的 active 笔记（正文 = 失效原因 + 时间戳），旧笔记
         status=superseded 且 superseded_by 指向墓碑——"superseded 必须沿链
         可达 active"的不变量与审计留痕同时保住。
+
+        墓碑另带 ``tombstone: true`` 标记（P2-F 裁定一）：它是审计记录而非当前
+        知识，检索（``search``/``recall``）与 run 的 Prior 注入**默认排除**它，
+        但 ``wiki_read`` / ``memory_timeline`` / ``lint`` 照常可见——对外返回体
+        与链可达性（P1-A 契约）逐字段不变，变的只是"它不再被当作 active 知识
+        召回"。需要把墓碑当普通命中取回时用 ``include_tombstones=True``。
         """
         if not isinstance(reason, str) or not reason.strip():
             raise WikiToolError(
@@ -1014,6 +1075,7 @@ class WikiService:
                 title=derive_title(f"[已失效] {old.title}" if old.title else "[已失效] 记忆"),
                 entities=list(old.meta.entities),
                 kind="knowledge",
+                tombstone=True,
             )
             if not written.get("ok"):
                 return written
@@ -1206,6 +1268,8 @@ class WikiService:
                 volatility=meta.volatility,
                 kind=meta.kind,
                 importance=meta.importance,
+                # 墓碑标记透传（把墓碑本身标 superseded 的场景：标记不能丢）
+                tombstone=meta.tombstone,
                 observed_at=meta.observed_at,
                 reviewed_at=now,
                 trace_id=meta.trace_id,
@@ -1367,7 +1431,13 @@ class WikiService:
 
     @_structured_errors
     def health(self) -> dict[str, Any]:
-        """wiki 自检：笔记/页面/实体/冲突计数 + 索引状态。"""
+        """wiki 自检：笔记/页面/实体/冲突计数 + 索引状态。
+
+        ``index.stale`` 布尔语义不变，判据换成与 loop 路径共享的 ``index_drift``
+        （P2-F 裁定二）；落后时另给 ``index.stale_reason``（点名缺失/变化的
+        note_id），这是 v1 只有 ``stale: true/false`` 时拿不到的审计信息（新增
+        字段为追加，既有键与含义不变）。
+        """
         notes = self.store.list_notes(status=None)
         by_status: dict[str, int] = {"active": 0, "merged": 0, "superseded": 0}
         for note in notes:
@@ -1378,12 +1448,19 @@ class WikiService:
         if db_path.is_file():
             index_info["exists"] = True
             index_info["indexed_notes"] = _count_indexed_notes(db_path)
-            index_info["stale"] = self._index_is_stale()
             try:
                 with self._open_index() as index:
                     index_info["tokenizer"] = index.tokenizer
+                    # 与 loop 路径同一判据（index_drift）：stale 为布尔（既有契约），
+                    # 落后原因另放 stale_reason，便于排查"为什么它判落后"。
+                    reason = self._index_is_stale(index)
+                    index_info["stale"] = reason is not None
+                    if reason is not None:
+                        index_info["stale_reason"] = reason
             except Exception as exc:  # noqa: BLE001 -- 索引坏了也要能报健康度
                 index_info["error"] = f"{type(exc).__name__}: {exc}"
+                # 索引打不开就没法比对指纹：退回"有笔记就算需重建"的保守判断
+                index_info["stale"] = bool(notes)
         else:
             index_info["exists"] = False
             index_info["stale"] = bool(notes)
@@ -1421,6 +1498,7 @@ def _validate_write_inputs(
     sources: Sequence[SourceInput] | None,
     kind: str = "knowledge",
     importance: float | None = None,
+    tombstone: bool = False,
 ) -> dict[str, Any]:
     """wiki_write / memory_store 的输入校验（写保护第 1 件）。
 
@@ -1495,6 +1573,10 @@ def _validate_write_inputs(
         )
     elif not normalized_sources:
         warnings.append("sources 解析后为空：笔记没有可用来源 URL")
+    # tombstone 是布尔标记（P2-F 裁定一），只由 invalidate_memory 传 True；
+    # 非布尔值一律拒绝，避免 "true"/1 这类形态在服务层被静默归一成另一层语义。
+    if not isinstance(tombstone, bool):
+        errors.append(f"tombstone 必须是布尔值，得到 {tombstone!r}")
     if errors:
         raise WikiToolError(
             "validation_failed",
@@ -1508,6 +1590,7 @@ def _validate_write_inputs(
         "volatility": str(vol),
         "kind": normalized_kind,
         "importance": normalized_importance,
+        "tombstone": bool(tombstone),
         "sources": normalized_sources,
         "warnings": warnings,
     }

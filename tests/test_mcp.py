@@ -596,7 +596,13 @@ class TestRedirectRead:
     def test_redirect_note_explained_in_payload(
         self, service: WikiService, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """索引层报出 redirected_from 时，payload 里要有人话说明（含两个 ID）。"""
+        """索引层报出 redirected_from 时，payload 里要有人话说明（含两个 ID）。
+
+        替身需跟上 P2-F 的两处契约变更：① ``search`` 多了 ``include_tombstones``
+        关键字参数；② ``_index_is_stale`` 改用共享判据 ``index_drift``，会向索引问
+        ``indexed_fingerprints()``（本用例 store 为空，返回空快照即"新鲜"，
+        因此 rebuild 仍不该被调用）。
+        """
         from researchwiki.mcp_server import service as svc
 
         class FakeIndex:
@@ -609,7 +615,17 @@ class TestRedirectRead:
             def __exit__(self, *exc: object) -> None:
                 return None
 
-            def search(self, query: str, k: int = 5, kind: str | None = None) -> list[Any]:
+            def indexed_fingerprints(self) -> dict[str, tuple[str, str]]:
+                return {}  # 空 store + 空索引 = 新鲜，不触发 rebuild
+
+            def search(
+                self,
+                query: str,
+                k: int = 5,
+                kind: str | None = None,
+                *,
+                include_tombstones: bool = False,
+            ) -> list[Any]:
                 from researchwiki.wiki.index import SearchMatch
 
                 return [
@@ -1541,15 +1557,52 @@ class TestMemoryTools:
         assert tomb_meta["status"] == "active"
         assert tomb_meta["kind"] == "knowledge"
         assert "官方辟谣，传闻不实" in tomb_body
+        # P2-F 裁定一：墓碑带显式标记（类型化 frontmatter 字段）
+        assert tomb_meta["tombstone"] is True
 
         # 旧笔记沿链可达墓碑（不变量：superseded 必须沿链可达 active）
         old_meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
         assert old_meta["status"] == "superseded"
         assert old_meta["superseded_by"] == "N-0002"
         assert old_meta["invalidate_reason"] == "官方辟谣，传闻不实"
+        # 普通笔记不写 tombstone 键（False 是缺省，不污染每篇 frontmatter）
+        assert "tombstone" not in old_meta
         read = service.read("N-0001")
         assert read["note"]["note_id"] == "N-0002"
         assert read["redirected"] is True
+
+    def test_invalidate_tombstone_is_excluded_from_search_and_recall(
+        self, service: WikiService
+    ) -> None:
+        """裁定一①②③④：墓碑默认不出现在 search/recall，include 时出现，read 仍可读全文。"""
+        _write_note(service, "传闻：某模型下周发布。", title="某模型发布传闻")
+        payload = service.invalidate_memory("N-0001", "官方辟谣，传闻不实")
+        tombstone_id = str(payload["tombstone_id"])
+
+        # ① 缺省检索不含墓碑（连"命中旧 ID → 重定向落到墓碑"也不返回）
+        assert service.search("传闻")["count"] == 0
+        assert service.recall("传闻")["count"] == 0
+        assert service.search("辟谣")["count"] == 0
+        # ② 显式 include_tombstones=True 时墓碑作为普通命中出现
+        included = service.search("辟谣", include_tombstones=True)
+        assert included["count"] == 1
+        assert included["results"][0]["note_id"] == tombstone_id
+        recalled = service.recall("辟谣", include_tombstones=True)
+        assert [r["note_id"] for r in recalled["results"]] == [tombstone_id]
+        assert recalled["results"][0]["status"] == "active"
+        # ④ 墓碑仍可读全文，且读得到墓碑标记（审计出口）
+        read = service.read(tombstone_id)
+        assert read["ok"] is True and read["redirected"] is False
+        assert read["note"]["tombstone"] is True
+        assert "官方辟谣，传闻不实" in read["body"]
+
+    def test_search_include_tombstones_rejects_non_bool(self, service: WikiService) -> None:
+        """参数类型显式校验：不做隐式真值归一（"yes"/1 不该被猜成 True）。"""
+        _write_note(service, "正文", title="标题")
+        for bad in ("yes", 1, None):
+            payload = service.search("正文", include_tombstones=bad)
+            assert payload["ok"] is False
+            assert payload["error"]["code"] == "invalid_argument"
 
     def test_invalidate_requires_reason(self, service: WikiService) -> None:
         _write_note(service, "正文", title="标题")
@@ -1867,6 +1920,64 @@ class TestHealth:
         assert index["indexed_notes"] == 1
         assert index["stale"] is False
         assert index["tokenizer"] == "trigram"
+        # 判据换成共享的 index_drift（P2-F 裁定二）：新鲜时不带 stale_reason
+        assert "stale_reason" not in index
+
+    def test_health_reports_stale_reason_from_shared_judgement(
+        self, service: WikiService, store: WikiStore
+    ) -> None:
+        """契约变更（P2-F 裁定二）：stale 布尔语义不变，落后原因由共享判据给出。
+
+        构造"md 改了但索引没跟上"（绕过 MCP 直接写 md）→ ``stale: true`` 且
+        ``stale_reason`` 点名具体 note_id——这是 v1 的 boolean 拿不到的审计信息。
+        """
+        _write_note(service, "外部进程会改这条笔记。", title="检索一致性")
+        assert service.health()["index"]["stale"] is False
+        store.save_note("外部进程改过的新正文。", note_id="N-0001", title="检索一致性")
+        index = service.health()["index"]
+        assert index["stale"] is True
+        assert "索引字段变化" in index["stale_reason"]
+        assert "N-0001" in index["stale_reason"]
+
+
+class TestHealthIndexDriftContract:
+    """MCP 路径与 loop 路径对同一状态必须给出一致结论（P2-F 裁定二）。"""
+
+    def test_search_rebuilds_when_fingerprint_drifted(
+        self, service: WikiService, store: WikiStore
+    ) -> None:
+        """md 改了但索引没更新 → MCP 判落后并重建，检索命中新正文。"""
+        _write_note(service, "旧正文：量子退火炉的初代读数甲。", title="观测记录")
+        assert service.search("量子退火炉")["count"] == 1
+        store.save_note("新正文：闪电风暴仪的次代读数乙。", note_id="N-0001", title="观测记录")
+        payload = service.search("闪电风暴仪")
+        assert payload["index_rebuilt"] >= 1
+        assert "索引字段变化" in payload["index_stale_reason"]
+        assert [r["note_id"] for r in payload["results"]] == ["N-0001"]
+
+    def test_search_skips_rebuild_when_only_mtime_changed(
+        self, service: WikiService, store: WikiStore
+    ) -> None:
+        """回归"白做功"：md 被重写但指纹没变（mark_source_changed 路径）→ 不重建。
+
+        旧判据（md mtime 比 index.db 新即判 stale）在这里会全量重建一次却什么
+        都没变；共享判据只看集合/status/指纹，正确判"新鲜"。
+        """
+        url = "https://example.com/quantum"
+        written = _write_note(
+            service,
+            "量子退火炉的初代读数甲。",
+            title="观测记录",
+            sources=[{"url": url, "content_hash": "sha1:old"}],
+        )
+        assert written["indexed"] is True
+        assert service.health()["index"]["stale"] is False
+        # 只写 md 不写索引：frontmatter 多出 source_changed_at（mtime 也变了）
+        assert store.mark_source_changed(url, "sha1:new") == ["N-0001"]
+        payload = service.search("量子退火炉")
+        assert "index_rebuilt" not in payload  # 判新鲜 → 零重建（旧判据下这里必然重建）
+        assert [r["note_id"] for r in payload["results"]] == ["N-0001"]
+        assert service.health()["index"]["stale"] is False
 
     def test_entity_count(self, service: WikiService, store: WikiStore) -> None:
         from researchwiki.wiki.entities import EntityRegistry

@@ -4,14 +4,18 @@
 
 - ``retrieve_priors``：对问题检索 active notes。命中 merged/superseded 时返回
   最终 active note，并保留重定向链信息（哪些旧 ID 重定向到了它）；同一最终
-  note 被多个旧 ID 命中时合并 ``redirected_from`` 列表。
+  note 被多个旧 ID 命中时合并 ``redirected_from`` 列表。**墓碑（``meta.tombstone``）
+  默认不进 Prior**——它是审计记录不是当前知识，被当作 active 知识注入 plan 在
+  RQ2 语义下是错的（P2-F 裁定一）；要审计时才显式传给 ``SearchIndex.search``。
 - ``format_prior_context``：格式化成人类可读的 markdown 块。**必须包含标签行**
   ``历史 Prior，仅供核验，不是本轮 fresh evidence``（原文一字不差，后续任务
   的测试会断言它），提醒下游 Prior 不能直接当答案、其 URL 不得混入本轮
   SourcePool。
 - ``ensure_index_fresh``：run 开始前检查索引是否落后于 store（笔记集合、status
   或**索引指纹**任一不一致即视为落后），落后则整体 ``index.rebuild(store)``。
-  MVP 只做"检测落后 → 整体 rebuild"，等收益实验跑通后再优化增量同步。
+  判定本身委托给 ``index.index_drift``——**与 MCP 路径共用同一份判据**（P2-F
+  裁定二），本函数只负责"落后了怎么办"。MVP 只做"检测落后 → 整体 rebuild"，
+  等收益实验跑通后再优化增量同步。
 
 注入内容每条带：note_id、title、置信度、volatility、observed_at（缺省用
 created）、来源 URL 列表、正文（可截断）、以及若有重定向链则列出
@@ -25,7 +29,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from researchwiki.wiki.index import SearchIndex, SearchMatch, note_index_hash
+from researchwiki.wiki.index import SearchIndex, SearchMatch, index_drift
 from researchwiki.wiki.store import Note, WikiStore
 
 # 标签行原文（PLAN §4.2 一字不差；后续任务在测试里断言它）
@@ -133,6 +137,7 @@ def retrieve_priors(
     *,
     k: int = DEFAULT_K,
     max_chars: int = DEFAULT_MAX_CHARS,
+    include_tombstones: bool = False,
 ) -> PriorContext:
     """对问题检索 Prior：检索 → 跟随重定向 → 按 k 截取 → 预算内格式化。
 
@@ -140,11 +145,15 @@ def retrieve_priors(
       命中 merged/superseded 时取最终 active note（``SearchMatch.redirected_from``
       指向被命中的旧 ID；若拿到的 note 仍是 merged/superseded，则防御性地
       自行走链到最终 active——有界防环、不抛异常，走不到就丢弃该命中）。
+    - ``include_tombstones`` 缺省 False：墓碑（失效裁定记录）不进 Prior 注入。
+      过滤在检索层（``SearchIndex.search``）完成，含"命中旧 ID → 重定向落到
+      墓碑"的情况；这里透传参数只是把"注入什么"的口径显式写在本层签名上，供
+      审计场景显式打开。
     - 总上下文不超过 ``max_chars``：按分数从高到低装入，放不下的整条丢弃，
       末位命中可压缩正文到最低保留长度；被保留的 hits 才进入 ``PriorContext``。
     - 空 Wiki / 无命中 / 预算内一条也放不下 → 空 PriorContext，不抛异常。
     """
-    matches = index.search(question, k=k)
+    matches = index.search(question, k=k, include_tombstones=include_tombstones)
     hits = _collect_hits(matches, store)
     kept = _fit_within_budget(hits, max_chars)
     context_chars = len(format_prior_context(kept))
@@ -339,60 +348,18 @@ def _format_block(pos: int, hit: PriorHit) -> str:
 def ensure_index_fresh(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
     """run 开始前检查索引是否落后于 store；落后则整体 rebuild。
 
-    判定口径（P2-B 起为**三维**，任一维不符即落后）：
+    判定**不在本模块**：``index.index_drift`` 是 loop 与 MCP 两条路径共用的唯一
+    判据（P2-F 裁定二——同一系统对"索引是否落后"必须只有一个答案），本函数只
+    负责"落后了怎么办"：落后 → ``index.rebuild(store)``，返回 ``(True, 原因)``；
+    新鲜 → 不写任何东西，返回 ``(False, 原因)``。返回文案与抽判据之前逐字一致
+    （陈旧态 ``索引落后于 store：…；已执行 rebuild（索引 N 条笔记）``，新鲜态
+    ``索引与 store 一致（…），无需 rebuild``），P2-B 的调用方与测试不受影响。
 
-    1. **id 集合差异**：store 全量笔记（active/merged/superseded）里有索引没有的
-       （新增）或有索引里多出的（已删除）；
-    2. **status 变化**：同 id 的 meta.status 与索引记录不同；
-    3. **索引指纹变化**：同 id 的 ``note_index_hash(note)`` 与索引里的 ``body_hash``
-       不同。指纹覆盖 ``index_note`` 写入索引且参与检索/过滤的**全部字段**
-       （title/body/confidence/volatility/kind/redirect_to/superseded_by/
-       observed_at/created），因此这一维既治"同 id 原地改写正文"（``memory_update``
-       与 formation merge 两个新入口），也治**只改元数据**的原地改写——
-       ``loop._annotate_formation`` 正在原地回写 kind/importance，其 docstring
-       自己写明"若 formation 未来赋非 knowledge kind，必须触发索引同步，否则
-       kind 过滤会失真"；只比 status 或只比正文都兜不住这条路径。
-       **旧库迁移留下的空指纹**（迁移时 ALTER 补列、未回填）同样算落后：
-       宁可重建一次，也不接受"不知道索引里是哪版检索视图"。
-
-    落后即 ``index.rebuild(store)`` 并返回 ``(True, 原因)``；原因里点名具体
-    note_id（索引字段变化 / status 变化 / 新增 / 索引多余 / 缺指纹），便于审计；
-    新鲜返回 ``(False, 原因)``，不做任何写入。策略仍是"检测到落后 → 整体
-    rebuild"（增量同步留给后续优化），且本函数只读 store + 只写索引，不动 md。
+    三维口径（id 集合 / status / 索引指纹，含墓碑标记与空指纹）见 ``index_drift``
+    的 docstring；本函数只读 store + 写索引，不动 md。
     """
-    notes = store.list_notes(status=None)
-    store_status = {n.id: n.status for n in notes}
-    store_hash = {n.id: note_index_hash(n) for n in notes}
-    indexed = index.indexed_fingerprints()
-    index_status = {note_id: status for note_id, (status, _) in indexed.items()}
-    if store_status == index_status and all(
-        indexed[note_id][1] == store_hash[note_id] for note_id in store_status
-    ):
-        return False, (
-            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与索引指纹均相同），"
-            "无需 rebuild"
-        )
-    missing = sorted(set(store_status) - set(index_status))
-    extra = sorted(set(index_status) - set(store_status))
-    common = set(store_status) & set(index_status)
-    changed = sorted(n for n in common if store_status[n] != index_status[n])
-    # 缺指纹：迁移后未回填的行（body_hash 为空串）；它不能进"字段变化"口径，
-    # 否则会把"不知道是哪版"说成"字段变了"，误导审计。
-    legacy = sorted(n for n in common if not indexed[n][1])
-    rehashed = sorted(
-        n for n in common if indexed[n][1] and indexed[n][1] != store_hash[n]
-    )
-    parts: list[str] = []
-    if missing:
-        parts.append(f"新增: {', '.join(missing)}")
-    if rehashed:
-        parts.append(f"索引字段变化: {', '.join(rehashed)}")
-    if changed:
-        detail = "、".join(f"{nid}:{index_status[nid]}→{store_status[nid]}" for nid in changed)
-        parts.append(f"status 变化 {len(changed)} 条（{detail}）")
-    if legacy:
-        parts.append(f"旧索引缺指纹（{len(legacy)} 条：{', '.join(legacy)}）")
-    if extra:
-        parts.append(f"索引多余: {', '.join(extra)}")
+    stale, reason = index_drift(store, index)
+    if not stale:
+        return False, f"{reason}，无需 rebuild"
     count = index.rebuild(store)
-    return True, f"索引落后于 store：{'；'.join(parts)}；已执行 rebuild（索引 {count} 条笔记）"
+    return True, f"{reason}；已执行 rebuild（索引 {count} 条笔记）"

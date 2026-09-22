@@ -3,7 +3,7 @@
 字段一次定齐（防后续迁移）：id / title / entities / confidence / status /
 redirect_to / superseded_by / volatility / observed_at / reviewed_at /
 valid_from / valid_until / source_changed_at / created / trace_id / sources /
-kind / importance。
+kind / importance / tombstone。
 
 设计约定：
 - 未知字段一律收进 ``extra``，round-trip 不丢数据（向后兼容未来扩展）。
@@ -76,6 +76,13 @@ class NoteMeta:
     - volatility: stable（不衰减）| drifting（90 天半衰）| volatile（30 天半衰）。
     - kind: knowledge（世界知识）| user（用户画像/偏好）| experience（经验教训）。
     - importance: 0.0–1.0 的主观重要性；None 表示未评估（序列化时省略）。
+    - tombstone: True = 本笔记是**墓碑**（``memory_invalidate`` 生成的失效裁定
+      记录），False = 普通笔记。墓碑仍是 status=active 的笔记（"superseded 必须
+      沿链可达 active"的不变量不变），但语义上属**审计记录**而非当前知识：
+      检索（``SearchIndex.search``）与 Prior 注入默认按"该标记为真 → 排除"过滤，
+      要看到它需显式 ``include_tombstones=True``；``memory_read`` / ``timeline``
+      / ``lint`` 照常可见（可读性不受影响）。False 是缺省值，序列化时省略，
+      不往每篇普通笔记的 frontmatter 里写 ``tombstone: false``。
     - observed_at: 断言的观察时间（ISO 字符串）；缺省时新鲜度回退 created。
     - valid_from / valid_until: 断言的有效期窗口（ISO 字符串，均可缺省）。
       valid_until 为 None = 未声明显式失效时间，靠在 freshness.py 里按
@@ -99,6 +106,7 @@ class NoteMeta:
     volatility: str = "stable"
     kind: str = "knowledge"
     importance: float | None = None
+    tombstone: bool = False
     observed_at: str | None = None
     reviewed_at: str | None = None
     valid_from: str | None = None
@@ -110,7 +118,7 @@ class NoteMeta:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化回 frontmatter dict；None 的可选字段省略，extra 平铺在最后。"""
+        """序列化回 frontmatter dict：None 的可选字段与 False 的 tombstone 省略，extra 平铺在后。"""
         out: dict[str, Any] = {}
         for f in fields(self):
             if f.name == "extra":
@@ -128,6 +136,8 @@ class NoteMeta:
             )
             if value is None and f.name in optional:
                 continue
+            if f.name == "tombstone" and not value:
+                continue  # False 是缺省：不把 tombstone: false 写进每篇普通笔记
             if f.name == "sources":
                 out[f.name] = [{"url": s.url, "content_hash": s.content_hash} for s in self.sources]
             else:
@@ -164,6 +174,7 @@ class NoteMeta:
             volatility=volatility,
             kind=kind,
             importance=_importance(data.get("importance")),
+            tombstone=_flag(data.get("tombstone")),
             observed_at=_scalar_str(data.get("observed_at")),
             reviewed_at=_scalar_str(data.get("reviewed_at")),
             # 有效期窗口：宽容透传（非 ISO 字符串原样保留，由 freshness 计算侧按不可解析处理）
@@ -212,3 +223,18 @@ def _importance(value: Any) -> float | None:
     if IMPORTANCE_MIN <= number <= IMPORTANCE_MAX:
         return number
     return None
+
+
+def _flag(value: Any) -> bool:
+    """布尔标记字段的宽容解析（tombstone；手工编辑 / 旧数据 / YAML 类型漂移都能读）。
+
+    真值集合：``True``、非零数值、``"true"/"yes"/"on"/"1"``（忽略大小写与两侧空白）；
+    其余（``None`` / False / 0 / 空串 / 无法识别的字符串）一律 False。默认 False 是
+    "普通笔记"，所以无法识别时**不做**墓碑过滤——失败的代价只是多召回一条审计
+    记录，比"正常记忆因为标记没解析出来就从检索里消失"安全得多。
+    """
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int | float):
+        return value != 0
+    return str(value).strip().lower() in ("true", "yes", "on", "1")

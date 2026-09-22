@@ -15,6 +15,10 @@
       正文与 status 都不变）同样检出——覆盖 ``_annotate_formation`` 回写 kind
       这条已被代码预判的路径。
 
+P2-F 追加两组：``tombstone`` 列（裁定一：墓碑标记进指纹、旧库 ALTER 回填 0），
+以及 ``index_drift`` 共享判据（裁定二：MCP 与 loop 两条路径对同一状态给出一致
+结论——含"md 重写但指纹没变"时**两边都不重建**的"白做功"回归）。
+
 零网络：MockEmbeddingProvider（dim=128，与 service 层缺省一致）+ tokenizer=trigram。
 
 检索断言的写法说明：Mock 向量通道对任何查询都可能返回命中（余弦只要 > 1e-6 即算
@@ -32,7 +36,7 @@ import pytest
 
 from researchwiki.mcp_server.service import WikiService
 from researchwiki.wiki.embeddings import MockEmbeddingProvider
-from researchwiki.wiki.index import SearchIndex, SearchMatch, note_index_hash
+from researchwiki.wiki.index import SearchIndex, SearchMatch, index_drift, note_index_hash
 from researchwiki.wiki.prior import ensure_index_fresh
 from researchwiki.wiki.store import Note, WikiStore
 
@@ -296,3 +300,149 @@ class TestBodyRewriteDetection:
             assert rebuilt is True
             assert "索引多余: N-9999" in reason
             assert "N-9999" not in index.indexed_fingerprints()
+
+
+# ---- 裁定一：墓碑标记进指纹 / 列迁移 -------------------------------------------
+
+
+class TestTombstoneFlag:
+    """墓碑标记（``tombstone``）参与索引指纹与检索过滤（P2-F 裁定一）。"""
+
+    def test_fingerprint_covers_tombstone_flag(self, store: WikiStore) -> None:
+        """只改 tombstone（正文/标题/元数据全不动）→ 指纹必须变。"""
+        plain = store.save_note(OLD_BODY, note_id="N-0001", title=TITLE)
+        marked = store.save_note(
+            OLD_BODY, note_id="N-0001", title=TITLE, tombstone=True,
+            created=plain.meta.created,
+        )
+        assert note_index_hash(plain) != note_index_hash(marked)
+        # 反向：标回 False 又回到原指纹（标记是二值、可复原的）
+        unmarked = store.save_note(
+            OLD_BODY, note_id="N-0001", title=TITLE, tombstone=False,
+            created=plain.meta.created,
+        )
+        assert note_index_hash(unmarked) == note_index_hash(plain)
+
+    def test_tombstone_flag_change_is_detected_and_filters_retrieval(
+        self, store: WikiStore
+    ) -> None:
+        """裁定一⑤：标记变化被 ensure_index_fresh 检出，rebuild 后检索排除墓碑。"""
+        store.save_note(OLD_BODY, note_id="N-0001", title=TITLE)
+        with make_index(store) as index:
+            index.rebuild(store)
+            # 陈旧态证据：索引里 tombstone=0，检索照常把它当当前知识返回
+            assert [m.note_id for m in _fts_hits(index, OLD_PHRASE)] == ["N-0001"]
+            # 原地标成墓碑（正文/标题/status 全不变）
+            store.save_note(OLD_BODY, note_id="N-0001", title=TITLE, tombstone=True)
+            rebuilt, reason = ensure_index_fresh(store, index)
+            assert rebuilt is True
+            assert "索引字段变化" in reason and "N-0001" in reason
+            # rebuild 后：默认检索里没有它，显式 include_tombstones 才有
+            assert _fts_hits(index, OLD_PHRASE) == []
+            assert index.search(OLD_PHRASE) == []
+            assert [m.note_id for m in index.search(OLD_PHRASE, include_tombstones=True)] == [
+                "N-0001"
+            ]
+
+    def test_legacy_index_without_tombstone_column_is_migrated(self, store: WikiStore) -> None:
+        """旧库（有 body_hash、无 tombstone 列）探测缺列即 ALTER，存量行回填 0。"""
+        store.save_note(OLD_BODY, note_id="N-0001", title=TITLE)
+        with make_index(store) as index:
+            index.rebuild(store)
+        # 模拟 P2-B~P2-F 之间建的库：列不存在（旧 schema）
+        conn = sqlite3.connect(store.root / "index.db")
+        conn.execute("ALTER TABLE note_meta DROP COLUMN tombstone")
+        conn.commit()
+        conn.close()
+        with make_index(store) as index:
+            columns = {row[1] for row in index._conn.execute("PRAGMA table_info(note_meta)")}
+            assert "tombstone" in columns
+            rows = index._conn.execute("SELECT note_id, tombstone FROM note_meta").fetchall()
+            assert [(str(r[0]), int(r[1])) for r in rows] == [("N-0001", 0)]
+            # 回填 0 是对的（旧数据里不存在墓碑）→ 指纹没变 → 判新鲜，不白做 rebuild
+            fresh, reason = ensure_index_fresh(store, index)
+            assert fresh is False and "无需 rebuild" in reason
+            assert index.search(OLD_PHRASE, include_tombstones=True)
+
+
+# ---- 裁定二：共享判据（MCP 与 loop 两条路径只允许一个答案）---------------------
+
+
+class TestSharedDriftJudgement:
+    """``index.index_drift`` 是两条路径共用的判据（P2-F 裁定二）。
+
+    ``WikiService._index_is_stale`` 在 v1 是 mtime + 条数口径（返回 bool），现在
+    委托给共享判据并返回落后原因（``str | None``）——本类直接对它断言，因为这正是
+    契约变更的那一处；同时用公开行为（``service.search`` 是否 rebuild）兜一层，
+    避免断言只锁在私有方法上。
+    """
+
+    @staticmethod
+    def _service(root: Path) -> WikiService:
+        return WikiService(root, config=CONFIG)
+
+    def test_both_paths_agree_stale_when_md_changed_without_index_update(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "wiki-data"
+        service = self._service(root)
+        written = service.store_memory(OLD_BODY, kind="knowledge")
+        note_id = str(written["note_id"])
+        store = WikiStore(root)
+        # 外部进程改 md（绕过 MCP，索引没跟上）
+        store.save_note(NEW_BODY, note_id=note_id, title=TITLE)
+        with make_index(store) as index:
+            # 同一状态、同一索引实例：共享判据 / MCP 判据 / loop 判据三方同答案
+            stale, reason = index_drift(store, index)
+            assert stale is True
+            assert "索引字段变化" in reason and note_id in reason
+            assert service._index_is_stale(index) == reason  # 逐字同一原因（同一份判据）
+            loop_stale, loop_reason = ensure_index_fresh(store, index)
+            assert loop_stale is True
+            assert loop_reason == f"{reason}；已执行 rebuild（索引 1 条笔记）"
+        # 落点一致：loop 路径那次 rebuild 对 MCP 路径同样生效 → 检索命中新正文
+        # 且不再需要重建（两条路径不会互相判对方的成果为"落后"）
+        payload = service.search(NEW_PHRASE)
+        assert "index_rebuilt" not in payload
+        assert [r["note_id"] for r in payload["results"]] == [note_id]
+        assert payload["results"][0]["snippet"] and NEW_PHRASE in payload["results"][0]["snippet"]
+
+    def test_both_paths_agree_fresh_when_index_matches(self, tmp_path: Path) -> None:
+        root = tmp_path / "wiki-data"
+        service = self._service(root)
+        service.store_memory(OLD_BODY, kind="knowledge")
+        store = WikiStore(root)
+        with make_index(store) as index:
+            assert index_drift(store, index) == (
+                False,
+                "索引与 store 一致（1 条笔记，集合、status 与索引指纹均相同）",
+            )
+            assert service._index_is_stale(index) is None
+            fresh, reason = ensure_index_fresh(store, index)
+            assert fresh is False and "无需 rebuild" in reason
+        payload = service.search(OLD_PHRASE)
+        assert "index_rebuilt" not in payload  # 判新鲜 → 零重建
+        assert payload["count"] == 1
+
+    def test_frontmatter_only_rewrite_is_fresh_for_both_paths(self, tmp_path: Path) -> None:
+        """回归"白做功"：``mark_source_changed`` 只写 md 不写索引 → 两边都判新鲜。
+
+        该路径推后 ``source_changed_at``（不在指纹输入内），旧 mtime 判据必然判
+        stale 并白做一次全量重建；共享判据只看集合/status/指纹，正确判新鲜。
+        """
+        root = tmp_path / "wiki-data"
+        service = self._service(root)
+        url = "https://example.com/quantum"
+        written = service.store_memory(
+            OLD_BODY, kind="knowledge", source_urls=[{"url": url, "content_hash": "sha1:old"}]
+        )
+        note_id = str(written["note_id"])
+        store = WikiStore(root)
+        assert store.mark_source_changed(url, "sha1:new") == [note_id]  # md 真被重写
+        with make_index(store) as index:
+            assert index_drift(store, index)[0] is False
+            assert service._index_is_stale(index) is None
+            assert ensure_index_fresh(store, index)[0] is False
+        payload = service.search(OLD_PHRASE)
+        assert "index_rebuilt" not in payload
+        assert [r["note_id"] for r in payload["results"]] == [note_id]

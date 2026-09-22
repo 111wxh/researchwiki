@@ -326,7 +326,48 @@ def test_prior_disabled_skips_retrieval_and_injection(tmp_path: Path) -> None:
     assert metrics["prior_note_ids"] == []
 
 
-# ---- 7. dispatch 路径：子 agent 用量回流主计数，metrics 可对账 -------------------
+# ---- 7. 墓碑不进 Prior 注入（P2-F 裁定一③，loop 层断言）------------------------
+
+
+def test_tombstone_excluded_from_prior_injection(tmp_path: Path) -> None:
+    """墓碑是审计记录：``memory_invalidate`` 之后同一个问题不再注入失效记忆。
+
+    夹具走完整服务面（WikiService.invalidate_memory 生成墓碑 + tombstone 标记），
+    检索短语只出现在**已失效的旧笔记正文**里 → 唯一命中路径是"重定向到墓碑"，
+    而墓碑必须被排除，于是 Prior 为空、plan 消息里连标签行都不出现。
+    """
+    from researchwiki.mcp_server.service import WikiService
+
+    root = tmp_path / "wiki-data"
+    store = WikiStore(root)
+    preload_note(
+        store,
+        f"历史结论：关于{QUESTION}，初代读数甲认为 Letta 方案最成熟。",
+        note_id="N-0001",
+        title="记忆方案（历史）",
+        confidence="high",
+    )
+    service = WikiService(root, config={"wiki": {"fts_tokenizer": "trigram"}})
+    invalidated = service.invalidate_memory("N-0001", "初代读数甲的结论已被推翻")
+    assert invalidated["ok"] is True
+    tombstone_id = str(invalidated["tombstone_id"])
+
+    loop = make_loop(tmp_path, strong_turns=default_turns())
+    list(loop.events())
+
+    # 墓碑确实在库里（可读、可审计），但没进 Prior
+    assert loop.wiki_store.get_note(tombstone_id).tombstone is True
+    assert loop.prior_context is not None and loop.prior_context.hits == []
+    plan_msg = loop.provider.calls[0][0]  # type: ignore[attr-defined]
+    assert plan_msg.content == QUESTION  # 无注入（连标签行都没有）
+    assert PRIOR_CONTEXT_LABEL not in plan_msg.content
+    assert "初代读数甲" not in plan_msg.content
+    metrics = load_metrics(tmp_path)
+    assert metrics["prior_hit_count"] == 0
+    assert metrics["prior_note_ids"] == []
+
+
+# ---- 8. dispatch 路径：子 agent 用量回流主计数，metrics 可对账 -------------------
 
 
 def test_dispatch_run_tokens_reconcile_with_tokens_jsonl(tmp_path: Path) -> None:
@@ -370,7 +411,7 @@ def test_dispatch_run_tokens_reconcile_with_tokens_jsonl(tmp_path: Path) -> None
     assert metrics["output_tokens"] == token_out == loop.output_tokens
 
 
-# ---- 8. 流中途异常：run-metrics 仍恰好写一次 -------------------------------------
+# ---- 9. 流中途异常：run-metrics 仍恰好写一次 -------------------------------------
 
 
 class _BoomProvider:

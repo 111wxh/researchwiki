@@ -19,10 +19,15 @@
 rebuild(store)（全量重建）或 index_note(note)（增量 upsert）。索引存了
 body 快照（供向量命中出摘要与短查询 LIKE），md 改动后需重新 index_note。
 除正文快照外，note_meta 还存一列 ``body_hash``（``note_index_hash``：title/body +
-confidence/volatility/kind/redirect_to/superseded_by/observed_at/created 的 sha256，
-即"这条索引记录对应哪一版检索视图"的指纹）——``prior.ensure_index_fresh`` 靠它
-发现**同 id 原地改写**（memory_update / formation merge / formation 标注回写 kind
-等入口），只比 status 会静默保留陈旧索引。
+confidence/volatility/kind/redirect_to/superseded_by/observed_at/created/tombstone
+的 sha256，即"这条索引记录对应哪一版检索视图"的指纹）——``prior.ensure_index_fresh``
+与 ``mcp_server.service._index_is_stale`` **共用** ``index_drift`` 这一个判据
+发现**同 id 原地改写**（memory_update / formation merge / formation 标注回写 kind /
+memory_invalidate 写墓碑标记等入口），只比 status 会静默保留陈旧索引。
+
+墓碑的检索可见性（P2-F 裁定一）：``note_meta.tombstone`` 是墓碑标记（真 = 该笔记
+是失效裁定记录），``search()`` 缺省把它排除在结果之外（``include_tombstones=True``
+才看得到）；墓碑仍可 read / timeline / lint，只是不再被当作当前知识召回。
 """
 
 from __future__ import annotations
@@ -216,16 +221,18 @@ def note_index_hash(note: Note) -> str:
 
     指纹输入（顺序固定，逐字段以 ``"\\n"`` 连接后取 sha256 hex）：``title``、
     ``body``、``confidence``、``volatility``、``kind``、``redirect_to``、
-    ``superseded_by``、``observed_at``、``created``——即 ``note_fts`` 的两列
-    （title/body）加 ``note_meta`` 里 ``search()`` 实际消费的七个元数据列：
-    confidence / volatility / observed_at / created 进检索打分
+    ``superseded_by``、``observed_at``、``created``、``tombstone``——即
+    ``note_fts`` 的两列（title/body）加 ``note_meta`` 里 ``search()`` 实际消费的
+    八个列：confidence / volatility / observed_at / created 进检索打分
     （``CONFIDENCE_FACTOR`` × ``freshness_factor``），kind 进 kind 过滤，
-    redirect_to / superseded_by 进重定向解析（改了就改命中落点与 ``redirected_from``）。
+    redirect_to / superseded_by 进重定向解析（改了就改命中落点与 ``redirected_from``），
+    tombstone 则是 P2-F 裁定一引入的**检索可见性**开关（真 = 墓碑，默认被排除）。
 
     因此"只改这些字段、body/title/status 都不变"同样会让索引失真，必须能被
     ``prior.ensure_index_fresh`` 检出——这正是本函数覆盖全部写入字段（而不仅
     正文）的原因；在 ``index_note`` 里新增参与检索的列时，**这里必须同步扩列表**，
-    否则新列会退回"只有 rebuild 才能纠正"的静默陈旧。
+    否则新列会退回"只有 rebuild 才能纠正"的静默陈旧（P2-F 的 tombstone 列就是
+    按这条规矩加进来的：标记变化必须能被一致性检查检出）。
 
     ``status`` 不在输入内：它由 ``ensure_index_fresh`` 的独立维度负责，两类原因
     分开报告更好审计。写入位置是 ``note_meta.body_hash`` 列——列名沿用任务简报
@@ -243,6 +250,7 @@ def note_index_hash(note: Note) -> str:
             str(meta.superseded_by or ""),
             str(meta.observed_at or ""),
             str(meta.created or ""),
+            "1" if meta.tombstone else "0",
         )
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -343,7 +351,7 @@ class SearchIndex:
             "CREATE TABLE IF NOT EXISTS note_meta ("
             "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
             "volatility TEXT, kind TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
-            "observed_at TEXT, created TEXT, body_hash TEXT)"
+            "observed_at TEXT, created TEXT, body_hash TEXT, tombstone INTEGER)"
         )
         self._migrate_note_meta(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -386,6 +394,12 @@ class SearchIndex:
         不填的后果是首次 ``prior.ensure_index_fresh`` 把 NULL 视为"索引缺指纹"
         并整体 rebuild——正确性优先的一次性代价（rebuild 后即恢复新鲜），
         比"迁移时静默按旧值回填、漏掉已经变过的正文"安全得多。
+
+        P2-F 增补 v3 → v4 的 tombstone 列（墓碑标记，检索过滤用，见
+        ``SearchIndex.search`` 的 include_tombstones）：ALTER 后**存量行回填 0**
+        ——与 kind 的迁移同理，旧数据里不存在墓碑（该标记是本包新引入的），
+        回填 0 语义无损且不触发一次白做的 rebuild。注意 body_hash 仍是 NULL 的
+        更旧索引照样会因"缺指纹"整体 rebuild 一次，那是另一条维度的事。
         """
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(note_meta)")}
         if "kind" not in columns:
@@ -393,6 +407,9 @@ class SearchIndex:
             conn.execute("UPDATE note_meta SET kind = 'knowledge' WHERE kind IS NULL")
         if "body_hash" not in columns:
             conn.execute("ALTER TABLE note_meta ADD COLUMN body_hash TEXT")
+        if "tombstone" not in columns:
+            conn.execute("ALTER TABLE note_meta ADD COLUMN tombstone INTEGER")
+            conn.execute("UPDATE note_meta SET tombstone = 0 WHERE tombstone IS NULL")
 
     def _ensure_vec_table(self, dim: int) -> bool:
         """惰性建 vec0 表；sqlite-vec 不可用或建表失败返回 False（走暴力扫描）。"""
@@ -429,8 +446,8 @@ class SearchIndex:
         )
         conn.execute(
             "INSERT OR REPLACE INTO note_meta (note_id, title, body, confidence, volatility, "
-            "kind, status, redirect_to, superseded_by, observed_at, created, body_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "kind, status, redirect_to, superseded_by, observed_at, created, body_hash, tombstone) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 note.id,
                 note.title,
@@ -444,6 +461,7 @@ class SearchIndex:
                 note.meta.observed_at,
                 note.meta.created,
                 note_index_hash(note),
+                1 if note.meta.tombstone else 0,
             ),
         )
         conn.execute(
@@ -500,7 +518,14 @@ class SearchIndex:
 
     # ---- 检索 ----
 
-    def search(self, query: str, k: int = 5, kind: str | None = None) -> list[SearchMatch]:
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        kind: str | None = None,
+        *,
+        include_tombstones: bool = False,
+    ) -> list[SearchMatch]:
         """双通道检索 + RRF 融合 + 置信/新鲜度调节；默认只回 active 笔记。
 
         命中 merged/superseded 时跟随重定向到最终 active 笔记并在结果上
@@ -508,6 +533,14 @@ class SearchIndex:
         ``kind`` 给定时（knowledge/user/experience）只保留最终笔记（重定向
         落点）的 meta.kind 与之相同的结果——过滤发生在融合打分之后、排序
         截断之前，打分逻辑本身不动；None 时行为与不过滤完全一致。
+
+        ``include_tombstones``（P2-F 裁定一）：缺省 False = **排除墓碑**。墓碑是
+        ``memory_invalidate`` 生成的失效裁定记录，仍是 status=active 的笔记
+        （"superseded 必须沿链可达 active"的不变量不变），但它是审计记录而非
+        当前知识，被当作 active 知识召回在 RQ2 语义下是错的。判定发生在
+        **重定向解析之后**（看最终落点的标记）：命中一条已失效的旧 ID 时结果会
+        跟随到墓碑，那条也一并排除，否则过滤等于没做。要看到墓碑（审计/排查）
+        显式传 True，行为与不过滤完全一致。
         """
         query = query.strip()
         if not query:
@@ -529,6 +562,8 @@ class SearchIndex:
         matches: list[SearchMatch] = []
         for note_id, fused_score in fused.items():
             info = meta_map[note_id]
+            if not include_tombstones and info.get("tombstone") == "1":
+                continue  # 墓碑（含重定向到墓碑的落点）：审计记录，默认不是当前知识
             confidence = CONFIDENCE_FACTOR.get(info["confidence"], CONFIDENCE_FACTOR["medium"])
             fresh = freshness_factor(
                 info["volatility"],
@@ -562,9 +597,15 @@ class SearchIndex:
         return matches[:k]
 
     def _load_meta_map(self) -> dict[str, dict[str, str | None]]:
+        """note_meta 全量快照（检索期用）。``tombstone`` 在这里就归一成 ``"1"``/``"0"``
+        字符串：列本身是 INTEGER，而本字典的值类型统一是 ``str | None``（SQL 里
+        直接 CASE 成文本，省掉 Python 侧的类型抖动）。
+        """
         rows = self._conn.execute(
             "SELECT note_id, title, confidence, volatility, kind, status, redirect_to, "
-            "superseded_by, observed_at, created, body FROM note_meta"
+            "superseded_by, observed_at, created, body, "
+            "CASE WHEN COALESCE(tombstone, 0) != 0 THEN '1' ELSE '0' END "
+            "FROM note_meta"
         ).fetchall()
         keys = (
             "note_id",
@@ -578,6 +619,7 @@ class SearchIndex:
             "observed_at",
             "created",
             "body",
+            "tombstone",
         )
         return {str(row[0]): dict(zip(keys, row, strict=True)) for row in rows}
 
@@ -728,6 +770,78 @@ class SearchIndex:
         self.close()
 
 
+# ---- 索引一致性（MCP 与 loop 两条路径共用的唯一判据）-------------------------
+
+
+def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
+    """索引是否落后于 store —— **唯一判据**，供 ``prior.ensure_index_fresh``（loop
+    路径）与 ``mcp_server.service._index_is_stale``（MCP 路径）共用。
+
+    放在 ``index.py``（而非 prior.py）的理由：这条判据问的是"索引自己记的检索
+    视图与 store 现状是否一致"，两个输入（``note_index_hash`` 指纹函数、
+    ``SearchIndex.indexed_fingerprints`` 快照）都长在本模块里；且 loop 与 MCP 都
+    已经依赖 index.py，放在 prior.py 会让 MCP 服务层为了一条索引一致性问题去
+    import "Prior 读取器"，是无谓的层次倒挂。
+
+    判定口径（P2-B 起为**三维**，任一维不符即落后）：
+
+    1. **id 集合差异**：store 全量笔记（active/merged/superseded）里有索引没有的
+       （新增）或有索引里多出的（已删除）；
+    2. **status 变化**：同 id 的 meta.status 与索引记录不同；
+    3. **索引指纹变化**：同 id 的 ``note_index_hash(note)`` 与索引里的 ``body_hash``
+       不同。指纹覆盖 ``index_note`` 写入索引且参与检索/过滤的**全部字段**
+       （title/body/confidence/volatility/kind/redirect_to/superseded_by/
+       observed_at/created/tombstone），因此这一维既治"同 id 原地改写正文"
+       （``memory_update`` 与 formation merge 两个新入口），也治**只改元数据**的
+       原地改写——``loop._annotate_formation`` 正在原地回写 kind/importance，
+       ``memory_invalidate`` 写入墓碑标记，其 docstring 自己写明"若 formation
+       未来赋非 knowledge kind，必须触发索引同步，否则 kind 过滤会失真"；
+       只比 status 或只比正文都兜不住这些路径。**旧库迁移留下的空指纹**
+       （迁移时 ALTER 补列、未回填）同样算落后：宁可重建一次，也不接受
+       "不知道索引里是哪版检索视图"。
+
+    **只读**：不动 md、不写 index.db、**不 rebuild**——"落后了怎么办"是调用方的
+    决定（两条路径当前都选择整体 rebuild）。返回 ``(是否落后, 原因)``；原因里
+    点名具体 note_id（索引字段变化 / status 变化 / 新增 / 索引多余 / 缺指纹），
+    便于审计，文案与 P2-B 的 ``ensure_index_fresh`` 逐字兼容（陈旧态以
+    "索引落后于 store：" 开头，新鲜态说明"集合、status 与索引指纹均相同"）。
+    """
+    notes = store.list_notes(status=None)
+    store_status = {n.id: n.status for n in notes}
+    store_hash = {n.id: note_index_hash(n) for n in notes}
+    indexed = index.indexed_fingerprints()
+    index_status = {note_id: status for note_id, (status, _) in indexed.items()}
+    if store_status == index_status and all(
+        indexed[note_id][1] == store_hash[note_id] for note_id in store_status
+    ):
+        return False, (
+            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与索引指纹均相同）"
+        )
+    missing = sorted(set(store_status) - set(index_status))
+    extra = sorted(set(index_status) - set(store_status))
+    common = set(store_status) & set(index_status)
+    changed = sorted(n for n in common if store_status[n] != index_status[n])
+    # 缺指纹：迁移后未回填的行（body_hash 为空串）；它不能进"字段变化"口径，
+    # 否则会把"不知道是哪版"说成"字段变了"，误导审计。
+    legacy = sorted(n for n in common if not indexed[n][1])
+    rehashed = sorted(
+        n for n in common if indexed[n][1] and indexed[n][1] != store_hash[n]
+    )
+    parts: list[str] = []
+    if missing:
+        parts.append(f"新增: {', '.join(missing)}")
+    if rehashed:
+        parts.append(f"索引字段变化: {', '.join(rehashed)}")
+    if changed:
+        detail = "、".join(f"{nid}:{index_status[nid]}→{store_status[nid]}" for nid in changed)
+        parts.append(f"status 变化 {len(changed)} 条（{detail}）")
+    if legacy:
+        parts.append(f"旧索引缺指纹（{len(legacy)} 条：{', '.join(legacy)}）")
+    if extra:
+        parts.append(f"索引多余: {', '.join(extra)}")
+    return True, f"索引落后于 store：{'；'.join(parts)}"
+
+
 def wiki_search(
     query: str,
     k: int = 5,
@@ -737,12 +851,16 @@ def wiki_search(
     tokenizer: str = "auto",
     half_life_days: Mapping[str, float] | None = None,
     clock: Callable[[], datetime] | None = None,
+    include_tombstones: bool = False,
 ) -> list[SearchMatch]:
     """便捷检索入口：面向 Distiller / MCP 层。
 
     注意（MVP 一致性策略）：本函数【不】自动同步 md → 索引。首次使用或 md
     变更后，由调用方执行 ``SearchIndex(store.root).rebuild(store)`` 或逐条
     ``index_note(note)``；否则查的是上次索引的快照。
+
+    ``include_tombstones`` 缺省 False（墓碑 = 审计记录，默认排除），语义见
+    ``SearchIndex.search``。
     """
     with SearchIndex(
         store.root,
@@ -751,4 +869,4 @@ def wiki_search(
         half_life_days=half_life_days,
         clock=clock,
     ) as index:
-        return index.search(query, k=k)
+        return index.search(query, k=k, include_tombstones=include_tombstones)

@@ -244,6 +244,76 @@ class TestEnsureIndexFresh:
             assert "N-0002" in reason
 
 
+# ---- 墓碑的检索可见性（P2-F 裁定一）-------------------------------------------
+
+
+class TestTombstoneVisibility:
+    """墓碑（``tombstone=True``）默认不进检索与 Prior 注入，include 时才出现。
+
+    墓碑由 ``memory_invalidate`` 生成（kind=knowledge 的 active 笔记 + 标题前缀），
+    这里用 ``store.save_note(tombstone=True)`` 直接造出同一形态的状态。
+    """
+
+    def test_tombstone_hidden_from_priors_by_default(self, store: WikiStore) -> None:
+        store.save_note(
+            "上下文压缩技术可以把长对话压缩成摘要。", note_id="N-0001", title="上下文压缩"
+        )
+        store.save_note(
+            "该结论已被裁定失效：上下文压缩的初代结论有误。",
+            note_id="N-0002",
+            title="[已失效] 上下文压缩",
+            tombstone=True,
+        )
+        with _make_index(store) as index:
+            index.rebuild(store)
+            # 缺省检索：墓碑不在结果里（正常笔记照常命中）
+            assert [m.note_id for m in index.search("上下文压缩", k=5)] == ["N-0001"]
+            assert "N-0002" not in [m.note_id for m in index.search("裁定失效", k=5)]
+            # Prior 注入路径同样排除（注入走的就是 index.search）
+            ctx = retrieve_priors("裁定失效", store, index, k=5)
+            assert ctx.hits == []
+            assert ctx.format() == ""  # 无命中 → 标签行也不注入
+            ctx_all = retrieve_priors("上下文压缩", store, index, k=5)
+            assert "N-0002" not in [h.note_id for h in ctx_all.hits]
+            # 显式出口：include_tombstones=True 时墓碑作为普通命中出现
+            assert "N-0002" in [
+                m.note_id for m in index.search("裁定失效", k=5, include_tombstones=True)
+            ]
+            ctx_explicit = retrieve_priors(
+                "裁定失效", store, index, k=5, include_tombstones=True
+            )
+            assert [h.note_id for h in ctx_explicit.hits] == ["N-0002"]
+
+    def test_redirect_landing_on_tombstone_is_excluded(self, store: WikiStore) -> None:
+        """命中旧 ID → 重定向落到墓碑：那条也必须排除（过滤在重定向解析之后）。"""
+        store.save_note(
+            "上下文压缩的初代读数甲，内容已被判定失效。",
+            note_id="N-0001",
+            title="上下文压缩（旧）",
+            status="superseded",
+            superseded_by="N-0002",
+        )
+        store.save_note(
+            "记忆 N-0001（上下文压缩（旧））已被裁定失效：结论不成立。",
+            note_id="N-0002",
+            title="[已失效] 上下文压缩",
+            tombstone=True,
+        )
+        with _make_index(store) as index:
+            index.rebuild(store)
+            # 查询短语只出现在旧笔记正文里：唯一命中路径是"重定向到墓碑"
+            assert index.search("初代读数甲", k=5) == []
+            ctx = retrieve_priors("初代读数甲", store, index, k=5)
+            assert ctx.hits == [] and ctx.format() == ""
+            # 显式打开时才看到墓碑，且摘要来自旧笔记正文（证明确实走了重定向路径）。
+            # 这里不断言 redirected_from：Mock 向量通道对任何查询都可能命中最终笔记
+            # （余弦 > 1e-6 即算命中），于是 _direct_hits 会把同一落点也标成直接命中，
+            # 该字段在 mock 夹具下不可稳定断言（与 test_index_freshness.py 文件头同一原因）。
+            hits = index.search("初代读数甲", k=5, include_tombstones=True)
+            assert [m.note_id for m in hits] == ["N-0002"]
+            assert "初代读数甲" in hits[0].snippet
+
+
 # ---- 格式化与预算 ---------------------------------------------------------------
 
 
