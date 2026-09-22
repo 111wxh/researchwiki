@@ -596,12 +596,23 @@ def test_specificity_applies_when_time_not_later() -> None:
 
 
 def test_entity_disjoint_blocks_specificity() -> None:
+    """实体不交的长证据不得判 more_specific（修复轮 2/5 后连具体度也被全局护栏短路）。"""
     note = make_note(body="该系列有 3 个版本。", entities=["GLM-5.3"])
     result = vf.compare_prior_and_evidence(
         note, evi("该系列有 3 个版本，Pro 版本参数 70B。", entities=["Qwen-3"])
     )
     assert result.verdict != vf.VERDICT_MORE_SPECIFIC
-    assert any("两侧实体不交" in reason for reason in result.reasons)
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    joined = "\n".join(result.reasons)
+    assert "两侧实体不交" in joined
+    assert "无法确认主体同一性 → 不做更新判定" in joined
+
+    with_time = vf.compare_prior_and_evidence(
+        note,
+        evi("该系列有 3 个版本，Pro 版本参数 70B。", observed_at=LATER, entities=["Qwen-3"]),
+    )
+    assert with_time.verdict == vf.VERDICT_UNCERTAIN
+    assert "具体度：" not in "\n".join(with_time.reasons)  # 规则 5 整条被短路
 
 
 def test_entity_overlap_allows_specificity() -> None:
@@ -982,16 +993,16 @@ def test_swapped_values_with_later_time_is_not_consistent() -> None:
     assert "一致判定被保留" in "\n".join(result.reasons)
 
 
-# ---- 修复轮 1/5：Important（实体护栏纳入冲突门）----------------------------
+# ---- 修复轮 1/5：Important（实体护栏纳入冲突门）+ 修复轮 2/5：提升为全局前置 ---
 
 
 def test_entity_disjoint_skips_conflict_gate() -> None:
-    """Important 复现用例：两侧实体不交时不得判 conflicting。
+    """修复轮 1/5 复现用例：两侧实体不交时不得判 conflicting（修复轮 2/5 后为全局短路）。
 
     旧「模型 A 参数 70B。」(entities=["GLM-5.3"]) 对新「模型 B 参数 128B。」
     (entities=["Qwen-3"])：槽位键里不含主语，`number:b:参数` 同槽位不同值看似冲突，
     但两个句子说的是两个模型。判 conflicting 会直接产出 open_conflict、污染冲突台账
-    与评测冲突计数，所以这里跳过冲突判定 → 实际 verdict = uncertain（交人工/判官）。
+    与评测冲突计数 → 实际 verdict = uncertain（交人工/判官）。
     """
     result = vf.compare_prior_and_evidence(
         make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
@@ -1002,7 +1013,7 @@ def test_entity_disjoint_skips_conflict_gate() -> None:
     assert result.suggested_action == vf.ACTION_NONE
     assert result.conflicts == []
     joined = "\n".join(result.reasons)
-    assert "两侧实体不交（旧=glm-5-3；新=qwen-3）→ 跳过冲突判定" in joined
+    assert "两侧实体不交（旧=glm-5-3；新=qwen-3）：槽位键里不含主语 → 跳过冲突判定" in joined
     assert "冲突检测命中" not in joined
 
 
@@ -1025,8 +1036,29 @@ def test_missing_entities_keep_conflict_gate() -> None:
     assert any("冲突检测命中" in reason for reason in result.reasons)
 
 
-def test_entity_disjoint_still_newer_when_source_changed() -> None:
-    """实体护栏只作用于冲突门：来源换版（规则 2）不受影响。"""
+# ---- 修复轮 2/5：重要（实体护栏提升为全局前置）-----------------------------
+
+
+def test_entity_disjoint_with_later_time_is_not_newer() -> None:
+    """①实体不交 + 时间更晚 → uncertain（不得升级为 newer/supersede）。
+
+    未修复前：冲突门被跳过 → 时间规则接手 → newer/supersede，判定从"开台账"变成
+    "建议覆盖"，而冲突门根本没跑、没有任何取值被反证。实体信号只说明"无法确认同一
+    主语"，不足以支撑任何更新判定。
+    """
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", observed_at=LATER, entities=["Qwen-3"]),
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    joined = "\n".join(result.reasons)
+    assert "无法确认主体同一性 → 不做更新判定" in joined
+    assert "时间：" not in joined  # 时间规则整条被短路，不再产出更新理由
+
+
+def test_entity_disjoint_with_source_change_is_not_newer() -> None:
+    """②实体不交 + 来源命中且 hash 不同 → uncertain（不得判 newer）。"""
     result = vf.compare_prior_and_evidence(
         source_url_note(entities=["GLM-5.3"], source_changed_at="2026-08-01T00:00:00+00:00"),
         evi(
@@ -1036,8 +1068,81 @@ def test_entity_disjoint_still_newer_when_source_changed() -> None:
             entities=["Qwen-3"],
         ),
     )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    joined = "\n".join(result.reasons)
+    assert "无法确认主体同一性 → 不做更新判定" in joined
+    assert "来源变化" not in joined  # 规则 2 被短路
+    # 留痕仍带来源全量 hash（结构化字段不受短路影响）
+    assert result.source is not None and result.source.evidence_content_hash == HASH_NEW
+
+
+def test_entity_disjoint_family_versions_do_not_get_pressed_into_newer() -> None:
+    """同一家族不同版本（GLM-5.3 vs GLM-4.5）也判不交：真冲突不得被压成 newer。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="GLM-5.3 的上下文窗口是 128k。", entities=["GLM-5.3"]),
+        evi("GLM-4.5 的上下文窗口是 64k。", observed_at=LATER, entities=["GLM-4.5"]),
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.verdict not in {vf.VERDICT_NEWER, vf.VERDICT_CONFLICTING}
+    assert "无法确认主体同一性 → 不做更新判定" in "\n".join(result.reasons)
+
+
+def test_entity_disjoint_blocks_consistent() -> None:
+    """规则 3 的关联残留：实体不交但槽位取值相同也不得判 consistent（假一致）。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 70B。", entities=["Qwen-3"]),
+    )
+    assert result.verdict != vf.VERDICT_CONSISTENT
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    joined = "\n".join(result.reasons)
+    assert "无法确认主体同一性 → 不做更新判定" in joined
+    assert "一致：" not in joined
+
+
+@pytest.mark.parametrize(
+    ("prior_entities", "evidence_entities"),
+    [
+        (["GLM-5.3"], ["glm-5-3"]),  # 同实体不同写法（slugify 归一后相交）
+        (["GLM-5.3"], ["GLM-5.3", "Qwen-3"]),  # 部分相交
+        ([], ["Qwen-3"]),  # 旧记忆无实体
+        (["GLM-5.3"], []),  # 证据无实体
+        ([], []),  # 两侧都无实体
+    ],
+)
+def test_entity_signal_absent_keeps_original_verdicts(
+    prior_entities: list[str], evidence_entities: list[str]
+) -> None:
+    """③实体相交或任一侧为空 → 原有判定不受影响（回归：时间更晚仍判 newer）。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="GLM-5.3 支持工具调用。", entities=prior_entities),
+        evi(
+            "GLM-5.3 现在支持工具调用与函数并行。",
+            observed_at=LATER,
+            entities=evidence_entities,
+        ),
+    )
     assert result.verdict == vf.VERDICT_NEWER
-    assert any("来源变化" in reason for reason in result.reasons)
+    assert any("晚于旧记忆" in reason for reason in result.reasons)
+
+
+def test_entity_disjoint_judge_can_still_override() -> None:
+    """实体短路走同一兜底出口：judge 仍可改判（并写明最终判定）。"""
+    judge, calls = counting_judge(vf.VERDICT_CONFLICTING)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", observed_at=LATER, entities=["Qwen-3"]),
+        judge=judge,
+    )
+    assert len(calls) == 1
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert result.suggested_action == vf.ACTION_OPEN_CONFLICT
+    assert result.judge_used is True
+    assert "→ 最终判定 conflicting（由语义判官给出，建议动作 open_conflict）" in "\n".join(
+        result.reasons
+    )
 
 
 # ---- 修复轮 1/5：随修（Minor a–e）------------------------------------------

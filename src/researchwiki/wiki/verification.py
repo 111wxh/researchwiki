@@ -18,11 +18,19 @@
    2），这里把它提到时间与具体度之上，理由有两条：简报规则 1 自己就写明"若冲突
    检测命中 → CONFLICTING"；PLAN §3.3 要求"冲突独立落在 conflicts/，不把冲突
    伪装成普通 merge"，而"更晚但自相矛盾"的证据若判 newer/supersede，冲突就被
-   supersede 静默掩盖了。**前置护栏（实体）**：两侧实体集合都非空且不交时**跳过**
-   冲突判定（写一行原因）——槽位键里不含主语，"模型 A 参数 70B" 与 "模型 B 参数
-   128B" 的同槽位不同值说的是两个主体，判冲突会直接产出 ``open_conflict`` 并污染
-   冲突台账与评测冲突计数；方向选择：宁漏一次自动冲突（人工/判官仍会看到 uncertain）
-   也不误开台账。
+   supersede 静默掩盖了。
+   **实体护栏（全局前置，修复轮 2/5）**：两侧实体集合都非空且不交时**整条短路**
+   ——不判冲突、不判 newer/consistent/更具体，直接进兜底落 ``uncertain`` /
+   ``none``（judge 仍可改判），理由行写明"无法确认主体同一性 → 不做更新判定"。
+   为什么必须全局而不是只拦冲突门：槽位键里不含主语，只拦冲突门时**其他规则会
+   接着用同一个不可信的前提**——`模型 A 参数 70B`(GLM-5.3) 对 `模型 B 参数 128B`
+   (Qwen-3) 在证据时间更晚时会从"开冲突台账"变成"建议 supersede"（覆盖一条可能
+   不是同一主语的记忆），而 `GLM-5.3` 对 `GLM-4.5` 这种同一家族版本号（``entity_keys``
+   是精确 slug，家族内不同版本也判不交）还会把两条真冲突整条压掉。方向选择：
+   实体不交时**不做任何更新/一致判定**，只标记需复核——这与"不静默覆盖"是同一个
+   不可退让方向：宁可少一次自动判定，不可多一次静默覆盖。剩余边界：``entity_keys``
+   是精确 slug（``GLM-5.3`` 与 ``GLM5.3`` 判不交），拼写差异会被当成"不同主语"，
+   代价是这类证据落 uncertain（不做动作、不写台账），方向安全。
 2. **来源变化**：``evidence.source_url`` 命中旧记忆某条 ``SourceRef``——
    - ``content_hash`` **相同**（两侧都非空）→ 来源未变，**不早退**，只追加审计行
      后继续走 3/4/5（同一快照的重述 → consistent；同一快照里更完整的事实 →
@@ -45,7 +53,8 @@
    而这正是来源换版时"表格列序/标签错位"的真实形态，方向恰是"不静默覆盖"最不能
    出错的一侧。被跳过的槽位（单侧多值）同样让"一致"退回 uncertain——"还成立"的
    判定必须建立在**所有可比槽位都真的比过且对得上**之上：漏判一致性只是多一次复核，
-   误判一致性等于把可能已经变化的事实当成仍然成立。
+   误判一致性等于把可能已经变化的事实当成仍然成立。**实体不交由规则 1 的全局护栏
+   短路**（同上）：主体同一性都确认不了时，"一致"是最不该给出的结论。
 4. **时间**：``evidence.observed_at`` 晚于旧记忆基准时间（``observed_at`` →
    ``created``，**与 P2-A freshness 同口径**，直接复用其公开的
    ``freshness.resolve_base_time`` / ``freshness.parse_ts``，不写第二份）→
@@ -798,16 +807,32 @@ def compare_prior_and_evidence(
     reasons.append(_token_summary(scan))
     reasons.extend(scan.skipped)
     if entities_disjoint:
-        # 实体护栏（修复轮 1/5）：两侧实体集合都非空且不交 = 说的不是同一主语，
-        # 槽位键里不含主语，此时同槽位不同值多为"不同主体的同名参数"而非冲突。
-        # 判 conflicting 会直接产出 open_conflict 并污染冲突台账与评测冲突计数，
-        # 故这里**跳过冲突判定**（写清原因，交后续规则/人工），而不是判冲突。
-        reasons.append(
+        # 实体护栏（修复轮 2/5 提升为**全局前置**）：两侧实体集合都非空且不交 =
+        # 无法确认主体同一性。此时槽位键里不含主语，任何"更新/一致/更具体"结论都
+        # 站不住：判 conflicting 会误开冲突台账，判 newer 会建议覆盖一个可能不是
+        # 同一主语的记忆，判 consistent 会把"假一致"当成仍然成立——三者都违背
+        # "不静默覆盖"。故这里一次短路掉规则 2/3/4/5，直接进兜底（uncertain/none，
+        # judge 仍可改判）。
+        boundary = (
             f"两侧实体不交（旧={'、'.join(prior_entity_keys)}；"
-            f"新={'、'.join(evidence_entity_keys)}）→ 跳过冲突判定"
+            f"新={'、'.join(evidence_entity_keys)}）"
+        )
+        reasons.append(
+            f"{boundary}：槽位键里不含主语 → 跳过冲突判定"
             "（主语不同时同槽位不同值不构成对同一条记忆的反驳）"
         )
-    elif scan.conflicts:
+        return _finish_uncertain(
+            prior,
+            evidence,
+            evidence_index,
+            reasons,
+            similarity=similarity,
+            source=source_trace,
+            judge=judge,
+            blockers="实体不交，无法确认主体同一性 → 不做更新判定"
+            "（不判 newer / consistent / 更具体，也不据此开冲突台账）",
+        )
+    if scan.conflicts:
         reasons.append(
             f"冲突检测命中 {len(scan.conflicts)} 个槽位："
             + "；".join(conflict.describe() for conflict in scan.conflicts)
@@ -934,62 +959,40 @@ def compare_prior_and_evidence(
     else:
         reasons.append("时间：证据未提供可解析的 observed_at → 不因时间判更新")
 
-    # 规则 5：具体度（事实令牌更多）
+    # 规则 5：具体度（事实令牌更多）。实体护栏已在上方全局短路，这里不必再判实体
     if len(scan.evidence_tokens) > len(scan.prior_tokens):
-        if entities_disjoint:
-            reasons.append(
-                f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 > 旧记忆 "
-                f"{len(scan.prior_tokens)} 个，但两侧实体不交（旧={'、'.join(prior_entity_keys)}；"
-                f"新={'、'.join(evidence_entity_keys)}）→ 不判更具体"
-            )
-        else:
-            fresh = "、".join(t.label() for t in scan.new_tokens) or "无"
-            reasons.append(
-                f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 > 旧记忆 "
-                f"{len(scan.prior_tokens)} 个（{fresh}）"
-                " 且无冲突 → 更具体（建议 merge 并入旧记忆，保留规范 ID）"
-            )
-            return _make(
-                prior,
-                evidence_index,
-                VERDICT_MORE_SPECIFIC,
-                reasons,
-                similarity=similarity,
-                source=source_trace,
-            )
-    else:
+        fresh = "、".join(t.label() for t in scan.new_tokens) or "无"
         reasons.append(
-            f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 不多于 旧记忆 "
-            f"{len(scan.prior_tokens)} 个 → 不判更具体"
+            f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 > 旧记忆 "
+            f"{len(scan.prior_tokens)} 个（{fresh}）"
+            " 且无冲突 → 更具体（建议 merge 并入旧记忆，保留规范 ID）"
         )
+        return _make(
+            prior,
+            evidence_index,
+            VERDICT_MORE_SPECIFIC,
+            reasons,
+            similarity=similarity,
+            source=source_trace,
+        )
+    reasons.append(
+        f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 不多于 旧记忆 "
+        f"{len(scan.prior_tokens)} 个 → 不判更具体"
+    )
 
     # 规则 6：兜底（judge 只在此处注入）
-    blockers = (
-        "无确定性判据：相似度高于地板、无冲突，但时间不更新、也无新增事实令牌可用，"
-        "既不足以判「一致」也不足以判「更具体」"
-    )
-    judge_used = judge is not None
-    verdict = VERDICT_UNCERTAIN
-    if judge is not None:
-        judged = _apply_judge(judge, prior, evidence, reasons)
-        if judged is not None:
-            verdict = judged
-    # 结句按**最终**判定写：判官改判时不能留一句"→ uncertain"与 verdict 自相牵制
-    if verdict == VERDICT_UNCERTAIN:
-        reasons.append(f"{blockers} → uncertain（建议人工或语义判官复核，本轮不做动作）")
-    else:
-        reasons.append(
-            f"{blockers} → 最终判定 {verdict}"
-            f"（由语义判官给出，建议动作 {VERDICT_ACTIONS[verdict]}）"
-        )
-    return _make(
+    return _finish_uncertain(
         prior,
+        evidence,
         evidence_index,
-        verdict,
         reasons,
         similarity=similarity,
-        judge_used=judge_used,
         source=source_trace,
+        judge=judge,
+        blockers=(
+            "无确定性判据：相似度高于地板、无冲突，但时间不更新、也无新增事实令牌可用，"
+            "既不足以判「一致」也不足以判「更具体」"
+        ),
     )
 
 
@@ -1058,6 +1061,47 @@ def _consistency_blockers(scan: SlotScan) -> list[str]:
         evidence_slots = _slot_summary(_slot_values(scan.evidence_tokens))
         blockers.append(f"槽位级取值对不上（旧={prior_slots}；新={evidence_slots}）")
     return blockers
+
+
+def _finish_uncertain(
+    prior: Note,
+    evidence: EvidenceItem,
+    evidence_index: int,
+    reasons: list[str],
+    *,
+    similarity: float,
+    source: SourceComparison | None,
+    judge: Callable[[Note, EvidenceItem], str | None] | None,
+    blockers: str,
+) -> EvidenceComparison:
+    """兜底出口（规则 6 与"实体不交"全局短路共用）：默认 uncertain，judge 可改判。
+
+    ``blockers`` 是"为什么确定性判据不足"的一句（引用具体值）；结句按**最终**判定
+    生成——判官改判后不能再留一句"→ uncertain"与 verdict 自相牵制（修复轮 1/5 Minor c）。
+    judge=None 时本函数是纯确定性路径（uncertain / none）。
+    """
+    judge_used = judge is not None
+    verdict = VERDICT_UNCERTAIN
+    if judge is not None:
+        judged = _apply_judge(judge, prior, evidence, reasons)
+        if judged is not None:
+            verdict = judged
+    if verdict == VERDICT_UNCERTAIN:
+        reasons.append(f"{blockers} → uncertain（建议人工或语义判官复核，本轮不做动作）")
+    else:
+        reasons.append(
+            f"{blockers} → 最终判定 {verdict}"
+            f"（由语义判官给出，建议动作 {VERDICT_ACTIONS[verdict]}）"
+        )
+    return _make(
+        prior,
+        evidence_index,
+        verdict,
+        reasons,
+        similarity=similarity,
+        judge_used=judge_used,
+        source=source,
+    )
 
 
 def _apply_judge(
