@@ -299,9 +299,10 @@ class SearchIndex:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS note_meta ("
             "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
-            "volatility TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
+            "volatility TEXT, kind TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
             "observed_at TEXT, created TEXT)"
         )
+        self._migrate_note_meta(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS note_vec_cache ("
@@ -325,6 +326,21 @@ class SearchIndex:
             conn.execute("DROP TABLE IF EXISTS note_vec")
             conn.execute("DELETE FROM index_meta WHERE key = 'vec_dim'")
         conn.commit()
+
+    def _migrate_note_meta(self, conn: sqlite3.Connection) -> None:
+        """旧库 schema 迁移：note_meta 缺 kind 列时在线补列并回填默认值。
+
+        迁移路径（v1 → v2，P1-A 引入 kind 过滤时）：已存在的 index.db 是
+        ``CREATE TABLE IF NOT EXISTS`` 够不到的旧 schema，直接 SELECT kind 会
+        OperationalError。这里用 ``PRAGMA table_info`` 探测列是否存在，缺列则
+        ``ALTER TABLE ADD COLUMN kind TEXT`` 并把存量行回填为默认类型
+        knowledge（旧行为下所有笔记都是知识笔记，语义无损）——老用户索引
+        打开即自动升级，绝不报废重建。全量 rebuild() 会用笔记真实 kind 重写。
+        """
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(note_meta)")}
+        if "kind" not in columns:
+            conn.execute("ALTER TABLE note_meta ADD COLUMN kind TEXT")
+            conn.execute("UPDATE note_meta SET kind = 'knowledge' WHERE kind IS NULL")
 
     def _ensure_vec_table(self, dim: int) -> bool:
         """惰性建 vec0 表；sqlite-vec 不可用或建表失败返回 False（走暴力扫描）。"""
@@ -361,14 +377,15 @@ class SearchIndex:
         )
         conn.execute(
             "INSERT OR REPLACE INTO note_meta (note_id, title, body, confidence, volatility, "
-            "status, redirect_to, superseded_by, observed_at, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "kind, status, redirect_to, superseded_by, observed_at, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 note.id,
                 note.title,
                 note.body,
                 note.meta.confidence,
                 note.meta.volatility,
+                note.meta.kind,
                 note.meta.status,
                 note.meta.redirect_to,
                 note.meta.superseded_by,
@@ -418,11 +435,14 @@ class SearchIndex:
 
     # ---- 检索 ----
 
-    def search(self, query: str, k: int = 5) -> list[SearchMatch]:
+    def search(self, query: str, k: int = 5, kind: str | None = None) -> list[SearchMatch]:
         """双通道检索 + RRF 融合 + 置信/新鲜度调节；默认只回 active 笔记。
 
         命中 merged/superseded 时跟随重定向到最终 active 笔记并在结果上
         标注 redirected_from（值是被命中的那条别名笔记 id）。
+        ``kind`` 给定时（knowledge/user/experience）只保留最终笔记（重定向
+        落点）的 meta.kind 与之相同的结果——过滤发生在融合打分之后、排序
+        截断之前，打分逻辑本身不动；None 时行为与不过滤完全一致。
         """
         query = query.strip()
         if not query:
@@ -466,12 +486,19 @@ class SearchIndex:
                     redirected_from=None if direct else self._redirect_source.get(note_id),
                 )
             )
+        if kind is not None:
+            # 旧库迁移前可能残留 NULL kind，按默认类型 knowledge 兜底
+            matches = [
+                m
+                for m in matches
+                if (meta_map[m.note_id].get("kind") or "knowledge") == kind
+            ]
         matches.sort(key=lambda m: (-m.score, m.note_id))
         return matches[:k]
 
     def _load_meta_map(self) -> dict[str, dict[str, str | None]]:
         rows = self._conn.execute(
-            "SELECT note_id, title, confidence, volatility, status, redirect_to, "
+            "SELECT note_id, title, confidence, volatility, kind, status, redirect_to, "
             "superseded_by, observed_at, created, body FROM note_meta"
         ).fetchall()
         keys = (
@@ -479,6 +506,7 @@ class SearchIndex:
             "title",
             "confidence",
             "volatility",
+            "kind",
             "status",
             "redirect_to",
             "superseded_by",

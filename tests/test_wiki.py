@@ -127,6 +127,62 @@ class TestFrontmatter:
         meta2 = NoteMeta.from_dict({"id": "N-1", "confidence": "whatever"})
         assert meta2.confidence == "medium"
 
+    def test_kind_round_trip(self):
+        """kind 全值域 round-trip；to_dict 始终输出 kind。"""
+        for kind in ("knowledge", "user", "experience"):
+            meta = NoteMeta.from_dict({"id": "N-1", "kind": kind})
+            assert meta.kind == kind
+            meta_dict, _ = parse(dump(meta.to_dict(), "正文"))
+            assert meta_dict["kind"] == kind
+            assert NoteMeta.from_dict(meta_dict).kind == kind
+
+    def test_kind_tolerant_parsing(self):
+        """kind 宽容解析：大小写归一、非法值回退 knowledge。"""
+        assert NoteMeta.from_dict({"id": "N-1", "kind": "USER"}).kind == "user"
+        assert NoteMeta.from_dict({"id": "N-1", "kind": " Experience "}).kind == "experience"
+        assert NoteMeta.from_dict({"id": "N-1", "kind": "diary"}).kind == "knowledge"
+        assert NoteMeta.from_dict({"id": "N-1", "kind": 123}).kind == "knowledge"
+        assert NoteMeta.from_dict({"id": "N-1"}).kind == "knowledge"
+
+    def test_importance_round_trip(self):
+        """importance 合法值 round-trip；None 时 to_dict 省略该字段。"""
+        meta = NoteMeta.from_dict({"id": "N-1", "importance": 0.8})
+        assert meta.importance == 0.8
+        meta_dict, _ = parse(dump(meta.to_dict(), "正文"))
+        assert meta_dict["importance"] == 0.8
+        assert NoteMeta.from_dict(meta_dict).importance == 0.8
+        # None → 序列化时省略（旧数据兼容：frontmatter 里不出现该键）
+        plain = NoteMeta(id="N-1")
+        assert "importance" not in plain.to_dict()
+
+    def test_importance_tolerant_parsing(self):
+        """importance 宽容解析：仅认 0.0–1.0 的数值，其余一律 None。"""
+        assert NoteMeta.from_dict({"id": "N-1", "importance": 0}).importance == 0.0
+        assert NoteMeta.from_dict({"id": "N-1", "importance": 1}).importance == 1.0
+        assert NoteMeta.from_dict({"id": "N-1", "importance": 0.5}).importance == 0.5
+        assert NoteMeta.from_dict({"id": "N-1", "importance": "0.8"}).importance is None
+        assert NoteMeta.from_dict({"id": "N-1", "importance": True}).importance is None
+        assert NoteMeta.from_dict({"id": "N-1", "importance": 1.5}).importance is None
+        assert NoteMeta.from_dict({"id": "N-1", "importance": -0.1}).importance is None
+        assert NoteMeta.from_dict({"id": "N-1"}).importance is None
+
+    def test_old_note_without_kind_importance_compat(self):
+        """旧笔记（无 kind/importance）round-trip 后 kind=knowledge、importance=None。"""
+        text = (
+            "---\n"
+            "id: N-0001\n"
+            "title: 旧笔记\n"
+            "confidence: high\n"
+            "created: 2026-05-01T00:00:00+00:00\n"
+            "---\n正文\n"
+        )
+        meta_dict, body = parse(text)
+        meta = NoteMeta.from_dict(meta_dict)
+        assert meta.kind == "knowledge" and meta.importance is None
+        restored = NoteMeta.from_dict(parse(dump(meta.to_dict(), body))[0])
+        assert restored.kind == "knowledge" and restored.importance is None
+        assert restored.confidence == "high" and restored.created == meta.created
+
 
 # ---- entities ---------------------------------------------------------
 
@@ -199,6 +255,21 @@ class TestStore:
         assert loaded.meta.confidence == "high"
         assert loaded.meta.sources[0].url == "https://example.com/a"
         assert loaded.meta.entities == ["glm-5-3"]
+
+    def test_save_note_kind_importance_round_trip(self, store: WikiStore):
+        """save_note 透传 kind/importance：落盘后读回一致，默认值向后兼容。"""
+        note = store.save_note(
+            "用户偏好深色主题。",
+            title="用户偏好",
+            kind="user",
+            importance=0.9,
+        )
+        assert note.kind == "user" and note.importance == 0.9
+        loaded = store.get_note(note.id)
+        assert loaded is not None
+        assert loaded.kind == "user" and loaded.importance == 0.9
+        default = store.save_note("普通知识笔记", title="知识")
+        assert default.kind == "knowledge" and default.importance is None
 
     def test_numbering_continues_from_loop_notes(self, store: WikiStore):
         """loop 层已写过 N-0001 时，WikiStore 必须续接编号而非从 N-0001 重来。"""
@@ -639,6 +710,95 @@ class TestIndex:
         assert hits[0].note_id == n1.id
         assert hits[0].snippet  # 摘要非空
         assert wiki_search("  ", store=store) == []  # 空查询
+
+    def test_old_index_db_without_kind_column_migrates(self, store: WikiStore):
+        """旧 schema（无 kind 列）的 index.db 打开时自动升级，检索与写入不受影响。
+
+        手工搭建 v1 schema（P1-A 之前：note_meta 无 kind 列）+ 一条已索引笔记，
+        SearchIndex 打开该库后必须：kind 列出现、存量行回填 knowledge、
+        FTS 检索照常可用——绝不能让老用户索引报废或要求手工重建。
+        """
+        db_path = store.root / "index.db"
+        store.root.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE note_meta ("
+                "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
+                "volatility TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
+                "observed_at TEXT, created TEXT)"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE note_fts USING fts5("
+                "note_id UNINDEXED, title, body, tokenize='trigram')"
+            )
+            conn.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "CREATE TABLE note_vec_cache "
+                "(note_id TEXT PRIMARY KEY, dim INTEGER, vec BLOB)"
+            )
+            conn.execute("INSERT INTO index_meta VALUES ('tokenizer', 'trigram')")
+            conn.execute(
+                "INSERT INTO note_meta (note_id, title, body, confidence, volatility, "
+                "status, created) VALUES ('N-0001', '上下文压缩', '旧库里的上下文压缩笔记', "
+                "'high', 'stable', 'active', '2026-05-01T00:00:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO note_fts (note_id, title, body) "
+                "VALUES ('N-0001', '上下文压缩', '旧库里的上下文压缩笔记')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with SearchIndex(store.root, tokenizer="trigram") as idx:
+            # 列已补上，存量行回填默认类型
+            columns = {row[1] for row in idx._conn.execute("PRAGMA table_info(note_meta)")}
+            assert "kind" in columns
+            row = idx._conn.execute("SELECT kind FROM note_meta WHERE note_id='N-0001'").fetchone()
+            assert row is not None and row[0] == "knowledge"
+            # 旧索引内容原样可用
+            hits = idx.search("上下文压缩", k=5)
+            assert [h.note_id for h in hits] == ["N-0001"]
+            assert idx.search("上下文压缩", kind="knowledge")[0].note_id == "N-0001"
+            assert idx.search("上下文压缩", kind="user") == []
+            # 迁移后的库还能继续增量写入（带 kind）
+            note = store.save_note(
+                "向量数据库方案支持多种检索模式", title="向量库", kind="experience"
+            )
+            idx.index_note(note)
+            assert idx.search("向量数据库", kind="experience")[0].note_id == note.id
+
+    def test_kind_filter_hit_and_exclude(self, store: WikiStore):
+        """kind 过滤：结果里只出现目标类型的笔记；None 时行为与不过滤完全一致。"""
+        user_note = store.save_note("用户偏好深色主题的界面", title="用户偏好", kind="user")
+        store.save_note("上下文压缩技术降低成本", title="知识", kind="knowledge")
+        with SearchIndex(store.root, tokenizer="trigram") as idx:
+            idx.rebuild(store)
+            hits = idx.search("用户偏好", kind="user")
+            assert [h.note_id for h in hits] == [user_note.id]
+            # 过滤后绝不允许混入其他类型（mock 向量通道的弱相关命中也要被挡掉）
+            for other_kind in ("knowledge", "experience"):
+                assert user_note.id not in {
+                    h.note_id for h in idx.search("用户偏好", kind=other_kind)
+                }
+            # 不过滤时两种都能召回（查询放宽到共享词）
+            both = idx.search("偏好", k=5, kind=None)
+            assert user_note.id in {h.note_id for h in both}
+
+    def test_kind_filter_follows_redirect_target(self, store: WikiStore):
+        """kind 过滤看的是重定向落点（最终 active 笔记）的类型，不是别名笔记。"""
+        store.save_note("量子退火旧记录里提到用户偏好", title="用户偏好旧版",
+                        kind="user", status="superseded", superseded_by="N-0002")
+        store.save_note("用户偏好深色主题的界面", title="用户偏好新版", kind="knowledge")
+        with SearchIndex(store.root, tokenizer="trigram") as idx:
+            idx.rebuild(store)
+            # 别名（user）被唯一词命中 → 重定向落点 N-0002（knowledge）
+            hits = idx.search("量子退火", kind="knowledge")
+            assert [h.note_id for h in hits] == ["N-0002"]
+            assert hits[0].redirected_from == "N-0001"
+            # 落点不是 user → kind=user 的结果里不允许出现
+            assert "N-0002" not in {h.note_id for h in idx.search("量子退火", kind="user")}
 
     def test_wiki_settings_and_invalid_tokenizer(self, store: WikiStore):
         config = {

@@ -61,6 +61,14 @@ class Note:
     def volatility(self) -> str:
         return self.meta.volatility
 
+    @property
+    def kind(self) -> str:
+        return self.meta.kind
+
+    @property
+    def importance(self) -> float | None:
+        return self.meta.importance
+
 
 @dataclass
 class Page:
@@ -125,6 +133,8 @@ class WikiStore:
         redirect_to: str | None = None,
         superseded_by: str | None = None,
         volatility: str = "stable",
+        kind: str = "knowledge",
+        importance: float | None = None,
         observed_at: str | None = None,
         reviewed_at: str | None = None,
         trace_id: str = "",
@@ -146,6 +156,8 @@ class WikiStore:
             redirect_to=redirect_to,
             superseded_by=superseded_by,
             volatility=volatility,
+            kind=kind,
+            importance=importance,
             observed_at=observed_at,
             reviewed_at=reviewed_at,
             created=created or datetime.now(UTC).isoformat(timespec="seconds"),

@@ -2,7 +2,7 @@
 
 字段一次定齐（防后续迁移）：id / title / entities / confidence / status /
 redirect_to / superseded_by / volatility / observed_at / reviewed_at /
-created / trace_id / sources。
+created / trace_id / sources / kind / importance。
 
 设计约定：
 - 未知字段一律收进 ``extra``，round-trip 不丢数据（向后兼容未来扩展）。
@@ -25,6 +25,11 @@ import yaml
 CONFIDENCE_LEVELS = ("high", "medium", "low")
 STATUS_LEVELS = ("active", "merged", "superseded")
 VOLATILITY_LEVELS = ("stable", "drifting", "volatile")
+# 记忆载体类型：knowledge（世界知识）/ user（用户画像与偏好）/ experience（经验教训）
+KIND_LEVELS = ("knowledge", "user", "experience")
+# importance 的合法区间（0.0–1.0），越界视为未填写
+IMPORTANCE_MIN = 0.0
+IMPORTANCE_MAX = 1.0
 
 # 匹配文件头部的第一个 frontmatter 块：--- \n ... \n --- \n 正文
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?(.*)\Z", re.DOTALL)
@@ -68,6 +73,8 @@ class NoteMeta:
     - status: active | merged | superseded；merged 必须给 redirect_to，
       superseded 必须给 superseded_by（本层不强校验，由调用方保证）。
     - volatility: stable（不衰减）| drifting（90 天半衰）| volatile（30 天半衰）。
+    - kind: knowledge（世界知识）| user（用户画像/偏好）| experience（经验教训）。
+    - importance: 0.0–1.0 的主观重要性；None 表示未评估（序列化时省略）。
     - observed_at: 断言的观察时间（ISO 字符串）；缺省时新鲜度回退 created。
     - extra: 未知字段原样保留，round-trip 不丢。
     """
@@ -80,6 +87,8 @@ class NoteMeta:
     redirect_to: str | None = None
     superseded_by: str | None = None
     volatility: str = "stable"
+    kind: str = "knowledge"
+    importance: float | None = None
     observed_at: str | None = None
     reviewed_at: str | None = None
     created: str = ""
@@ -94,7 +103,7 @@ class NoteMeta:
             if f.name == "extra":
                 continue
             value = getattr(self, f.name)
-            optional = ("redirect_to", "superseded_by", "observed_at", "reviewed_at")
+            optional = ("redirect_to", "superseded_by", "observed_at", "reviewed_at", "importance")
             if value is None and f.name in optional:
                 continue
             if f.name == "sources":
@@ -111,6 +120,7 @@ class NoteMeta:
         conf = _enum_str(data.get("confidence"), CONFIDENCE_LEVELS, "medium")
         status = _enum_str(data.get("status"), STATUS_LEVELS, "active")
         volatility = _enum_str(data.get("volatility"), VOLATILITY_LEVELS, "stable")
+        kind = _enum_str(data.get("kind"), KIND_LEVELS, "knowledge")
         sources: list[SourceRef] = []
         for item in data.get("sources") or []:
             if isinstance(item, Mapping):
@@ -130,6 +140,8 @@ class NoteMeta:
             redirect_to=_scalar_str(data.get("redirect_to")),
             superseded_by=_scalar_str(data.get("superseded_by")),
             volatility=volatility,
+            kind=kind,
+            importance=_importance(data.get("importance")),
             observed_at=_scalar_str(data.get("observed_at")),
             reviewed_at=_scalar_str(data.get("reviewed_at")),
             created=_scalar_str(data.get("created")) or "",
@@ -157,3 +169,19 @@ def _enum_str(value: Any, allowed: tuple[str, ...], default: str) -> str:
         return default
     lowered = text.strip().lower()
     return lowered if lowered in allowed else default
+
+
+def _importance(value: Any) -> float | None:
+    """importance 宽容解析：仅认数值（bool 除外）且落在 [0.0, 1.0]，否则 None。
+
+    注意 _scalar_str 会把数字转成字符串，所以这里必须在原始值上判断类型；
+    非法值（字符串 / bool / 越界）一律视为"未评估"→ None，to_dict 随即省略。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    if IMPORTANCE_MIN <= number <= IMPORTANCE_MAX:
+        return number
+    return None
