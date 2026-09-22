@@ -879,12 +879,13 @@ class TestMemoryTools:
         assert payload["backup"]["action"] == "overwrite"
         assert payload["backup"]["backup_file"] is not None
 
-        # 正文已改、reason 落盘进 frontmatter extra、reviewed_at 刷新
+        # 正文已改、reason 追加落盘进 frontmatter extra、reviewed_at 刷新
         raw = (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8")
         meta, body = parse(raw)
         assert "200k" in body and "128k" not in body
-        assert meta["update_reason"] == "官方文档更新为 200k"
-        assert str(meta["update_reason_at"]).startswith("20")
+        assert meta["update_reasons"] == [{"reason": "官方文档更新为 200k",
+                                          "at": payload["reviewed_at"]}]
+        assert "update_reason" not in meta  # 单键形态不再使用
         assert meta["reviewed_at"] != old_reviewed
 
         # 原稿在备份里
@@ -897,6 +898,42 @@ class TestMemoryTools:
         # list_changes 里表现为 reviewed 变更
         changes = service.list_changes()["changes"]
         assert changes[0]["change_kind"] == "reviewed"
+
+    def test_update_reasons_accumulate_across_revisions(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """多次修订：update_reasons 按序追加，全部原因保留（不整键覆盖）。"""
+        _write_note(service, "v1 正文", title="标题")
+        assert service.update_memory("N-0001", "v2 正文", "原因一")["ok"] is True
+        assert service.update_memory("N-0001", "v3 正文", "原因二")["ok"] is True
+        meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        records = meta["update_reasons"]
+        assert [r["reason"] for r in records] == ["原因一", "原因二"]
+        assert all(str(r["at"]).startswith("20") for r in records)
+        assert records[1]["at"] >= records[0]["at"]
+
+    def test_update_reason_folds_legacy_single_key(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """迁移兼容：旧版本的单键 update_reason 首次追加时折叠为列表首条目。"""
+        _write_note(service, "v1 正文", title="标题")
+        path = wiki_root / "notes" / "N-0001.md"
+        raw = path.read_text(encoding="utf-8")
+        head, _, rest = raw.partition("---\n")
+        assert head == "" and rest
+        path.write_text(
+            "---\n"
+            "update_reason: 旧版原因\n"
+            "update_reason_at: 2026-09-01T00:00:00+00:00\n"
+            f"{rest}",
+            encoding="utf-8",
+        )
+        payload = service.update_memory("N-0001", "v2 正文", "新版原因")
+        assert payload["ok"] is True
+        meta, _ = parse(path.read_text(encoding="utf-8"))
+        assert [r["reason"] for r in meta["update_reasons"]] == ["旧版原因", "新版原因"]
+        assert meta["update_reasons"][0]["at"] == "2026-09-01T00:00:00+00:00"
+        assert "update_reason" not in meta and "update_reason_at" not in meta
 
     def test_update_validations(self, service: WikiService, store: WikiStore) -> None:
         _write_note(service, "正文", title="标题")
@@ -995,36 +1032,84 @@ class TestMemoryTools:
         assert payload["ok"] is False
         assert payload["error"]["code"] == "validation_failed"
 
-    def test_timeline_ordered_oldest_first(self, service: WikiService) -> None:
-        _write_note(service, "GLM-5.3 支持 128k。", title="上下文长度")
-        service.supersede_memory("N-0001", "GLM-5.3 支持 200k。", "官方文档更新")
-        service.supersede_memory("N-0002", "GLM-5.3 支持大规模上下文。", "表述修正")
+    def test_timeline_ordered_oldest_first(
+        self, service: WikiService, store: WikiStore
+    ) -> None:
+        """链拓扑事件 + 变更记录合并，全时间线旧 → 新有序（显式时间戳保证确定性）。"""
+        store.save_note(
+            "v1", note_id="N-0001", title="一", status="superseded",
+            superseded_by="N-0002", created="2026-09-01T00:00:00+00:00",
+            reviewed_at="2026-09-02T00:00:00+00:00",
+            extra={"supersede_reason": "官方文档更新"},
+        )
+        store.save_note(
+            "v2", note_id="N-0002", title="二", status="superseded",
+            superseded_by="N-0003", created="2026-09-02T00:00:00+00:00",
+            reviewed_at="2026-09-03T00:00:00+00:00",
+            extra={"supersede_reason": "表述修正"},
+        )
+        store.save_note("v3", note_id="N-0003", title="三",
+                        created="2026-09-03T00:00:00+00:00")
 
-        # 从最新版本查，也能拿到完整历史
+        # 从最新版本查，也能拿到完整历史（含每条笔记的 created 与 status 事件）
         payload = service.timeline("N-0003")
         assert payload["ok"] is True
         assert payload["current"] == "N-0003"
         assert payload["direction"] == "oldest_first"
-        assert [e["note_id"] for e in payload["events"]] == ["N-0001", "N-0002", "N-0003"]
-        assert [e["status"] for e in payload["events"]] == [
-            "superseded",
-            "superseded",
-            "active",
+        events = payload["events"]
+        assert [(e["note_id"], e["change_kind"]) for e in events] == [
+            ("N-0001", "created"),
+            ("N-0001", "status"),
+            ("N-0002", "created"),
+            ("N-0002", "status"),
+            ("N-0003", "created"),
         ]
-        assert payload["events"][1]["superseded_by"] == "N-0003"
+        assert [e["status"] for e in events] == [
+            "superseded", "superseded", "superseded", "superseded", "active",
+        ]
+        assert events[1]["superseded_by"] == "N-0002"
+        assert events[1]["reason"] == "官方文档更新"
+        assert events[3]["reason"] == "表述修正"
+        assert events[-1]["reason"] is None
+        updated_list = [e["updated"] for e in events]
+        assert updated_list == sorted(updated_list), "事件必须按时间升序"
 
         # 从链中/链首查，结果一致
-        assert service.timeline("N-0001")["events"] == payload["events"]
+        assert service.timeline("N-0001")["events"] == events
         assert service.timeline("N-0002")["current"] == "N-0003"
 
-    def test_timeline_includes_predecessors_of_active_note(self, service: WikiService) -> None:
+    def test_timeline_includes_predecessors_of_active_note(
+        self, service: WikiService
+    ) -> None:
         """对最新（active）版本查询时，反向收集到全部更早版本。"""
         _write_note(service, "第一版结论。", title="结论")
         service.supersede_memory("N-0001", "第二版结论。", "补充证据")
         payload = service.timeline("N-0002")
-        assert [e["note_id"] for e in payload["events"]] == ["N-0001", "N-0002"]
-        assert payload["events"][0]["change_kind"] == "status"
-        assert payload["events"][1]["change_kind"] == "created"
+        kinds = [(e["note_id"], e["change_kind"]) for e in payload["events"]]
+        assert len(kinds) == 3
+        assert ("N-0001", "created") in kinds
+        assert ("N-0001", "status") in kinds
+        assert ("N-0002", "created") in kinds
+        # 同一笔记内事件按时间有序（created 先于 status）
+        assert kinds.index(("N-0001", "created")) < kinds.index(("N-0001", "status"))
+
+    def test_timeline_active_note_multiple_revisions(self, service: WikiService) -> None:
+        """同一 active 记忆多次修订：timeline 必须含两条 reviewed 事件（不折叠）。"""
+        _write_note(service, "GLM-5.3 支持 128k。", title="上下文长度")
+        assert service.update_memory("N-0001", "GLM-5.3 支持 192k。", "第一次修正")["ok"]
+        assert service.update_memory("N-0001", "GLM-5.3 支持 200k。", "第二次修正")["ok"]
+        payload = service.timeline("N-0001")
+        assert payload["ok"] is True
+        assert payload["current"] == "N-0001"
+        events = payload["events"]
+        assert [(e["note_id"], e["change_kind"]) for e in events] == [
+            ("N-0001", "created"),
+            ("N-0001", "reviewed"),
+            ("N-0001", "reviewed"),
+        ]
+        # 修订事件按 update_reasons 追加顺序排列，原因各自保留
+        assert [e["reason"] for e in events[1:]] == ["第一次修正", "第二次修正"]
+        assert events[1]["status"] == "active"
 
     def test_timeline_not_found(self, service: WikiService) -> None:
         payload = service.timeline("N-9999")
@@ -1116,7 +1201,16 @@ class TestMemoryProtocol:
         assert [m["note_id"] for m in profile["memories"]] == ["N-0002"]
 
         timeline = _tool_call(server, "memory_timeline", {"note_id": "N-0002"})
-        assert [e["note_id"] for e in timeline["events"]] == ["N-0001", "N-0002"]
+        kinds = [(e["note_id"], e["change_kind"]) for e in timeline["events"]]
+        # N-0001 的 created + memory_update 留下的 reviewed + supersede 的 status，
+        # 加上 N-0002 的 created——链拓扑事件与变更记录合并输出
+        assert ("N-0001", "created") in kinds
+        assert ("N-0001", "reviewed") in kinds
+        assert ("N-0001", "status") in kinds
+        assert ("N-0002", "created") in kinds
+        assert len(kinds) == 4
+        updated_list = [e["updated"] for e in timeline["events"]]
+        assert updated_list == sorted(updated_list)
 
         invalidated = _tool_call(
             server,

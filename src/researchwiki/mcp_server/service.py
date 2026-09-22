@@ -685,8 +685,11 @@ class WikiService:
         """修订既有记忆正文（不新增 ID）：写前备份 + reason 落盘，禁止静默覆盖。
 
         - 备份：create_backup(existed=True)，原稿进 wiki-data/.backups/；
-        - reason：写进 frontmatter extra 的 ``update_reason``（附 ``update_reason_at``），
-          同时刷新 ``reviewed_at``（list_changes 里表现为 reviewed 变更）；
+        - reason：**追加**进 frontmatter extra 的 ``update_reasons`` 列表（按修订顺序，
+          每条 ``{"reason", "at"}``），多次修订的全部原因都保留；同时刷新
+          ``reviewed_at``（list_changes 里表现为 reviewed 变更）。兼容迁移：旧版
+          本的单键 ``update_reason``/``update_reason_at`` 在首次追加时折叠为列表
+          首条目，随后旧键移除（round-trip 归一，不丢历史原因）；
         - 只允许修订 active 笔记：merged/superseded 的内容归属最终版本，
           应先 wiki_read 跟随重定向，再用 memory_supersede 取代。
         """
@@ -732,7 +735,7 @@ class WikiService:
                     reviewed_at=now,
                     trace_id=meta.trace_id,
                     sources=list(meta.sources),
-                    extra={**meta.extra, "update_reason": reason_text, "update_reason_at": now},
+                    extra=_append_update_reason(meta.extra, reason_text, now),
                     created=meta.created,
                 )
             except (OSError, ValueError) as exc:
@@ -747,12 +750,14 @@ class WikiService:
             "note_id": updated.id,
             "title": updated.title,
             "reason": reason_text,
+            "reasons_so_far": len(updated.meta.extra.get("update_reasons") or []),
             "reviewed_at": now,
             "backup": backup,
             "indexed": index_error is None,
             "path": _relative_path(updated.path, self.root),
             "message": (
-                f"已修订记忆 {updated.id}（原因记入 update_reason，原稿备份于 {backup['dir']}）"
+                f"已修订记忆 {updated.id}（原因追加记入 update_reasons，"
+                f"原稿备份于 {backup['dir']}）"
             ),
         }
         if index_error is not None:
@@ -866,12 +871,17 @@ class WikiService:
 
     @_structured_errors
     def timeline(self, note_id: str) -> dict[str, Any]:
-        """单条记忆的版本史：redirect 链 + 各版本变更记录，输出有序事件列表。
+        """单条记忆的版本史：redirect 链拓扑事件 + list_changes 口径变更记录，合并输出。
 
-        方向约定：**旧 → 新**（oldest_first）。链的构造：从请求的笔记沿
-        redirect_to/superseded_by 走到最终 active 版本，同时反向收集指向链上
-        节点的更早版本——无论查询的是链首、链中还是最新版本，都能拿到完整
-        历史（分支按拓扑序、同刻按 note_id 兜底排序）。
+        方向约定：**旧 → 新**（oldest_first）。两类来源按 note_id 合并：
+        ① 沿 redirect_to/superseded_by 链的拓扑事件——从请求的笔记走到最终
+        active 版本，并反向收集指向链上节点的更早版本（查链上任一 ID 都拿
+        完整历史）；② 每条笔记按 list_changes 同口径拆出的变更记录——一条
+        created（新建）、每次修订一条 reviewed（reason 取 extra.update_reasons，
+        兼容旧单键 update_reason）、superseded/merged 一条 status（reason 取
+        supersede_reason / invalidate_reason）。全部事件按时间升序输出并做
+        全字段去重；同刻按链拓扑序与事件类型（created < reviewed < status）
+        兜底排序，保证同一笔记内 created → reviewed… → status 的相对次序。
         """
         origin = normalize_note_id(note_id)
         final, aliases = self._walk_redirects(origin)
@@ -897,7 +907,19 @@ class WikiService:
                 if current in (note.meta.redirect_to, note.meta.superseded_by):
                     lineage[note.id] = note
                     frontier.append(note.id)
-        events = [self._timeline_event(lineage[nid]) for nid in _topo_order(lineage)]
+        # 两类来源合并：链拓扑序内逐笔记生成事件 → 时间升序 → 全字段去重
+        keyed: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        for topo_idx, nid in enumerate(_topo_order(lineage)):
+            keyed.extend(self._note_events(lineage[nid], topo_idx))
+        keyed.sort(key=lambda pair: pair[0])
+        seen: set[tuple[Any, ...]] = set()
+        events: list[dict[str, Any]] = []
+        for _, payload in keyed:
+            fingerprint = tuple(sorted((k, str(v)) for k, v in payload.items()))
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            events.append(payload)
         return {
             "ok": True,
             "note_id": origin,
@@ -1026,26 +1048,66 @@ class WikiService:
             logger.warning("旧笔记索引同步失败（%s）：%s", note.id, index_error)
         return marked
 
-    def _timeline_event(self, note: Note) -> dict[str, Any]:
-        """一个版本的变更事件（字段与 list_changes 条目对齐，另带 kind/importance）。"""
-        updated = _change_time(note)
-        return {
+    def _note_events(
+        self, note: Note, topo_idx: int
+    ) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+        """一条笔记的全部时间线事件（list_changes 同口径拆分），附排序键。
+
+        事件类型与 list_changes 的 change_kind 对齐：created（新建）/ reviewed
+        （每次修订一条，reason 取 update_reasons；无修订记录但 reviewed_at 晚于
+        created 的 active 笔记按老口径补一条，兼容手工维护的笔记）/ status
+        （superseded/merged 状态变更，reason 取 supersede_reason 或
+        invalidate_reason）。排序键 (updated, topo_idx, kind_order, note_id)：
+        同刻先按链拓扑序、再按 created < reviewed < status 的类型次序兜底，
+        Python 稳定排序保证同刻同类的多条修订保持 frontmatter 里的追加顺序。
+        """
+        base: dict[str, Any] = {
             "note_id": note.id,
             "title": note.title,
             "kind": note.meta.kind,
             "status": note.meta.status,
-            "change_kind": _change_kind(note),
             "confidence": note.meta.confidence,
             "importance": note.meta.importance,
             "entities": list(note.meta.entities),
             "created": note.meta.created,
             "reviewed_at": note.meta.reviewed_at,
             "observed_at": note.meta.observed_at,
-            "updated": updated.isoformat() if updated else (note.meta.created or ""),
             "redirect_to": note.meta.redirect_to,
             "superseded_by": note.meta.superseded_by,
             "path": _relative_path(note.path, self.root),
         }
+        entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def add(change_kind: str, at: str, reason: str | None, kind_order: int) -> None:
+            payload = {**base, "change_kind": change_kind, "updated": at, "reason": reason}
+            entries.append(((at or "", topo_idx, kind_order, note.id), payload))
+
+        created = _parse_ts(note.meta.created)
+        if created is not None:
+            add("created", note.meta.created, None, 0)
+        revisions = _revision_records(note.meta.extra)
+        if revisions:
+            for record in revisions:
+                at = record["at"] or note.meta.reviewed_at or note.meta.created or ""
+                add("reviewed", at, record["reason"], 1)
+        elif note.meta.status == "active":
+            # 老口径兼容：没有修订记录但 reviewed_at 晚于 created → 一次复核事件
+            reviewed = _parse_ts(note.meta.reviewed_at)
+            if reviewed is not None and created is not None and reviewed > created:
+                add("reviewed", note.meta.reviewed_at or "", None, 1)
+        if note.meta.status != "active":
+            change_time = _change_time(note)
+            at = change_time.isoformat() if change_time else (note.meta.created or "")
+            reason = (
+                str(
+                    note.meta.extra.get("supersede_reason")
+                    or note.meta.extra.get("invalidate_reason")
+                    or ""
+                ).strip()
+                or None
+            )
+            add("status", at, reason, 2)
+        return entries
 
     # ---- 增量列表 ----
 
@@ -1299,6 +1361,48 @@ def _change_time(note: Note) -> datetime | None:
     """笔记的"最后变更时间" = max(created, reviewed_at)（均按 ISO 串解析，UTC 归一）。"""
     candidates = [t for t in (_parse_ts(note.meta.created), _parse_ts(note.meta.reviewed_at)) if t]
     return max(candidates) if candidates else None
+
+
+def _append_update_reason(extra: Mapping[str, Any], reason: str, at: str) -> dict[str, Any]:
+    """把一次修订原因**追加**进 extra 的 ``update_reasons``（按修订顺序累积）。
+
+    条目形态 ``{"reason": ..., "at": ...}``；多次修订全部保留，不覆盖。
+    兼容迁移：旧版本把原因写在单键 ``update_reason``/``update_reason_at``，
+    首次追加时先把它折叠为列表首条目，随后旧键移除——round-trip 归一，
+    历史原因不丢。
+    """
+    merged = dict(extra)
+    records: list[Any] = list(merged.pop("update_reasons", None) or [])
+    legacy_reason = merged.pop("update_reason", None)
+    legacy_at = merged.pop("update_reason_at", None)
+    if not records and legacy_reason is not None:
+        # YAML 会把时间戳解析成 datetime：归一回 ISO 字符串再入列表
+        normalized_at = _parse_ts(str(legacy_at) if legacy_at is not None else "")
+        records.append(
+            {
+                "reason": str(legacy_reason),
+                "at": normalized_at.isoformat() if normalized_at else str(legacy_at or ""),
+            }
+        )
+    records.append({"reason": reason, "at": at})
+    merged["update_reasons"] = records
+    return merged
+
+
+def _revision_records(extra: Mapping[str, Any]) -> list[dict[str, str]]:
+    """读出 extra.update_reasons 的修订记录（宽容解析手工编辑的条目形态）。"""
+    out: list[dict[str, str]] = []
+    for item in extra.get("update_reasons") or []:
+        if isinstance(item, Mapping):
+            out.append(
+                {
+                    "reason": str(item.get("reason") or ""),
+                    "at": str(item.get("at") or ""),
+                }
+            )
+        elif item:
+            out.append({"reason": str(item), "at": ""})
+    return out
 
 
 def _topo_order(lineage: Mapping[str, Note]) -> list[str]:
