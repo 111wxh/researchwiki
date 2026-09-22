@@ -38,6 +38,20 @@ Interaction → Memory Candidate Detection → Memory Formation → External Mem
 
 三个问题合起来一句话：**Remember → Maintain → Recall**。
 
+### 两类时效性问题（RQ2 的展开）
+
+**问题一：外部信息的时效性**
+- **问题**：Agent 记忆的信息会随时间变化，静态记忆容易产生过期信息，导致错误召回。
+- **解法**：为记忆引入时间感知机制，通过 freshness、expiration、supersession、conflict、timeline 判断信息当前是否仍有效，并在新证据出现时更新或替换旧记忆。
+
+**问题二：用户记忆的时效性**
+- **问题**：用户的身份、偏好、正在进行的任务等也会变化，但频繁主动询问用户确认会降低交互体验。
+- **解法**：采用被动验证 + 选择性询问：根据记忆稳定性、时间衰减、上下文证据和重要性动态判断可信度；优先从后续对话中自动验证和更新，仅在高重要性且无法确认时向用户询问。
+
+总述（一句）：
+
+> 核心问题是解决 Agent Memory 中“信息会过期”和“用户状态会变化”两类时效性问题；核心思路是通过时间感知、证据驱动更新与选择性重新确认，使记忆能够持续演化，同时减少对用户的主动打扰。
+
 ### 0.5 设计立场（作为假设写进计划书，接受评测检验）
 
 1. **Storage 与 Retrieval 分离**：存储层尽可能保存可追溯的状态与证据；检索层每次按 Query 动态组合各因子决定进 Context 的内容。**核心算法问题在检索层**，不在存储层。存储层字段基线：
@@ -272,6 +286,8 @@ P1 的 Prior 注入、run-metrics、cold/warm smoke 已完成（§1.3）。收�
 
 **目标**：让系统知道一条记忆"什么时候不再应该被当成当前事实"（RQ2），并在新证据与旧记忆不一致时留下可追溯的状态变化。
 
+> **研究问题锚点**：RQ2 的两个子问题见 §0"两类时效性问题（RQ2 的展开）"——问题二（用户记忆时效性）的"被动验证 + 选择性询问"落在 P2 的 verification 回路与 P4 的 continual 更新里。
+
 **设计**（现有 frontmatter 已有 `volatility`、`observed_at`、`reviewed_at`、`status`、来源快照和 redirect 字段，本阶段扩展现有模型，不新建数据库）：
 
 - freshness 是计算状态：`fresh`、`review_due`、`stale`；expiration 由 `valid_from` / `valid_until`（待加字段）表达。
@@ -281,6 +297,7 @@ P1 的 Prior 注入、run-metrics、cold/warm smoke 已完成（§1.3）。收�
 - **carried 项（v1 阶段 2 补办）**：`ensure_index_fresh` 补 content_hash 比对——索引落后检测不只看条目数，还要比对来源内容哈希。
 - 新研究/新交互比较旧记忆与新证据：一致则更新 `reviewed_at`；更具体/更新则 supersede；无法判断则进入 conflict ledger。
 - `memory.timeline`：一条记忆的状态变迁历史可查询。
+- **kind 差异（本阶段只标注，不定参数）**：问题一（外部信息）对应 `kind=knowledge` 记忆、问题二（用户记忆）对应 `kind=user` 记忆，两者在 freshness 参数上可能需要区分（`volatility` 已承载部分语义）——这是 P2 设计需要考虑的一点，具体取值留给实现与评测校准，现在不写死。
 - 投影层（pages）中的断言必须能追溯到 active note；引用 merged note 时给出 redirect 警告。
 
 **计划交付物**（代码路径不变）：
