@@ -19,11 +19,14 @@ delay = 0.04
 #   Kimi         https://api.moonshot.cn/v1           （kimi-k2-*）
 
 [llm.strong]
-model = "glm-4.7"
+# 主循环（规划 / 综述报告）。当前用便宜档以控制成本；
+# 想换更强的规划与综述：把 model 改成 "glm-4.7"（贵、慢、质量更高），代码不用动。
+model = "glm-4.5-air"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_STRONG_API_KEY"
 
 [llm.cheap]
+# 子 agent 检索阅读 / 笔记蒸馏。这一档用得最多，保持便宜模型。
 model = "glm-4.5-air"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
