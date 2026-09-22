@@ -13,15 +13,19 @@ CONFIG_PATH = Path(os.environ.get("RESEARCHWIKI_CONFIG", "config.toml"))
 
 
 def load_config() -> dict:
-    """读取运行配置；文件缺失/损坏时按空配置处理（调用方按缺省值接线）。
+    """读取运行配置；读不到（缺失/损坏/路径是目录/无读权限）时按空配置处理。
 
     与 ``server.main.load_config`` 同语义（lint 命令只需 tomllib，不值得为它
     拉起 FastAPI 那一整串导入，故此处独立实现，不 import server 模块）。
+    宽容面比 server 版更大：``RESEARCHWIKI_CONFIG`` 指向目录、或无读权限时，
+    "读配置"不该让 lint 整体崩掉——一律回退空配置（调用方随即按默认参数接线，
+    时效统计与不接线时逐值一致）。
     """
     try:
         with CONFIG_PATH.open("rb") as f:
             return tomllib.load(f)
-    except (FileNotFoundError, tomllib.TOMLDecodeError):
+    except (OSError, tomllib.TOMLDecodeError):
+        # OSError 覆盖 FileNotFoundError / IsADirectoryError / PermissionError 等
         return {}
 
 

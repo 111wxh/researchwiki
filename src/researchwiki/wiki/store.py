@@ -30,6 +30,11 @@ from researchwiki.wiki.frontmatter import NoteMeta, SourceRef, dump, parse
 
 CONFLICT_ID_RE = re.compile(r"^C-(\d+)$")
 
+# mark_source_changed 的去重记账键：最近一次"为该新哈希标记过来源变化"的哈希值。
+# 存在 note extra 里（不新增类型化 frontmatter 字段，与 formation_reason /
+# update_reasons 同处 extra，round-trip 不丢）；用途见该方法的 docstring。
+SOURCE_CHANGED_HASH_KEY = "source_changed_hash"
+
 
 def source_snapshot_path(sources_root: str | Path, url: str, content_hash: str) -> Path:
     """纯函数：{url, content_hash} → sources 快照正文路径（与 tools.fetch 落盘布局对齐）。
@@ -318,16 +323,27 @@ class WikiStore:
 
         - 只处理 **active** 笔记（merged/superseded 已退役，复核无意义）；
         - 命中条件：引用了该 URL **且** 记录里的 content_hash ≠ ``new_content_hash``
-          （记录哈希与新哈希相同的笔记 = 证据未变，不动）；
+          **且** 该笔记还没有为这个新哈希标记过（去重见下）；
         - 写入 ``source_changed_at = now``（缺省当前 UTC 秒级 ISO），**只记"何时
           发现变化"**，不改 sources 里的 content_hash——证据换版要等复核后由
           supersede / memory_update 决定（下一包），这样来源变化的检测与证据的
           修订是两个可分别审计的动作；
-        - 笔记的其余字段（含 reviewed_at / valid_* / extra）原样保留，只这一
-          个字段变化；返回值按 note_id 升序，便于调用方直接展示。
+        - 同时把被检测到的 ``new_content_hash`` 记进 ``extra["source_changed_hash"]``
+          （不新增类型化 frontmatter 字段，与 formation_reason / update_reasons
+          同处 extra，round-trip 不丢）；
+        - 笔记的其余字段（含 reviewed_at / valid_* / 其余 extra 键）原样保留，
+          只这两个写入项变化；返回值按 note_id 升序，便于调用方直接展示。
 
-        重复调用是幂等的"刷新时间戳"：同一次变化被检测两次会把时间戳推后，
-        不会产生重复记录或状态漂移。
+        **去重（幂等）**：同一次变化反复检测是 no-op —— 若
+        ``extra["source_changed_hash"] == new_content_hash``，直接跳过（返回空列表、
+        时间戳不动）。没有这条记账时，例行检测（P4 refresh 每周期调用）会把
+        ``source_changed_at`` 一路往后推，于是"标记 → 复核（reviewed_at 晚于
+        source_changed_at → 恢复 fresh）→ 下一周期又被标记推后"，
+        已复核的笔记被永久钉在 review_due；记账后的行为：同一变化只标记一次，
+        **哈希确实再次变化时**（新的 new_content_hash）正常标记并推后时间戳。
+        退化情形：若 ``source_changed_hash`` 记录被外部清掉（含经
+        ``save_note`` 不带 extra 的重写），同一变化会被再标记一次——可接受，
+        宁可多标一次也不漏标。
         """
         stamp = now or datetime.now(UTC).isoformat(timespec="seconds")
         affected: list[str] = []
@@ -341,6 +357,10 @@ class WikiStore:
             ):
                 continue  # 记录哈希与新哈希一致：证据未变
             meta = note.meta
+            extra = dict(meta.extra)
+            if str(extra.get(SOURCE_CHANGED_HASH_KEY) or "") == new_content_hash:
+                continue  # 同一次变化已标记过：no-op，不刷新时间戳（防"永久钉在 review_due"）
+            extra[SOURCE_CHANGED_HASH_KEY] = new_content_hash
             self.save_note(
                 body=note.body,
                 note_id=note.id,
@@ -360,7 +380,7 @@ class WikiStore:
                 source_changed_at=stamp,
                 trace_id=meta.trace_id,
                 sources=list(meta.sources),
-                extra=dict(meta.extra),
+                extra=extra,
                 created=meta.created,
             )
             affected.append(note.id)

@@ -18,10 +18,11 @@
 一致性策略（MVP）：查询前【不】自动同步 md 文件与索引——由调用方决定
 rebuild(store)（全量重建）或 index_note(note)（增量 upsert）。索引存了
 body 快照（供向量命中出摘要与短查询 LIKE），md 改动后需重新 index_note。
-除正文快照外，note_meta 还存一列 ``body_hash``（``note_body_hash``：title+body
-的 sha256）作为"这条索引记录对应哪版正文"的指纹——``prior.ensure_index_fresh``
-靠它发现**同 id 原地改写正文**（memory_update / formation merge 等新入口），
-只比 status 会静默保留陈旧正文。
+除正文快照外，note_meta 还存一列 ``body_hash``（``note_index_hash``：title/body +
+confidence/volatility/kind/redirect_to/superseded_by/observed_at/created 的 sha256，
+即"这条索引记录对应哪一版检索视图"的指纹）——``prior.ensure_index_fresh`` 靠它
+发现**同 id 原地改写**（memory_update / formation merge / formation 标注回写 kind
+等入口），只比 status 会静默保留陈旧索引。
 """
 
 from __future__ import annotations
@@ -210,17 +211,41 @@ def _deserialize_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{len(blob) // 4}f", blob))
 
 
-def note_body_hash(title: str, body: str) -> str:
-    """笔记正文指纹：``sha256("{title}\\n{body}")`` 的 hex。
+def note_index_hash(note: Note) -> str:
+    """索引指纹：sha256 over **``index_note`` 写入索引且参与检索/过滤的全部字段**。
 
-    **指纹覆盖范围**：``index_note`` 实际写入索引的两处文本——``note_fts`` 的
-    ``title`` / ``body`` 列与 ``note_meta`` 的 ``title`` / ``body`` 列（title 与
-    body 都会进 FTS 参与打分、也会作为 snippet 来源，故改标题同样让索引失真）。
-    与嵌入输入 ``f"{title}\\n{body}"`` 同形，避免"改了参与检索的字段但指纹不动"。
-    注意：指纹**不含** frontmatter 的其它字段（status/kind/sources 等）——那些
-    由 ``ensure_index_fresh`` 的 status 维度与全文 rebuild 覆盖。
+    指纹输入（顺序固定，逐字段以 ``"\\n"`` 连接后取 sha256 hex）：``title``、
+    ``body``、``confidence``、``volatility``、``kind``、``redirect_to``、
+    ``superseded_by``、``observed_at``、``created``——即 ``note_fts`` 的两列
+    （title/body）加 ``note_meta`` 里 ``search()`` 实际消费的七个元数据列：
+    confidence / volatility / observed_at / created 进检索打分
+    （``CONFIDENCE_FACTOR`` × ``freshness_factor``），kind 进 kind 过滤，
+    redirect_to / superseded_by 进重定向解析（改了就改命中落点与 ``redirected_from``）。
+
+    因此"只改这些字段、body/title/status 都不变"同样会让索引失真，必须能被
+    ``prior.ensure_index_fresh`` 检出——这正是本函数覆盖全部写入字段（而不仅
+    正文）的原因；在 ``index_note`` 里新增参与检索的列时，**这里必须同步扩列表**，
+    否则新列会退回"只有 rebuild 才能纠正"的静默陈旧。
+
+    ``status`` 不在输入内：它由 ``ensure_index_fresh`` 的独立维度负责，两类原因
+    分开报告更好审计。写入位置是 ``note_meta.body_hash`` 列——列名沿用任务简报
+    给定的名字，语义是"这条索引记录对应哪一版检索视图"，不限于正文。
     """
-    return hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()
+    meta = note.meta
+    payload = "\n".join(
+        (
+            note.title,
+            note.body,
+            str(meta.confidence or ""),
+            str(meta.volatility or ""),
+            str(meta.kind or ""),
+            str(meta.redirect_to or ""),
+            str(meta.superseded_by or ""),
+            str(meta.observed_at or ""),
+            str(meta.created or ""),
+        )
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 # ---- 索引主体 ---------------------------------------------------------------
@@ -355,7 +380,7 @@ class SearchIndex:
         knowledge（旧行为下所有笔记都是知识笔记，语义无损）——老用户索引
         打开即自动升级，绝不报废重建。全量 rebuild() 会用笔记真实 kind 重写。
 
-        P2-B 增补 v2 → v3 的 body_hash 列（正文指纹，见 ``note_body_hash``）：
+        P2-B 增补 v2 → v3 的 body_hash 列（索引指纹，见 ``note_index_hash``）：
         同样探测缺列即 ALTER，但**存量行不回填**（一律留 NULL）。理由：回填需要
         逐条重算 md 正文的 sha256，而这里的迁移路径只有连接、没有 store；
         不填的后果是首次 ``prior.ensure_index_fresh`` 把 NULL 视为"索引缺指纹"
@@ -418,7 +443,7 @@ class SearchIndex:
                 note.meta.superseded_by,
                 note.meta.observed_at,
                 note.meta.created,
-                note_body_hash(note.title, note.body),
+                note_index_hash(note),
             ),
         )
         conn.execute(
@@ -464,9 +489,9 @@ class SearchIndex:
     def indexed_fingerprints(self) -> dict[str, tuple[str, str]]:
         """索引内 ``{note_id: (status, body_hash)}`` 的只读快照（一致性检查专用）。
 
-        ``body_hash`` 是 ``note_body_hash`` 的结果（覆盖写入索引的 title + body）；
-        旧库迁移（ALTER 补列）留下的行此列为 NULL，这里归一成**空字符串**——
-        空串不是合法 sha256，调用方据此即可判定"该行缺正文指纹"（``prior.
+        ``body_hash`` 是 ``note_index_hash`` 的结果（覆盖写入索引且参与检索/过滤的
+        全部字段）；旧库迁移（ALTER 补列）留下的行此列为 NULL，这里归一成**空字符串**
+        ——空串不是合法 sha256，调用方据此即可判定"该行缺指纹"（``prior.
         ensure_index_fresh`` 正是这么用的），无需关心底层是 NULL 还是 ``""``。
         与 ``indexed_status`` 一样，只读、仅供比对，不代表检索可用性。
         """

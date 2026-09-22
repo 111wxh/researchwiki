@@ -1,16 +1,19 @@
-"""索引正文指纹与 ensure_index_fresh 三维比对（P2-B：carried 一致性修复）。
+"""索引指纹与 ensure_index_fresh 三维比对（P2-B：carried 一致性修复）。
 
 覆盖 task-9 简报需求 1 与需求 2：
 
 1. ``note_meta.body_hash`` 列 + 旧库迁移（探测缺列 → ALTER，存量行留空）+ 只读
    方法 ``indexed_fingerprints()``（``indexed_status()`` 契约不变）；
-2. ``ensure_index_fresh`` 的三维落后判定：id 集合 / status / **正文指纹**，以及
-   回归用例：
+2. ``ensure_index_fresh`` 的三维落后判定：id 集合 / status / **索引指纹**
+   （覆盖写入索引且参与检索/过滤的全部字段），以及回归用例：
    a. ``store.save_note`` 同 id 原地改写正文 → 判落后并 rebuild，之后检索命中
       新正文、不再命中旧正文；
    b. ``memory_update`` 走完整 MCP 服务面改正文 → 索引一致性可检出（service 层
       直接调用，不起 server、不走 stdio）；
-   c. status 变化与新增笔记两个旧维度不回归（另见 test_prior.py 的同名用例）。
+   c. status 变化与新增笔记两个旧维度不回归（另见 test_prior.py 的同名用例）；
+   d. **只改元数据**（kind / volatility / observed_at / title / redirect_to …，
+      正文与 status 都不变）同样检出——覆盖 ``_annotate_formation`` 回写 kind
+      这条已被代码预判的路径。
 
 零网络：MockEmbeddingProvider（dim=128，与 service 层缺省一致）+ tokenizer=trigram。
 
@@ -29,7 +32,7 @@ import pytest
 
 from researchwiki.mcp_server.service import WikiService
 from researchwiki.wiki.embeddings import MockEmbeddingProvider
-from researchwiki.wiki.index import SearchIndex, SearchMatch, note_body_hash
+from researchwiki.wiki.index import SearchIndex, SearchMatch, note_index_hash
 from researchwiki.wiki.prior import ensure_index_fresh
 from researchwiki.wiki.store import Note, WikiStore
 
@@ -57,9 +60,15 @@ def make_index(store: WikiStore) -> SearchIndex:
     )
 
 
-def _fts_hits(index: SearchIndex, query: str) -> list[SearchMatch]:
-    """只保留真正来自索引正文的命中（fts / both），滤掉向量通道噪声。"""
-    return [m for m in index.search(query, k=5) if m.match_type in ("fts", "both")]
+def _fts_hits(index: SearchIndex, query: str, kind: str | None = None) -> list[SearchMatch]:
+    """只保留真正来自索引正文的命中（fts / both），滤掉向量通道噪声。
+
+    ``kind`` 透传给 ``search`` 的过滤参数（kind 过滤发生在融合打分之后，
+    与通道无关；这里同时带上通道过滤，断言才不会被向量命中污染）。
+    """
+    return [
+        m for m in index.search(query, k=5, kind=kind) if m.match_type in ("fts", "both")
+    ]
 
 
 # ---- 需求 1：指纹列 / 只读方法 / 旧库迁移 -------------------------------------
@@ -72,16 +81,45 @@ class TestBodyHashColumn:
             index.rebuild(store)
             fingerprints = index.indexed_fingerprints()
             assert fingerprints == {
-                "N-0001": ("active", note_body_hash(note.title, note.body))
+                "N-0001": ("active", note_index_hash(note))
             }
             # 契约不动：indexed_status 仍是 {note_id: status}（P1-A 调用方依赖）
             assert index.indexed_status() == {"N-0001": "active"}
 
-    def test_fingerprint_covers_title_and_body(self) -> None:
-        """指纹覆盖 title + body（两者都进 FTS 与 note_meta，改任一个都算变化）。"""
-        assert note_body_hash("甲", "同样的正文") != note_body_hash("乙", "同样的正文")
-        assert note_body_hash("甲", "正文一") != note_body_hash("甲", "正文二")
-        assert note_body_hash("甲", "正文一") == note_body_hash("甲", "正文一")
+    def test_fingerprint_covers_title_body_and_metadata(self, store: WikiStore) -> None:
+        """指纹覆盖"写入索引且参与检索/过滤的全部字段"，逐字段敏感。"""
+        base = store.save_note(OLD_BODY, note_id="N-0001", title=TITLE)
+        assert note_index_hash(base) == note_index_hash(store.get_note("N-0001"))
+        # title / body
+        for kwargs in (
+            {"title": "另一个标题"},
+            {"body": "换一段正文"},
+            {"confidence": "high"},
+            {"volatility": "volatile"},
+            {"kind": "user"},
+            {"observed_at": "2026-05-01T00:00:00+00:00"},
+            {"created": "2026-05-01T00:00:00+00:00"},
+        ):
+            changed = store.save_note(
+                kwargs.get("body", OLD_BODY),
+                note_id="N-0001",
+                title=str(kwargs.get("title", TITLE)),
+                confidence=str(kwargs.get("confidence", "medium")),
+                volatility=str(kwargs.get("volatility", "stable")),
+                kind=str(kwargs.get("kind", "knowledge")),
+                observed_at=kwargs.get("observed_at"),
+                created=str(kwargs.get("created", base.meta.created)),
+                sources=list(base.meta.sources),
+            )
+            assert note_index_hash(changed) != note_index_hash(base), kwargs
+        # redirect_to / superseded_by（merged 笔记的跳转目标变了 = 命中落点变了）
+        merged_a = store.save_note(
+            "留痕", note_id="N-0002", status="merged", redirect_to="N-0001", title="留痕甲"
+        )
+        merged_b = store.save_note(
+            "留痕", note_id="N-0002", status="merged", redirect_to="N-0003", title="留痕甲"
+        )
+        assert note_index_hash(merged_a) != note_index_hash(merged_b)
 
     def test_title_only_change_is_detected(self, store: WikiStore) -> None:
         store.save_note(OLD_BODY, note_id="N-0001", title="旧标题")
@@ -91,7 +129,47 @@ class TestBodyHashColumn:
             store.save_note(OLD_BODY, note_id="N-0001", title="新标题")
             rebuilt, reason = ensure_index_fresh(store, index)
             assert rebuilt is True
-            assert "正文变化" in reason and "N-0001" in reason
+            assert "索引字段变化" in reason and "N-0001" in reason
+
+    def test_kind_only_change_is_detected(self, store: WikiStore) -> None:
+        """只改 kind（body/title/status 不变）→ 判落后并 rebuild。
+
+        这条路径已被代码预判：``loop/agent_loop._annotate_formation`` 原地回写
+        ``kind=decision.kind``，其 docstring 写明"若 formation 未来赋非 knowledge
+        kind，此处必须触发索引同步，否则检索的 kind 过滤会失真"。指纹不含元数据
+        时这条路径检不出，索引会静默按旧 kind 过滤。
+        """
+        store.save_note(OLD_BODY, note_id="N-0001", title=TITLE, kind="knowledge")
+        with make_index(store) as index:
+            index.rebuild(store)
+            assert index.indexed_fingerprints()["N-0001"][0] == "active"
+            # 模拟 _annotate_formation 的原地回写：正文/标题/status 全不变，只换 kind
+            store.save_note(OLD_BODY, note_id="N-0001", title=TITLE, kind="user")
+            # 陈旧态证据：索引里仍是 kind=knowledge，按 user 过滤一条也召不回
+            assert _fts_hits(index, OLD_PHRASE, kind="user") == []
+            assert [m.note_id for m in _fts_hits(index, OLD_PHRASE, kind="knowledge")] == ["N-0001"]
+            rebuilt, reason = ensure_index_fresh(store, index)
+            assert rebuilt is True
+            assert "索引字段变化" in reason and "N-0001" in reason
+            # rebuild 之后 kind 过滤才与 store 一致
+            assert [m.note_id for m in _fts_hits(index, OLD_PHRASE, kind="user")] == ["N-0001"]
+            assert _fts_hits(index, OLD_PHRASE, kind="knowledge") == []
+
+    def test_volatility_only_change_is_detected(self, store: WikiStore) -> None:
+        """只改 volatility/observed_at（参与检索打分的字段）→ 同样判落后。"""
+        store.save_note(
+            OLD_BODY, note_id="N-0001", title=TITLE, volatility="stable",
+            observed_at="2026-01-01T00:00:00+00:00",
+        )
+        with make_index(store) as index:
+            index.rebuild(store)
+            store.save_note(
+                OLD_BODY, note_id="N-0001", title=TITLE, volatility="volatile",
+                observed_at="2026-01-01T00:00:00+00:00",
+            )
+            rebuilt, reason = ensure_index_fresh(store, index)
+            assert rebuilt is True
+            assert "索引字段变化" in reason and "N-0001" in reason
 
     def test_legacy_index_without_body_hash_is_migrated_and_rebuilt(
         self, store: WikiStore
@@ -108,16 +186,14 @@ class TestBodyHashColumn:
         with make_index(store) as index:
             columns = {row[1] for row in index._conn.execute("PRAGMA table_info(note_meta)")}
             assert "body_hash" in columns  # 探测缺列 → ALTER 已补上
-            # 存量行不回填：归一成空串（"不知道是哪版正文"）
+            # 存量行不回填：归一成空串（"不知道是哪版检索视图"）
             assert index.indexed_fingerprints()["N-0001"] == ("active", "")
             assert index.indexed_status() == {"N-0001": "active"}
             rebuilt, reason = ensure_index_fresh(store, index)
             assert rebuilt is True
-            assert "旧索引缺正文指纹" in reason
+            assert "旧索引缺指纹" in reason
             # rebuild 之后指纹回填，再检查即新鲜
-            assert index.indexed_fingerprints()["N-0001"][1] == note_body_hash(
-                note.title, note.body
-            )
+            assert index.indexed_fingerprints()["N-0001"][1] == note_index_hash(note)
             again, reason2 = ensure_index_fresh(store, index)
             assert again is False and "无需 rebuild" in reason2
 
@@ -131,7 +207,7 @@ class TestBodyHashColumn:
             assert _fts_hits(index, NEW_PHRASE) == []
 
 
-# ---- 需求 2：同 id 原地改写正文的检出与 rebuild --------------------------------
+# ---- 需求 2：同 id 原地改写（正文 / 元数据）的检出与 rebuild ------------------
 
 
 class TestBodyRewriteDetection:
@@ -147,7 +223,7 @@ class TestBodyRewriteDetection:
             assert [m.note_id for m in _fts_hits(index, NEW_PHRASE)] == []  # 陈旧态证据
             rebuilt, reason = ensure_index_fresh(store, index)
             assert rebuilt is True
-            assert "正文变化" in reason and "N-0001" in reason
+            assert "索引字段变化" in reason and "N-0001" in reason
             # rebuild 之后：新正文可召回（snippet 就是新文本），旧正文不再可召回
             new_hits = _fts_hits(index, NEW_PHRASE)
             assert [m.note_id for m in new_hits] == ["N-0001"]
@@ -181,7 +257,7 @@ class TestBodyRewriteDetection:
             assert [m.note_id for m in _fts_hits(index, OLD_PHRASE)] == [note_id]
             rebuilt, reason = ensure_index_fresh(store, index)
             assert rebuilt is True
-            assert "正文变化" in reason and note_id in reason
+            assert "索引字段变化" in reason and note_id in reason
             assert [m.note_id for m in _fts_hits(index, NEW_PHRASE)] == [note_id]
             assert _fts_hits(index, OLD_PHRASE) == []
 

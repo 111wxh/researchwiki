@@ -227,8 +227,11 @@ def lint_wiki(
     index 可选：传入检索索引时顺带做一次"索引是否落后于 md"的粗检查
     （best-effort，读不到索引内部表就跳过，不影响其它指标）。
     now / freshness_settings 可选：时效统计的时钟与参数（缺省 = 真实时钟 +
-    freshness 默认参数，config 的 ``[freshness]`` 段由调用方经
-    ``freshness.from_config`` 传入；CLI 不读配置，保持既有行为）。
+    freshness 默认参数）。config 的 ``[freshness]`` 段由调用方经
+    ``freshness.from_config`` 传入：``researchwiki lint`` 会读运行配置文件
+    （``RESEARCHWIKI_CONFIG`` 或项目根 ``config.toml``，见 cli.load_config）并注入，
+    缺配置/坏配置回退默认参数（与不接线时逐值一致）；其它调用方（测试、上层服务）
+    可直接传 ``FreshnessSettings``，不读配置。
     时效统计只覆盖 active 笔记（与 notes_total 同口径：merged/superseded 已退役，
     不再参与"当前事实"判定）。
     """

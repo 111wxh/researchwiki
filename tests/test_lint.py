@@ -376,3 +376,25 @@ def test_cli_lint_reads_freshness_and_wiki_config(tmp_path: Path, capsys, monkey
     # ④ 配置文件损坏 → 按空配置处理（回退默认，不崩）
     config_path.write_text("[freshness\n坏掉的 toml", encoding="utf-8")
     assert _lint_json(root, capsys)["freshness"] == {"fresh": 1, "review_due": 0, "stale": 0}
+
+
+def test_cli_lint_tolerates_unreadable_config_path(tmp_path: Path, capsys, monkeypatch):
+    """配置路径不可读（这里用"是目录"复现 IsADirectoryError）→ 回退默认，不崩。
+
+    接线前 lint 从不读配置，故读配置的失败面必须全被吞掉：路径是目录 / 无读权限
+    都不能让 lint 整体失败（宽恕面见 cli.load_config，捕获整个 OSError）。
+    """
+    from researchwiki import cli
+
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    observed = (now - timedelta(days=1)).isoformat()
+    store.save_note("时效断言。", note_id="N-0001", volatility="volatile",
+                    observed_at=observed, created=observed)
+    as_dir = tmp_path / "config-dir"
+    as_dir.mkdir()
+    monkeypatch.setattr(cli, "CONFIG_PATH", as_dir)
+    assert cli.load_config() == {}
+    assert _lint_json(tmp_path / "wiki-data", capsys)["freshness"] == {
+        "fresh": 1, "review_due": 0, "stale": 0
+    }

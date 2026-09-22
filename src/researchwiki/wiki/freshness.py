@@ -34,11 +34,13 @@ valid_from / valid_until / kind）+ 一个"现在"的时刻，输出一个 ``Fre
    可解析、且晚于 ``reviewed_at``（或 ``reviewed_at`` 缺失/不可解析）→ 该记忆
    **至少 review_due**（本轮不判 fresh），理由写明
    ``来源内容已变化（source_changed_at=...）``；若第 3 条衰减本已判 stale 则
-   保持 stale（取更严重者，绝不因新证据把状态"修好"）。规则 1 / 2 的早退结论
-   （review_due / stale）本就不低于 review_due，故无需重复应用；反过来，
-   ``stable`` 的笔记也会被这条规则拉下 fresh —— 这是刻意的：来源内容换了，
-   确定性衰减算不出来的失真只有靠证据链指出来。时间戳不可解析时按"未声明"
-   处理并说明（与 valid_from / valid_until 同口径）。
+   保持 stale（取更严重者，绝不因新证据把状态"修好"）。这条地板在**每条返回路径**
+   上都执行：规则 1 / 2 的早退结论（review_due / stale）本就不低于 review_due，
+   地板在那里只追加一条"来源内容已变化 → 保持 review_due/stale"的**审计行、不改
+   状态**——状态虽对，但少这一行就等于把"为什么需要复核"的证据链从 reasons 里
+   抹掉了。反过来，``stable`` 的笔记会被这条规则拉下 fresh —— 这是刻意的：
+   来源内容换了，确定性衰减算不出来的失真只有靠证据链指出来。时间戳不可解析时
+   按"未声明"处理并说明（与 valid_from / valid_until 同口径）。
 
 与 ``index.py`` 的关系（口径约束）：``decay`` 与检索层的
 ``index.freshness_factor(...)`` **数值口径完全一致**——同一套
@@ -376,27 +378,33 @@ def evaluate_freshness(
             f"年龄 {age_days:.1f} 天 → decay {decay:.3f}"
         )
 
-    # 规则 2：显式失效 / 显式未生效，优先于 volatility 衰减与"缺基准"
+    # 规则 2：显式失效 / 显式未生效，优先于 volatility 衰减与"缺基准"。
+    # 这两条早退路径的结论（stale / review_due）本就不低于规则 5 的地板，故地板
+    # 在此只追加"来源内容已变化"的审计行、不改状态——不写这一行会让"为什么这条
+    # 记忆需要复核"的证据链在 reasons 里断掉（状态虽对，审计信息丢失）。
     if valid_until is not None and moment > valid_until:
         reasons.append(
             f"valid_until={valid_until.isoformat()} 已过期"
             f"（now {moment.isoformat()} > valid_until）→ stale"
             "（显式失效，不看 volatility 衰减）"
         )
-        return FreshnessState(note.id, FRESHNESS_STALE, age_days, half_life, decay, reasons)
+        state = _apply_source_change_floor(meta, FRESHNESS_STALE, moment, reasons)
+        return FreshnessState(note.id, state, age_days, half_life, decay, reasons)
     if valid_from is not None and moment < valid_from:
         reasons.append(
             f"valid_from={valid_from.isoformat()} 未到生效时间"
             f"（now {moment.isoformat()} < valid_from）→ review_due（未生效，不判 fresh）"
         )
-        return FreshnessState(note.id, FRESHNESS_REVIEW_DUE, age_days, half_life, decay, reasons)
+        state = _apply_source_change_floor(meta, FRESHNESS_REVIEW_DUE, moment, reasons)
+        return FreshnessState(note.id, state, age_days, half_life, decay, reasons)
 
     # 规则 1 的"未知年龄"：既不判 fresh 也不判 stale，交人工确认
     if base_ts is None:
         reasons.append(
             "缺少时间基准 → review_due（decay 按 1.000 计但不足以判 fresh，也不够判 stale）"
         )
-        return FreshnessState(note.id, FRESHNESS_REVIEW_DUE, age_days, half_life, decay, reasons)
+        state = _apply_source_change_floor(meta, FRESHNESS_REVIEW_DUE, moment, reasons)
+        return FreshnessState(note.id, state, age_days, half_life, decay, reasons)
 
     # 规则 3：volatility 衰减分类（阈值闭区间）
     if half_life is None:
@@ -428,8 +436,10 @@ def _apply_source_change_floor(
     """规则 5：``source_changed_at`` 晚于最近复核（或没复核过）→ 至少 review_due。
 
     返回**降级后**的 state（floor 只升不降：stale 保持 stale，review_due 保持
-    review_due，只有 fresh 会被拉到 review_due）。不修改笔记、不写盘；理由就地
-    追加到 ``reasons``。时间戳不可解析时按"未声明"处理并说明。
+    review_due，只有 fresh 会被拉到 review_due）。调用点在每条返回路径上
+    （规则 1 / 2 的早退路径也一样），在那里不改变状态、只把审计行写进 reasons。
+    不修改笔记、不写盘；理由就地追加到 ``reasons``。时间戳不可解析时按"未声明"
+    处理并说明。
     """
     raw = meta.source_changed_at
     changed_at = _parse_ts(raw)

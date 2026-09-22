@@ -10,7 +10,7 @@
   的测试会断言它），提醒下游 Prior 不能直接当答案、其 URL 不得混入本轮
   SourcePool。
 - ``ensure_index_fresh``：run 开始前检查索引是否落后于 store（笔记集合、status
-  或**正文指纹**任一不一致即视为落后），落后则整体 ``index.rebuild(store)``。
+  或**索引指纹**任一不一致即视为落后），落后则整体 ``index.rebuild(store)``。
   MVP 只做"检测落后 → 整体 rebuild"，等收益实验跑通后再优化增量同步。
 
 注入内容每条带：note_id、title、置信度、volatility、observed_at（缺省用
@@ -25,7 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from researchwiki.wiki.index import SearchIndex, SearchMatch, note_body_hash
+from researchwiki.wiki.index import SearchIndex, SearchMatch, note_index_hash
 from researchwiki.wiki.store import Note, WikiStore
 
 # 标签行原文（PLAN §4.2 一字不差；后续任务在测试里断言它）
@@ -344,36 +344,40 @@ def ensure_index_fresh(store: WikiStore, index: SearchIndex) -> tuple[bool, str]
     1. **id 集合差异**：store 全量笔记（active/merged/superseded）里有索引没有的
        （新增）或有索引里多出的（已删除）；
     2. **status 变化**：同 id 的 meta.status 与索引记录不同；
-    3. **正文指纹变化**：同 id 的 ``note_body_hash(title, body)`` 与索引里的
-       ``body_hash`` 不同——这一维专治"同 id 原地改写正文"（``memory_update``
-       与 formation merge 引入了两个新入口），只比 status 会静默保留旧正文，
-       检索命中摘要与向量都停留在旧版本；
+    3. **索引指纹变化**：同 id 的 ``note_index_hash(note)`` 与索引里的 ``body_hash``
+       不同。指纹覆盖 ``index_note`` 写入索引且参与检索/过滤的**全部字段**
+       （title/body/confidence/volatility/kind/redirect_to/superseded_by/
+       observed_at/created），因此这一维既治"同 id 原地改写正文"（``memory_update``
+       与 formation merge 两个新入口），也治**只改元数据**的原地改写——
+       ``loop._annotate_formation`` 正在原地回写 kind/importance，其 docstring
+       自己写明"若 formation 未来赋非 knowledge kind，必须触发索引同步，否则
+       kind 过滤会失真"；只比 status 或只比正文都兜不住这条路径。
        **旧库迁移留下的空指纹**（迁移时 ALTER 补列、未回填）同样算落后：
-       宁可重建一次，也不接受"不知道索引里是哪版正文"。
+       宁可重建一次，也不接受"不知道索引里是哪版检索视图"。
 
     落后即 ``index.rebuild(store)`` 并返回 ``(True, 原因)``；原因里点名具体
-    note_id（正文变化 / status 变化 / 新增 / 索引多余 / 缺指纹），便于审计；
+    note_id（索引字段变化 / status 变化 / 新增 / 索引多余 / 缺指纹），便于审计；
     新鲜返回 ``(False, 原因)``，不做任何写入。策略仍是"检测到落后 → 整体
     rebuild"（增量同步留给后续优化），且本函数只读 store + 只写索引，不动 md。
     """
     notes = store.list_notes(status=None)
     store_status = {n.id: n.status for n in notes}
-    store_hash = {n.id: note_body_hash(n.title, n.body) for n in notes}
+    store_hash = {n.id: note_index_hash(n) for n in notes}
     indexed = index.indexed_fingerprints()
     index_status = {note_id: status for note_id, (status, _) in indexed.items()}
     if store_status == index_status and all(
         indexed[note_id][1] == store_hash[note_id] for note_id in store_status
     ):
         return False, (
-            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与正文指纹均相同），"
+            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与索引指纹均相同），"
             "无需 rebuild"
         )
     missing = sorted(set(store_status) - set(index_status))
     extra = sorted(set(index_status) - set(store_status))
     common = set(store_status) & set(index_status)
     changed = sorted(n for n in common if store_status[n] != index_status[n])
-    # 缺指纹：迁移后未回填的行（body_hash 为空串）；它不能进"正文变化"口径，
-    # 否则会把"不知道是哪版"说成"正文变了"，误导审计。
+    # 缺指纹：迁移后未回填的行（body_hash 为空串）；它不能进"字段变化"口径，
+    # 否则会把"不知道是哪版"说成"字段变了"，误导审计。
     legacy = sorted(n for n in common if not indexed[n][1])
     rehashed = sorted(
         n for n in common if indexed[n][1] and indexed[n][1] != store_hash[n]
@@ -382,12 +386,12 @@ def ensure_index_fresh(store: WikiStore, index: SearchIndex) -> tuple[bool, str]
     if missing:
         parts.append(f"新增: {', '.join(missing)}")
     if rehashed:
-        parts.append(f"正文变化: {', '.join(rehashed)}")
+        parts.append(f"索引字段变化: {', '.join(rehashed)}")
     if changed:
         detail = "、".join(f"{nid}:{index_status[nid]}→{store_status[nid]}" for nid in changed)
         parts.append(f"status 变化 {len(changed)} 条（{detail}）")
     if legacy:
-        parts.append(f"旧索引缺正文指纹（{len(legacy)} 条：{', '.join(legacy)}）")
+        parts.append(f"旧索引缺指纹（{len(legacy)} 条：{', '.join(legacy)}）")
     if extra:
         parts.append(f"索引多余: {', '.join(extra)}")
     count = index.rebuild(store)

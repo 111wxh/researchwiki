@@ -547,6 +547,53 @@ def test_explicit_expiry_still_beats_source_change() -> None:
     )
     assert state.state == fr.FRESHNESS_STALE
     assert any("已过期" in r for r in state.reasons)
+    # 早退路径也要写"来源内容已变化"的审计行（状态不变、证据链不断）
+    assert any(
+        f"来源内容已变化（source_changed_at={changed}）" in r and "保持 stale" in r
+        for r in state.reasons
+    )
+
+
+def test_source_changed_reason_recorded_on_valid_from_path() -> None:
+    """valid_from 未生效（review_due 早退）：补审计行、状态不变。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    future = (NOW + timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=0.0, valid_from=future,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+    assert any("未到生效时间" in r for r in state.reasons)
+    assert any(
+        f"来源内容已变化（source_changed_at={changed}）" in r and "保持 review_due" in r
+        for r in state.reasons
+    )
+
+
+def test_source_changed_reason_recorded_on_missing_base_path() -> None:
+    """缺时间基准（review_due 早退）：补审计行、状态不变。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(
+            volatility="stable",
+            age_days=None,
+            created="",
+            source_changed_at=changed,
+        ),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+    assert any("缺少时间基准" in r for r in state.reasons)
+    assert any(
+        f"来源内容已变化（source_changed_at={changed}）" in r and "保持 review_due" in r
+        for r in state.reasons
+    )
+    # 早退路径同样不给"未声明"以外的措辞：无 source_changed_at 时不追加任何行
+    plain = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=None, created=""), now=NOW
+    )
+    assert not any("来源内容已变化" in r for r in plain.reasons)
 
 
 def test_source_changed_drives_queue_membership() -> None:
