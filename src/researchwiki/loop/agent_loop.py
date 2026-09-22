@@ -12,7 +12,9 @@ state 约定：每次 run 落盘 wiki-data/runs/{时间戳}-{trace_id}/：
 - research-plan.md：规划阶段产出的研究计划；
 - state.md：滚动状态（阶段、步骤、token 消耗、来源数、关键发现），每阶段原子重写；
 - report.md：最终报告（供阶段 3 Distiller 消费）；
-- run-metrics.json：本次 run 的复用/成本/质量指标（PLAN §4.4，与 tokens.jsonl 可复算对账）。
+- run-metrics.json：本次 run 的复用/成本/质量指标（PLAN §4.4，与 tokens.jsonl 可复算对账）；
+- memory-update.json：本 run 的记忆更新报告（RQ2 闭环）：每条命中 Prior 的判定、
+  执行动作与理由、五桶计数（复核/替代/合并/冲突/跳过）。
 
 Prior 注入（PLAN §4.2）：run 开始前对问题检索历史 Wiki 的 active notes（索引
 落后先 rebuild），以"仅供核验"标签块注入 plan 步骤的 user 消息；Prior 的 URL
@@ -23,6 +25,15 @@ Formation 判定（PLAN v2 RQ1：什么时候应该记住）：蒸馏候选入�
 不足 / 与既有记忆近乎重复的候选拒绝入库并计数，其余按权重表赋 importance、把
 判定理由写进笔记 extra。显式传入 [formation] 段才启用（server 通路），
 ``enabled = false`` 是逃生阀；未配置时照旧入库、零行为变化。
+
+记忆更新（PLAN v2 §3.3 / RQ2：新证据 vs 旧记忆）：run 收尾（report 写盘后、
+run-metrics 落盘前）把本轮蒸馏入库的候选当**新证据**，与 plan 阶段命中的 Prior
+逐条比较（wiki/verification.compare_batch，零模型调用、全确定性），按判定执行
+动作（loop/memory_update.py）——一致 → 刷新 reviewed_at；更新 → supersede（带
+来源）；更具体 → 并入正文与来源；冲突 → 开冲突台账；uncertain → 不做动作。
+显式传入 ``[memory_update]`` 段才启用（server 通路），``enabled = false`` 是
+逃生阀、``dry_run = true`` 是影子模式；未配置（None）时整个阶段不执行，state.md
+与 run 目录逐字段与接入前一致。
 """
 
 from __future__ import annotations
@@ -61,6 +72,7 @@ if TYPE_CHECKING:
     # 仅类型标注用：wiki 层在方法内延迟导入（见 AgentLoop._build_wiki_layer）——
     # wiki.store → loop.notes → loop/__init__ → loop.agent_loop 的包初始化顺序会让
     # 模块级「loop 导入 wiki」形成循环导入。
+    from researchwiki.loop.memory_update import MemoryUpdateReport
     from researchwiki.wiki.distiller import CandidateNote
     from researchwiki.wiki.embeddings import EmbeddingProvider
     from researchwiki.wiki.formation import FormationDecision
@@ -508,6 +520,8 @@ class AgentLoop:
         wiki_config: Mapping[str, Any] | None = None,
         prior_config: Mapping[str, Any] | None = None,
         formation_config: Mapping[str, Any] | None = None,
+        memory_update_config: Mapping[str, Any] | None = None,
+        verification_config: Mapping[str, Any] | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -549,6 +563,8 @@ class AgentLoop:
             wiki_config=wiki_config,
             prior_config=prior_config,
             formation_config=formation_config,
+            memory_update_config=memory_update_config,
+            verification_config=verification_config,
         )
         self.build_pages = build_pages
         # 滚动状态（state.md 的数据源）
@@ -563,6 +579,9 @@ class AgentLoop:
         self.forced_reason = ""
         # 子 agent 带回的候选笔记，蒸馏阶段与主循环抽取结果一并入库
         self.pending_candidates: list[CandidateNote] = []
+        # 本轮**真正入库**的候选（过完 formation）：记忆更新阶段把它们当"新证据"
+        # （被拒绝的候选不构成新记忆，见 events() 蒸馏阶段）
+        self.ingested_candidates: list[CandidateNote] = []
         # Prior 检索结果（events() 开头填充；None = 未启用或尚未检索）与入库动作计数
         self.prior_context: PriorContext | None = None
         self.notes_created = 0
@@ -570,6 +589,9 @@ class AgentLoop:
         self.notes_superseded = 0
         # formation 判定计数（RQ1）：候选 = 拒绝 + 入库（逃生阀关闭时拒绝恒 0）
         self.formation_stats = {"candidates": 0, "persisted": 0, "rejected": 0}
+        # 记忆更新（RQ2 闭环）的报告：阶段未启用时恒 None（state.md 与 run 目录
+        # 都不会出现相关内容——未配置 = 逐字段零行为变化）
+        self.memory_update_report: MemoryUpdateReport | None = None
 
     # ---- 基础设施 ----------------------------------------------------------
 
@@ -580,12 +602,15 @@ class AgentLoop:
         wiki_config: Mapping[str, Any] | None,
         prior_config: Mapping[str, Any] | None,
         formation_config: Mapping[str, Any] | None,
+        memory_update_config: Mapping[str, Any] | None,
+        verification_config: Mapping[str, Any] | None,
     ) -> None:
         """装配 wiki 层：WikiStore / EntityRegistry / Ingestor / Distiller / Prior 索引。
 
         方法内延迟导入的原因见文件头 TYPE_CHECKING 注释：wiki.store 反向依赖
         loop.notes，模块级导入会在「先 import wiki 包」的顺序下形成循环导入。
         """
+        from researchwiki.loop.memory_update import memory_update_settings
         from researchwiki.wiki.distiller import Distiller
         from researchwiki.wiki.entities import EntityRegistry
         from researchwiki.wiki.formation import FormationSettings, from_config
@@ -593,6 +618,7 @@ class AgentLoop:
         from researchwiki.wiki.ingest import Ingestor, dedup_settings
         from researchwiki.wiki.prior import prior_settings
         from researchwiki.wiki.store import WikiStore
+        from researchwiki.wiki.verification import VerificationSettings
 
         # 去重阈值：config [wiki] 段（dedup_similarity / dedup_entity_overlap）可覆盖
         self.dedup = dedup_settings(wiki_config)
@@ -645,6 +671,18 @@ class AgentLoop:
             self.formation_settings = FormationSettings(enabled=False)
         else:
             self.formation_settings = from_config(formation_config)
+        # 记忆更新（RQ2 闭环）：与 formation 同模式的保守默认——None = 未配置
+        # （脚本 / 既有测试等老调用方）时**整个阶段不执行**（不比较、不写盘、state.md
+        # 与 run 目录都不出现相关内容），逐字段零行为变化。server 始终传
+        # config.get("memory_update")；段内 enabled=false 是逃生阀、dry_run=true
+        # 是影子模式（判定照跑、零写盘）。
+        self.memory_update_settings = (
+            None if memory_update_config is None else memory_update_settings(memory_update_config)
+        )
+        # 判定阈值（[verification] 段）：None = 全默认（与 P2-C 模块默认同值）。
+        # judge 在本阶段**不注入**——run 收尾是确定性路径，零模型调用（judge 留给
+        # 评测/交互式路径按需注入，见 wiki/verification.py 的 judge 约束）。
+        self.verification_settings = VerificationSettings.from_config(verification_config)
 
     def _retrieve_priors(self) -> None:
         """run 开始前的 Prior 检索（PLAN §4.2）：索引新鲜检查（落后即 rebuild）→ 检索。
@@ -832,6 +870,8 @@ class AgentLoop:
             f"- 记忆形成：候选 {self.formation_stats['candidates']}，"
             f"入库 {self.formation_stats['persisted']}，拒绝 {self.formation_stats['rejected']}",
         ]
+        if self.memory_update_report is not None:
+            lines.append(self._memory_update_state_line(self.memory_update_report))
         if self.forced_reason:
             lines.append(f"- 熔断：{self.forced_reason}")
         lines += ["", "## 关键发现", "", (digest[:400] or "（暂无）"), ""]
@@ -1024,6 +1064,9 @@ class AgentLoop:
             note_seq += 1
             self.notes_written += 1
             self.formation_stats["persisted"] += 1
+            # 真正入库的候选 = 本轮"新记忆"：记忆更新阶段把它们当新证据与命中
+            # Prior 比较（被 formation 拒绝的候选不构成新记忆，不进证据集）
+            self.ingested_candidates.append(candidate)
             if decision is not None:
                 # importance/kind 写进 frontmatter，判定理由写进 extra（辅助产物，
                 # 失败不推翻入库）
@@ -1104,8 +1147,131 @@ class AgentLoop:
             }
 
         atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
+
+        # ---- 阶段 5：记忆更新（RQ2 闭环：本轮新证据 vs 命中的 Prior）----
+        # 位置刻意放这里：report 已写盘（哪怕本阶段出问题，run 的产物已完整），
+        # 且在 _write_run_metrics（events() 的 try/finally）之前——state.md 的
+        # 记忆更新行因此能带真实计数，而 run-metrics 的 14 字段契约不被触碰。
+        self._apply_memory_updates_guarded()
         self._write_state("done")
         yield {"type": "finish"}
+
+    # ---- 记忆更新（RQ2 闭环：新证据 vs 旧记忆）-----------------------------
+
+    def _apply_memory_updates_guarded(self) -> None:
+        """记忆更新阶段的守卫入口（同 run-metrics 的守卫约定）。
+
+        本阶段是收尾期的辅助产物：报告已写盘，任何失败（判定/写盘/序列化）都
+        只记 stderr——既不压过流中的原异常，也不让一次记忆更新故障把已经完整的
+        run 打断在 finish 之前。阶段内部对每条比较还有一层逐条降级（写失败 →
+        skipped 动作），这里是最后一道防线。
+        """
+        try:
+            self._apply_memory_updates()
+        except Exception as exc:  # noqa: BLE001 -- 辅助产物失败不能推翻本次 run
+            print(
+                f"[agent-loop] 记忆更新阶段失败（run 产物不受影响）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _apply_memory_updates(self) -> None:
+        """把本轮新证据与命中的 Prior 逐条比较，按判定执行动作并落盘报告。
+
+        - 新证据 = ``self.ingested_candidates``（过完 formation 真正入库的候选，
+          经 ``evidence_from_run`` 转成 EvidenceItem，来源取候选实际引用的 URL/hash）；
+        - 旧记忆 = ``self.prior_context.hits``（plan 阶段命中的 active Prior，用
+          store 重新读出 Note——注入块里的正文可能被预算截断，比较必须用全文）；
+        - 逐 Prior 调 ``compare_batch``（**judge 不注入**：收尾路径零模型调用、
+          全确定性），汇成 comparisons 交 ``apply_comparisons`` 执行。
+        - 未配置 [memory_update] 段（None）时整阶段不动（连报告文件都不写）。
+        """
+        settings = self.memory_update_settings
+        if settings is None:
+            return
+        from researchwiki.loop.memory_update import (
+            COUNT_KEYS,
+            MemoryUpdateReport,
+            apply_comparisons,
+            evidence_from_run,
+        )
+
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        report = MemoryUpdateReport(
+            counts={key: 0 for key in COUNT_KEYS}, dry_run=settings.dry_run
+        )
+        if settings.enabled:
+            from researchwiki.wiki.verification import compare_batch
+
+            evidence = evidence_from_run(
+                self.ingested_candidates, source_refs=self.ctx.source_refs(), now=now
+            )
+            comparisons = []
+            for note_id in self._prior_hit_note_ids():
+                prior = self.wiki_store.get_note(note_id)
+                if prior is None or prior.meta.status != "active":
+                    continue
+                comparisons.extend(
+                    compare_batch(prior, evidence, settings=self.verification_settings)
+                )
+            report = apply_comparisons(
+                self.wiki_store,
+                comparisons,
+                evidence=evidence,
+                now=now,
+                dry_run=settings.dry_run,
+                trace_id=self.trace_id,
+            )
+        self.memory_update_report = report
+        self._write_memory_update_file(report, now)
+
+    def _prior_hit_note_ids(self) -> list[str]:
+        """命中 Prior 的最终 active note_id（保序、去重；未检索到则空列表）。"""
+        if self.prior_context is None:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for hit in self.prior_context.hits:
+            if hit.note_id and hit.note_id not in seen:
+                seen.add(hit.note_id)
+                out.append(hit.note_id)
+        return out
+
+    def _memory_update_state_line(self, report: MemoryUpdateReport) -> str:
+        """state.md 的记忆更新行（阶段未启用时这一行根本不出现）。
+
+        形态三选一：正常（五桶计数）/ 逃生阀（enabled=false 写明已禁用）/
+        影子模式（dry_run 追加"未落盘"）——后两种都避免"复核 0"被读成
+        "跑了但没有动作"。
+        """
+        settings = self.memory_update_settings
+        if settings is not None and not settings.enabled:
+            return "- 记忆更新：已禁用（[memory_update].enabled=false）"
+        if report.dry_run:
+            return report.state_line() + "（dry-run，未落盘）"
+        return report.state_line()
+
+    def _write_memory_update_file(self, report: MemoryUpdateReport, now: str) -> None:
+        """落盘 run_dir/memory-update.json（**不动 run-metrics 的 14 字段契约**）。
+
+        内容：判定与动作全量清单（每条含 verdict / 建议动作 / 实际动作 / 幂等键 /
+        理由）+ 五桶计数 + 命中 Prior 与证据计数，供评测复算"这一轮到底改了什么"。
+        """
+        payload = {
+            "trace_id": self.trace_id,
+            "now": now,
+            "enabled": bool(self.memory_update_settings and self.memory_update_settings.enabled),
+            "dry_run": report.dry_run,
+            "prior_hit_count": len(self.prior_context.hits) if self.prior_context else 0,
+            "prior_note_ids": self._prior_hit_note_ids(),
+            "evidence_count": len(self.ingested_candidates),
+            "counts": report.to_dict()["counts"],
+            "actions": report.to_dict()["actions"],
+        }
+        atomic_write_text(
+            self.run_dir / "memory-update.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
 
     # ---- 辅助 ----------------------------------------------------------
 

@@ -96,3 +96,30 @@ require_source_for_knowledge = true
 min_importance_to_persist = 0.3
 # 与既有 active 记忆的最大相似度达到该值视为近乎重复，拒绝入库
 near_duplicate_similarity = 0.95
+
+[verification]
+# 旧记忆 vs 新证据的结构化比较阈值（P2-C，wiki/verification.py）：研究 run 收尾的
+# "记忆更新"阶段用它判定命中 Prior 该怎么处置。半衰期/新鲜度不在本段（那在
+# [freshness] 与 [wiki].half_life_days）。缺省段 = 模块默认值（同下）。
+# similarity_floor：相似度地板，低于它直接判 uncertain（不做任何比较，也不调用
+#   语义判官——地板存在的意义就是不让无关证据消耗比较器）；
+# consistent_similarity：断言重述的相似度阈值，达到且槽位级取值逐一对得上才判
+#   consistent（只刷新 reviewed_at）；被夹到不低于 similarity_floor。
+similarity_floor = 0.3
+consistent_similarity = 0.8
+# similarity_dim：比较用的确定性 bigram 特征哈希向量维度（与 [embedding] 无关，
+#   判定必须零网络、可复算）
+similarity_dim = 128
+# context_chars：冲突槽位的上下文锚点长度（越大越容易落进不同槽位、越不容易判冲突）
+context_chars = 6
+
+[memory_update]
+# 记忆更新（RQ2 闭环，P2-E）：run 收尾时把本轮蒸馏入库的候选当新证据，与 plan 阶段
+# 命中的 Prior 逐条比较（[verification] 阈值），按判定执行动作——
+# 一致 → 刷新 reviewed_at；更新 → supersede（带来源）；更具体 → 并入正文与来源；
+# 冲突 → 开冲突台账；uncertain → 不做动作。结果写 state.md 一行与
+# run_dir/memory-update.json（不改 run-metrics 契约）。
+# enabled = false 是逃生阀：阶段照常留痕（state.md 写明已禁用）、零写盘动作；
+# dry_run = true 是影子模式：判定与分派照跑，但不落任何笔记/台账（先观察再放行）。
+enabled = true
+dry_run = false

@@ -143,6 +143,10 @@ def chat(req: ChatRequest) -> StreamingResponse:
         wiki_config=wiki_cfg,
         prior_config=config.get("prior"),
         formation_config=config.get("formation"),  # [formation] 段（None = 不做入库判定）
+        # [memory_update] 段（None = 整阶段不执行，state.md / run 目录零变化）；
+        # [verification] 段是它的判定阈值（None = 模块默认值）
+        memory_update_config=config.get("memory_update"),
+        verification_config=config.get("verification"),
         embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
         ).events()
     else:
