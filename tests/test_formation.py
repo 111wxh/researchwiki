@@ -10,6 +10,7 @@
   enabled=false / 未传配置两条照旧入库路径（行为与既有基线逐字段一致）。
 """
 
+import dataclasses
 import json
 import math
 from pathlib import Path
@@ -573,3 +574,80 @@ def test_loop_merged_candidates_annotate_canonical_note_last_write_wins(
     assert "来源有" in canonical.meta.extra["formation_reason"]
     assert "具体要素无" in canonical.meta.extra["formation_reason"]
     assert canonical.meta.extra["merged_from"] == ["N-0002", "N-0003"]
+
+
+# ---- formation 注写的字段透传纪律（P2-F 修复轮 I-2）----------------------------
+
+
+def test_annotate_formation_preserves_every_other_field(tmp_path: Path) -> None:
+    """``_annotate_formation`` 只改 kind / importance / extra，其余逐字段保留。
+
+    这是修复轮 I-2 的"第三个漏传点"：本方法紧跟 ``Ingestor.add`` 之后跑，
+    action=merged 时入参就是刚被 ``_merge`` 重写过的规范笔记——旧写法逐参数透传
+    ``save_note``，两处漏传会连着把 tombstone / kind / importance 清两次。
+    夹具用一条**全字段非默认**的 meta（含墓碑标记），任何字段被静默重置都会被抓。
+    """
+    from researchwiki.wiki.formation import FormationDecision, FormationSignals
+    from researchwiki.wiki.frontmatter import NoteMeta, SourceRef
+
+    loop = make_loop(tmp_path, run_turns(), formation_config={"enabled": True})
+    store = loop.wiki_store
+    meta = NoteMeta(
+        id="N-0001",
+        title="全字段笔记",
+        entities=["GLM-5.3"],
+        confidence="low",
+        status="active",
+        volatility="volatile",
+        kind="experience",
+        importance=0.9,
+        tombstone=True,
+        observed_at="2026-05-01T00:00:00+00:00",
+        reviewed_at="2026-05-02T00:00:00+00:00",
+        valid_from="2026-05-01T00:00:00+00:00",
+        valid_until="2026-06-01T00:00:00+00:00",
+        source_changed_at="2026-05-03T00:00:00+00:00",
+        created="2026-04-30T00:00:00+00:00",
+        trace_id="run-7",
+        sources=[SourceRef(url="https://a", content_hash="a" * 64)],
+        extra={"keep": "me"},
+    )
+    note = store.save_meta(meta, "既有正文。")
+    decision = FormationDecision(
+        persist=True,
+        kind="knowledge",
+        importance=0.42,
+        confidence="high",
+        reason="夹具判定",
+        signals=FormationSignals(
+            body_chars=len(note.body),
+            entity_count=1,
+            has_source=True,
+            has_specifics=True,
+            similarity_max=None,
+        ),
+    )
+
+    loop._annotate_formation(note, decision)  # noqa: SLF001 -- 修复点本身就是私有方法
+
+    annotated = store.get_note("N-0001")
+    assert annotated is not None
+    # 点名的三处变更
+    assert annotated.meta.kind == "knowledge"
+    assert annotated.meta.importance == 0.42
+    assert annotated.meta.extra["formation_reason"] == "夹具判定"
+    assert annotated.meta.extra["formation_confidence"] == "high"
+    # 逐字段与"只改这三处"的期望值相同（含 tombstone：漏传会让墓碑复活）
+    expected = meta.replace(
+        kind="knowledge",
+        importance=0.42,
+        extra={
+            "keep": "me",
+            "formation_reason": "夹具判定",
+            "formation_confidence": "high",
+        },
+    )
+    for field in dataclasses.fields(NoteMeta):
+        assert getattr(annotated.meta, field.name) == getattr(expected, field.name), field.name
+    assert annotated.meta.tombstone is True
+    assert annotated.body == "既有正文。"  # 正文不动

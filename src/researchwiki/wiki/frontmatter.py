@@ -15,6 +15,7 @@ kind / importance / tombstone。
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -144,6 +145,27 @@ class NoteMeta:
                 out[f.name] = value
         out.update(self.extra)
         return out
+
+    def replace(self, **changes: Any) -> NoteMeta:
+        """返回一份"只改了指定字段"的新 meta（其余字段逐字段原样保留）。
+
+        存在的理由（P2-F 修复轮 I-2）：``WikiStore.save_note`` 的参数默认值会
+        **静默丢字段**——任何"以既有 meta 重建笔记"的路径只要漏传一个参数，
+        该字段就被悄悄重置（kind / importance / tombstone 都栽过：ingest merge
+        把墓碑变回可召回的正常笔记、formation 标注再清一次）。把重建点改成
+        ``meta.replace(...) + store.save_meta(...)`` 之后，"漏传"在语法上就不
+        存在了：没点名的字段必然保留。
+
+        实现是 ``dataclasses.replace`` 语义（浅拷贝 + 覆盖点名字段），但
+        **列表/字典字段各拷一份**（entities / sources 元素与 extra 的值仍共享），
+        避免调用方在原地改新 meta 的列表时把旧 meta 一起改了；未知字段名抛
+        ``TypeError``（与 dataclasses.replace 一致，早失败好过静默忽略）。
+        """
+        copied = dataclasses.replace(self, **changes)
+        copied.entities = list(copied.entities)
+        copied.sources = list(copied.sources)
+        copied.extra = dict(copied.extra)
+        return copied
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> NoteMeta:

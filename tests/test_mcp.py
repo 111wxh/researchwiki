@@ -666,12 +666,18 @@ class TestSearch:
     def test_search_rebuilds_index_after_external_write(
         self, service: WikiService, store: WikiStore
     ) -> None:
-        """别的进程/loop 直接写 md（绕过 MCP），检索也应看到——按需自动重建索引。"""
+        """别的进程/loop 直接写 md（绕过 MCP），检索也应看到——按需自动重建索引。
+
+        触发的是共享判据 ``index.index_drift`` 的 **id 集合维度**（索引里没有
+        N-0001），不再是 v1 那条"md 比 index.db 新"的 mtime 口径（P2-F 裁定二已
+        删除该弱代理判据：同秒改写与只改元数据的原地改写它都看不出来）。
+        """
         store.save_note("外部进程写入的事实：向量检索用 sqlite-vec。", note_id="N-0001",
                         title="向量检索")
         payload = service.search("sqlite-vec 向量检索")
         assert payload["ok"] is True
         assert payload["index_rebuilt"] >= 1
+        assert "新增" in payload["index_stale_reason"]
         assert [r["note_id"] for r in payload["results"]] == ["N-0001"]
 
     def test_search_empty_query_rejected(self, service: WikiService) -> None:
@@ -1604,6 +1610,56 @@ class TestMemoryTools:
             assert payload["ok"] is False
             assert payload["error"]["code"] == "invalid_argument"
 
+    def test_update_memory_preserves_tombstone_marker(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """修复轮 b：修订（update_memory）不把墓碑变回普通记忆，语义字段也不丢。"""
+        _write_note(service, "传闻：某模型下周发布。", title="某模型发布传闻")
+        tombstone_id = str(service.invalidate_memory("N-0001", "官方辟谣")["tombstone_id"])
+        before = service.read(tombstone_id)["note"]
+
+        updated = service.update_memory(tombstone_id, "补充：辟谣公告已归档。", "补充归档信息")
+        assert updated["ok"] is True
+
+        after = service.read(tombstone_id)["note"]
+        assert after["tombstone"] is True  # 标记没被 save_note 默认值清掉
+        assert after["kind"] == before["kind"]  # kind/importance/created 逐字段保留
+        assert after["importance"] == before["importance"]
+        assert after["created"] == before["created"]
+        raw, _ = parse((wiki_root / "notes" / f"{tombstone_id}.md").read_text(encoding="utf-8"))
+        assert raw["tombstone"] is True
+        assert raw["update_reasons"]  # 本次修订留痕照常
+        # 被失效的旧笔记的留痕也不受影响（两处写入互不干扰）
+        old_raw, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        assert old_raw["invalidate_reason"] == "官方辟谣"
+        # 检索口径不变：墓碑仍在缺省结果之外
+        assert service.search("辟谣公告")["count"] == 0
+
+    def test_mark_superseded_preserves_tombstone_marker(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """修复轮 b：把墓碑本身退役（invalidate / supersede）时标记不能丢。"""
+        _write_note(service, "传闻：某模型下周发布。", title="某模型发布传闻")
+        first = str(service.invalidate_memory("N-0001", "官方辟谣")["tombstone_id"])
+
+        # ① 对墓碑再跑一次 invalidate（墓碑是 active）：旧墓碑退役，标记保留
+        again = service.invalidate_memory(first, "墓碑本身也要留痕")
+        assert again["ok"] is True
+        retired, _ = parse((wiki_root / "notes" / f"{first}.md").read_text(encoding="utf-8"))
+        assert retired["status"] == "superseded"
+        assert retired["tombstone"] is True
+
+        # ② 对墓碑跑 supersede：同样保留
+        second = str(again["tombstone_id"])
+        payload = service.supersede_memory(second, "替代结论：发布推迟。", "结论更新")
+        assert payload["ok"] is True
+        superseded, _ = parse((wiki_root / "notes" / f"{second}.md").read_text(encoding="utf-8"))
+        assert superseded["status"] == "superseded"
+        assert superseded["tombstone"] is True
+        # 新版本是普通笔记（替代内容不是失效裁定），链可达
+        assert service.read(second)["note"]["note_id"] == payload["new_note_id"]
+        assert service.read(payload["new_note_id"])["note"]["tombstone"] is False
+
     def test_invalidate_requires_reason(self, service: WikiService) -> None:
         _write_note(service, "正文", title="标题")
         payload = service.invalidate_memory("N-0001", "  ")
@@ -1959,6 +2015,26 @@ class TestHealth:
         assert index["stale"] is True
         assert "索引字段变化" in index["stale_reason"]
         assert "N-0001" in index["stale_reason"]
+
+    def test_health_tolerates_unreadable_index(self, service: WikiService, wiki_root: Path) -> None:
+        """修复轮 a：index.db 存在但打不开（坏文件）→ 保守判 stale，不抛异常。
+
+        走的是 health 的异常兜底分支：索引打不开就没法比对指纹，退回"有笔记就算
+        需重建"的保守结论，并给出 ``error``（不冒充"新鲜"，也不让自检整体失败）。
+        """
+        _write_note(service, "正文", title="标题")
+        assert service.health()["index"]["exists"] is True
+
+        (wiki_root / "index.db").write_bytes(b"definitely not a sqlite database")
+
+        payload = service.health()
+        assert payload["ok"] is True
+        index = payload["index"]
+        assert index["exists"] is True
+        assert index["stale"] is True  # 保守：无法比对 → 按需重建
+        assert index["error"]
+        assert "stale_reason" not in index  # 没比对过就不编原因
+        assert "tokenizer" not in index
 
 
 class TestHealthIndexDriftContract:

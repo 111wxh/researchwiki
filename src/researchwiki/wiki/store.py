@@ -189,9 +189,11 @@ class WikiStore:
 
         ``tombstone`` 是墓碑标记（P2-F 裁定一）：True 表示这条笔记是"已失效记忆"
         的审计记录（``memory_invalidate`` 生成），检索与 Prior 注入默认排除它。
-        与 kind / importance 同属"save_note 参数默认值会静默丢字段"的字段——
-        任何以既有 meta 重建笔记的调用方（update / supersede / mark_source_changed）
-        都必须**逐字段透传** ``tombstone=meta.tombstone``，否则标记会被静默清掉。
+
+        **重建既有笔记别用本方法**：这里的参数默认值会静默丢字段（kind /
+        importance / tombstone 都栽过）。要"只改几个字段、其余保留"，用
+        ``meta.replace(改动的字段=...)`` 拿到新 meta 再交给 ``save_meta``——
+        本方法只适合**新建**（字段由调用方全新给出）。
         """
         meta = NoteMeta(
             id=note_id or self.next_note_id(),
@@ -221,6 +223,21 @@ class WikiStore:
         path = self.notes_dir / f"{meta.id}.md"
         atomic_write_text(path, dump(meta.to_dict(), body))
         return Note(id=meta.id, title=meta.title, body=body, meta=meta, path=path)
+
+    def save_meta(self, meta: NoteMeta, body: str) -> Note:
+        """以**给定的完整 meta** 覆写一条笔记（不做字段补默认、不做归一）。
+
+        **重建既有笔记时的推荐入口**（P2-F 修复轮 I-2）：调用方先用
+        ``meta.replace(改动的字段=...)`` 得到新 meta（未点名的字段逐字段保留），
+        再交给本方法落盘——这样"漏传字段"在语法上就不存在了。``save_note`` 的
+        参数默认值会静默丢字段，是 ingest merge / formation 标注 / source_changed
+        标记把 kind / importance / tombstone 悄悄清掉的共同根因。
+
+        ``meta.id`` 决定落盘文件名（不存在即新建）；元数据按 ``NoteMeta.to_dict``
+        序列化，未知字段仍在 ``extra`` 里 round-trip 不丢。事实校验（title 非空、
+        枚举白名单等）是**调用方**的职责：本方法不猜调用方意图。
+        """
+        return self._write_note(meta, body)
 
     def get_note(self, note_id: str) -> Note | None:
         """按 id 读笔记（兼容 loop 层轻量 frontmatter）；不存在返回 None。"""
@@ -394,31 +411,10 @@ class WikiStore:
                 slots = {str(k): str(v) for k, v in recorded.items()}
             slots[url] = new_content_hash
             extra[SOURCE_CHANGED_HASH_KEY] = slots
-            self.save_note(
-                body=note.body,
-                note_id=note.id,
-                title=meta.title,
-                entities=list(meta.entities),
-                confidence=meta.confidence,
-                status=meta.status,
-                redirect_to=meta.redirect_to,
-                superseded_by=meta.superseded_by,
-                volatility=meta.volatility,
-                kind=meta.kind,
-                importance=meta.importance,
-                # 墓碑标记逐字段透传：本方法只改 source_changed_at / extra，
-                # 不参与墓碑生成，但重建 meta 时漏传会把标记静默清掉。
-                tombstone=meta.tombstone,
-                observed_at=meta.observed_at,
-                reviewed_at=meta.reviewed_at,
-                valid_from=meta.valid_from,
-                valid_until=meta.valid_until,
-                source_changed_at=stamp,
-                trace_id=meta.trace_id,
-                sources=list(meta.sources),
-                extra=extra,
-                created=meta.created,
-            )
+            # 只改两个字段，其余逐字段保留（replace + save_meta，见 NoteMeta.replace：
+            # 旧写法逐参数透传 save_note，漏传一个就静默丢一个字段——本方法曾漏过
+            # tombstone / kind / importance 这一组"记忆语义"字段）。
+            self.save_meta(meta.replace(source_changed_at=stamp, extra=extra), note.body)
             affected.append(note.id)
         return sorted(affected)
 

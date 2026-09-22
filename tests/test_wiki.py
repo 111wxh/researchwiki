@@ -6,6 +6,7 @@ tokenizer 都要过）、向量检索 mock 相似度断言、RRF 合并、置信
 clock）、嵌入缓存命中、工厂无 key 回退 mock。
 """
 
+import dataclasses
 import hashlib
 import json
 import sqlite3
@@ -182,6 +183,54 @@ class TestFrontmatter:
         restored = NoteMeta.from_dict(parse(dump(meta.to_dict(), body))[0])
         assert restored.kind == "knowledge" and restored.importance is None
         assert restored.confidence == "high" and restored.created == meta.created
+
+    def test_replace_keeps_every_other_field(self):
+        """``replace`` 只改点名字段，其余**逐字段**保留（P2-F 修复轮 I-2 的纪律锁）。
+
+        这条断言是"重建 meta 漏传字段"这类缺陷的护栏：任何新增字段如果没被
+        replace 语义覆盖（例如被实现成手写字段清单），这里会立刻红。
+        """
+        meta = NoteMeta(
+            id="N-0001",
+            title="全字段笔记",
+            entities=["GLM-5.3"],
+            confidence="low",
+            status="active",
+            volatility="volatile",
+            kind="experience",
+            importance=0.9,
+            tombstone=True,
+            observed_at="2026-05-01T00:00:00+00:00",
+            reviewed_at="2026-05-02T00:00:00+00:00",
+            valid_from="2026-05-01T00:00:00+00:00",
+            valid_until="2026-06-01T00:00:00+00:00",
+            source_changed_at="2026-05-03T00:00:00+00:00",
+            created="2026-04-30T00:00:00+00:00",
+            trace_id="run-7",
+            sources=[SourceRef(url="https://a", content_hash="a" * 64)],
+            extra={"keep": "me"},
+        )
+        changed = meta.replace(kind="knowledge", importance=0.25)
+
+        # 点名的两处变了
+        assert changed.kind == "knowledge" and changed.importance == 0.25
+        # 其余逐字段不变（用 dataclasses.fields 枚举，新字段自动纳入比对）
+        for f in dataclasses.fields(NoteMeta):
+            if f.name in ("kind", "importance"):
+                continue
+            assert getattr(changed, f.name) == getattr(meta, f.name), f.name
+        # 等价表述：replace 后除点名字段外与"只改这两处"完全一致
+        assert meta.replace() == meta
+        assert meta.replace(kind="knowledge", importance=0.25) == changed
+        # 列表/字典字段是副本：改新 meta 不影响旧 meta
+        changed.entities.append("新增实体")
+        changed.sources.append(SourceRef(url="https://b", content_hash=""))
+        changed.extra["added"] = 1
+        assert meta.entities == ["GLM-5.3"] and len(meta.sources) == 1
+        assert meta.extra == {"keep": "me"}
+        # 未知字段名早失败（与 dataclasses.replace 同语义：不静默忽略）
+        with pytest.raises(TypeError):
+            meta.replace(not_a_field=1)
 
 
 # ---- entities ---------------------------------------------------------
@@ -448,6 +497,49 @@ class TestStore:
         assert store.mark_source_changed(other, "z" * 64, now="2026-06-03T00:00:00+00:00") == [
             "N-0003"
         ]
+
+    def test_mark_source_changed_preserves_tombstone_and_semantic_fields(
+        self, store: WikiStore
+    ):
+        """P2-F 修复轮 b：标记来源变化只改两处，墓碑标记 / kind / importance 不丢。
+
+        该方法一度逐参数透传 ``save_note``：漏传一个参数就把该字段静默重置
+        （``tombstone`` 变 False 会让墓碑复活成可召回的正常笔记）。现在是
+        ``meta.replace`` + ``save_meta``，本用例把透传纪律锁死。
+        """
+        url = "https://example.com/x"
+        meta = NoteMeta(
+            id="N-0001",
+            title="墓碑笔记",
+            entities=["GLM-5.3"],
+            confidence="high",
+            volatility="drifting",
+            kind="experience",
+            importance=0.7,
+            tombstone=True,
+            observed_at="2026-05-01T00:00:00+00:00",
+            reviewed_at="2026-05-02T00:00:00+00:00",
+            valid_from="2026-05-01T00:00:00+00:00",
+            valid_until="2026-06-01T00:00:00+00:00",
+            created="2026-04-30T00:00:00+00:00",
+            trace_id="run-7",
+            sources=[SourceRef(url=url, content_hash="a" * 64)],
+            extra={"keep": "me"},
+        )
+        store.save_meta(meta, "墓碑正文。")
+
+        assert store.mark_source_changed(url, "b" * 64, now="2026-06-01T00:00:00+00:00") == [
+            "N-0001"
+        ]
+        marked = store.get_note("N-0001")
+        assert marked is not None
+        assert marked.tombstone is True
+        # 逐字段：只有 source_changed_at 与 extra 的记账槽变化
+        assert marked.meta == meta.replace(
+            source_changed_at="2026-06-01T00:00:00+00:00",
+            extra={"keep": "me", "source_changed_hash": {url: "b" * 64}},
+        )
+        assert marked.body == "墓碑正文。"
 
     def test_mark_source_changed_same_hash_is_noop(self, store: WikiStore):
         """同一次变化重复检测 = no-op：不推后时间戳（否则已复核笔记被永久钉在 review_due）。"""

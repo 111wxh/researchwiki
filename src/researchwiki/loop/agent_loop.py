@@ -758,6 +758,13 @@ class AgentLoop:
         原地覆写（note_id 传回，created 保留），其余元数据字段透传不变；
         属辅助产物：失败只记 stderr，不推翻已完成的入库。
 
+        透传走 ``meta.replace(...) + store.save_meta(...)``：**只点名 kind /
+        importance / extra**，其余（title/status/created/observed_at/reviewed_at/
+        redirect_to/superseded_by/sources/valid_*/tombstone/trace_id）逐字段保留。
+        旧写法逐参数透传 ``save_note``，是"重建 meta 漏传字段"的第三个漏传点
+        （P2-F 修复轮 I-2）——本方法紧跟 ``Ingestor.add`` 之后跑，action=merged
+        时入参就是刚被 `_merge` 重写过的规范笔记，两处漏传会连着把标记清两次。
+
         注意：此处落盘后不重建 SearchIndex——当前 decision.kind 恒为 "knowledge"
         （formation MVP 的固定语义，见 formation.py docstring），与入库建索引时的
         kind 一致，索引无漂移；若 formation 未来赋非 knowledge kind，此处必须
@@ -768,24 +775,9 @@ class AgentLoop:
             extra: dict[str, Any] = dict(meta.extra)
             extra["formation_reason"] = decision.reason
             extra["formation_confidence"] = decision.confidence
-            self.wiki_store.save_note(
+            self.wiki_store.save_meta(
+                meta.replace(kind=decision.kind, importance=decision.importance, extra=extra),
                 note.body,
-                note_id=note.id,
-                title=note.title,
-                entities=list(note.entities),
-                confidence=meta.confidence,
-                status=meta.status,
-                redirect_to=meta.redirect_to,
-                superseded_by=meta.superseded_by,
-                volatility=meta.volatility,
-                kind=decision.kind,
-                importance=decision.importance,
-                observed_at=meta.observed_at,
-                reviewed_at=meta.reviewed_at,
-                trace_id=meta.trace_id,
-                sources=list(meta.sources),
-                extra=extra,
-                created=meta.created,
             )
         except Exception as exc:  # noqa: BLE001 -- 标注失败不能推翻入库
             print(

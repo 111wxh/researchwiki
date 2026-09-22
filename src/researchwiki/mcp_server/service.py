@@ -849,26 +849,15 @@ class WikiService:
             meta = note.meta
             merged_sources, sources_added = _merge_sources(meta.sources, provided)
             try:
-                updated = self.store.save_note(
-                    body=content,
-                    note_id=note.id,
-                    title=meta.title,
-                    entities=list(meta.entities),
-                    confidence=meta.confidence,
-                    status=meta.status,
-                    redirect_to=meta.redirect_to,
-                    superseded_by=meta.superseded_by,
-                    volatility=meta.volatility,
-                    kind=meta.kind,
-                    importance=meta.importance,
-                    # 墓碑标记透传（修订不该顺手把墓碑变回普通记忆）
-                    tombstone=meta.tombstone,
-                    observed_at=meta.observed_at,
-                    reviewed_at=now,
-                    trace_id=meta.trace_id,
-                    sources=merged_sources,
-                    extra=_append_update_reason(meta.extra, reason_text, now),
-                    created=meta.created,
+                # 只点名真正要改的字段（reviewed_at / sources / extra），其余逐字段
+                # 保留——replace + save_meta 让"漏传字段"在语法上不存在（修复轮 I-2）
+                updated = self.store.save_meta(
+                    meta.replace(
+                        reviewed_at=now,
+                        sources=merged_sources,
+                        extra=_append_update_reason(meta.extra, reason_text, now),
+                    ),
+                    content,
                 )
             except (OSError, ValueError) as exc:
                 raise WikiToolError(
@@ -1250,36 +1239,26 @@ class WikiService:
     ) -> Note:
         """把 active 笔记标记为 superseded 并链到目标（墓碑或新笔记）。
 
-        本方法直接以 note.id 作为 save_note 的写路径分量，写前再复核一次 id
-        形态（入口处的 _require_active 已查过，这里是纵深防御）。
+        本方法直接以 note.id 作为 save_meta 的写路径分量（meta.id 决定文件名），
+        写前再复核一次 id 形态（入口处的 _require_active 已查过，这里是纵深防御）。
+        只改 status / superseded_by / reviewed_at / extra，其余字段（含 tombstone：
+        把墓碑本身标 superseded 时标记不能丢）逐字段保留。
         """
         _assert_note_id_writable(note)
         meta = note.meta
         try:
-            marked = self.store.save_note(
-                body=note.body,
-                note_id=note.id,
-                title=meta.title,
-                entities=list(meta.entities),
-                confidence=meta.confidence,
-                status="superseded",
-                redirect_to=meta.redirect_to,
-                superseded_by=superseded_by,
-                volatility=meta.volatility,
-                kind=meta.kind,
-                importance=meta.importance,
-                # 墓碑标记透传（把墓碑本身标 superseded 的场景：标记不能丢）
-                tombstone=meta.tombstone,
-                observed_at=meta.observed_at,
-                reviewed_at=now,
-                trace_id=meta.trace_id,
-                sources=list(meta.sources),
-                extra={
-                    **meta.extra,
-                    f"{prefix}_reason": reason,
-                    f"{prefix}_reason_at": now,
-                },
-                created=meta.created,
+            marked = self.store.save_meta(
+                meta.replace(
+                    status="superseded",
+                    superseded_by=superseded_by,
+                    reviewed_at=now,
+                    extra={
+                        **meta.extra,
+                        f"{prefix}_reason": reason,
+                        f"{prefix}_reason_at": now,
+                    },
+                ),
+                note.body,
             )
         except (OSError, ValueError) as exc:
             raise WikiToolError(
