@@ -66,6 +66,20 @@ enabled = true
 top_k = 5
 max_chars = 4000
 
+[freshness]
+# 时间感知的记忆有效性判定（P2 / RQ2）：`researchwiki lint` 用它对 active 笔记
+# 算 fresh / review_due / stale 三态分布与待复核队列（只统计提示，不影响退出码）。
+# 半衰期不在本段：沿用上面的 [wiki].half_life_days（检索打分与时效判定同口径），
+# 需要单独覆盖时可以在这里再写一次 half_life_days = { volatile = 30, drifting = 90 }。
+# decay 降到 review_due_ratio 即判"该复核"，降到 stale_ratio 即判"该废止"（闭区间）。
+review_due_ratio = 0.5
+stale_ratio = 0.25
+
+# 可选：按记忆载体类型覆盖上面的参数（kind = knowledge / user / experience）。
+# 示例（默认注释掉，不改变默认行为）：用户画像变化慢，放宽复核阈值。
+# [freshness.user]
+# review_due_ratio = 0.7
+
 [formation]
 # 记忆形成（RQ1：什么时候应该记住）：run 内蒸馏候选入库前过确定性判定——
 # 正文过短 / knowledge 无来源 / importance 低于阈值 / 与既有 active 记忆相似度

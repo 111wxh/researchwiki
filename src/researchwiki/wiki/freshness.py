@@ -5,7 +5,8 @@
 valid_from / valid_until / kind）+ 一个"现在"的时刻，输出一个 ``FreshnessState``
 （state + age_days + half_life_days + decay + 引用具体数值的 reasons）。
 
-三层语义（逐条可测；判定按 1 → 2 → 3 → 4 的顺序短路，命中即定状态）：
+三层语义（逐条可测；判定按 1 → 2 → 3 → 4 的顺序短路，命中即定状态；规则 5 是
+作用在结论上的"降级地板"，在第 3 步之后应用，只升不降严重度）：
 
 1. **时间基准**：``observed_at`` → ``created``（前者缺失或不可解析才回退，与
    ``index.freshness_factor`` 同口径）。两者都拿不到 → "未知年龄"：``age_days``
@@ -29,6 +30,15 @@ valid_from / valid_until / kind）+ 一个"现在"的时刻，输出一个 ``Fre
    ``review_due_ratio`` / ``stale_ratio`` / ``half_life_days``）；**缺省为空 dict，
    默认行为等价于不区分 kind**（PLAN §3.3：user 记忆与 knowledge 记忆的时效参数
    "可能需要区分"，具体取值留给后续实现与评测校准，现在不写死）。
+5. **来源内容变化降级（floor，不提升严重度）**：``source_changed_at`` 存在、
+   可解析、且晚于 ``reviewed_at``（或 ``reviewed_at`` 缺失/不可解析）→ 该记忆
+   **至少 review_due**（本轮不判 fresh），理由写明
+   ``来源内容已变化（source_changed_at=...）``；若第 3 条衰减本已判 stale 则
+   保持 stale（取更严重者，绝不因新证据把状态"修好"）。规则 1 / 2 的早退结论
+   （review_due / stale）本就不低于 review_due，故无需重复应用；反过来，
+   ``stable`` 的笔记也会被这条规则拉下 fresh —— 这是刻意的：来源内容换了，
+   确定性衰减算不出来的失真只有靠证据链指出来。时间戳不可解析时按"未声明"
+   处理并说明（与 valid_from / valid_until 同口径）。
 
 与 ``index.py`` 的关系（口径约束）：``decay`` 与检索层的
 ``index.freshness_factor(...)`` **数值口径完全一致**——同一套
@@ -310,7 +320,7 @@ def evaluate_freshness(
     now: datetime | None = None,
     settings: FreshnessSettings | None = None,
 ) -> FreshnessState:
-    """对一条笔记做确定性时效判定（规则 1–4 见模块 docstring，按序短路）。
+    """对一条笔记做确定性时效判定（规则 1–5 见模块 docstring，按序短路）。
 
     ``now`` 缺省 ``datetime.now(UTC)``（测试传固定时钟即可完全复现）；
     ``settings`` 缺省全默认（= 不区分 kind，与 PLAN §3.3"先不写死"一致）。
@@ -408,7 +418,46 @@ def evaluate_freshness(
             f"decay {decay:.3f} > review_due_ratio {cfg.review_due_ratio:.2f} → fresh"
         )
         state = FRESHNESS_FRESH
+    state = _apply_source_change_floor(meta, state, moment, reasons)
     return FreshnessState(note.id, state, age_days, half_life, decay, reasons)
+
+
+def _apply_source_change_floor(
+    meta: Any, state: str, moment: datetime, reasons: list[str]
+) -> str:
+    """规则 5：``source_changed_at`` 晚于最近复核（或没复核过）→ 至少 review_due。
+
+    返回**降级后**的 state（floor 只升不降：stale 保持 stale，review_due 保持
+    review_due，只有 fresh 会被拉到 review_due）。不修改笔记、不写盘；理由就地
+    追加到 ``reasons``。时间戳不可解析时按"未声明"处理并说明。
+    """
+    raw = meta.source_changed_at
+    changed_at = _parse_ts(raw)
+    if raw and changed_at is None:
+        reasons.append(f"source_changed_at={raw} 不是合法 ISO 时间，按未声明处理（不参与判定）")
+        return state
+    if changed_at is None:
+        return state
+    reviewed_at = _parse_ts(meta.reviewed_at)
+    if reviewed_at is not None and changed_at <= reviewed_at:
+        reasons.append(
+            f"来源内容已变化（source_changed_at={changed_at.isoformat()}）"
+            f"，但不晚于最近复核 reviewed_at={reviewed_at.isoformat()} → 不降级"
+        )
+        return state
+    reason = f"来源内容已变化（source_changed_at={changed_at.isoformat()}）"
+    if reviewed_at is None:
+        reason += "，无复核记录"
+    else:
+        reason += f"，晚于最近复核 reviewed_at={reviewed_at.isoformat()}"
+    if state == FRESHNESS_FRESH:
+        reasons.append(f"{reason} → review_due（新证据待复核，本轮不判 fresh）")
+        return FRESHNESS_REVIEW_DUE
+    if state == FRESHNESS_REVIEW_DUE:
+        reasons.append(f"{reason} → 保持 review_due（本就待复核；now {moment.isoformat()}）")
+    else:
+        reasons.append(f"{reason} → 保持 stale（取更严重者，新证据不提升有效性）")
+    return state
 
 
 def freshness_queue(

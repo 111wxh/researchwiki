@@ -5,6 +5,24 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tomllib
+from pathlib import Path
+
+# 运行配置路径：与 server.main.CONFIG_PATH 同一约定（env 覆盖，缺省项目根 config.toml）
+CONFIG_PATH = Path(os.environ.get("RESEARCHWIKI_CONFIG", "config.toml"))
+
+
+def load_config() -> dict:
+    """读取运行配置；文件缺失/损坏时按空配置处理（调用方按缺省值接线）。
+
+    与 ``server.main.load_config`` 同语义（lint 命令只需 tomllib，不值得为它
+    拉起 FastAPI 那一整串导入，故此处独立实现，不 import server 模块）。
+    """
+    try:
+        with CONFIG_PATH.open("rb") as f:
+            return tomllib.load(f)
+    except (FileNotFoundError, tomllib.TOMLDecodeError):
+        return {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,11 +87,15 @@ def main(argv: list[str] | None = None) -> int:
         # 延迟导入：lint 之外的命令不需要拉起 wiki 子系统
         import json
 
+        from researchwiki.wiki.freshness import from_config as freshness_from_config
         from researchwiki.wiki.lint import lint_wiki
         from researchwiki.wiki.store import WikiStore
 
         store = WikiStore(args.root)
-        report = lint_wiki(store)
+        # 时效参数接线：freshness.from_config 读 [freshness] 段，半衰期回退 [wiki]
+        # 段（与检索层 index.wiki_settings 同一张表）。config.toml 缺失/无该段
+        # 时得到全默认参数，时效统计行为与接线前逐值一致。
+        report = lint_wiki(store, freshness_settings=freshness_from_config(load_config()))
         if args.json:
             print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
         else:

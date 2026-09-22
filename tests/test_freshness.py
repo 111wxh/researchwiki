@@ -7,8 +7,9 @@
 - 规则 2 显式 expiration 优先（valid_until 过期 / valid_from 未生效 / 非 ISO 宽容）
 - 规则 3 volatility 衰减（时点-状态对照表：0 / 半衰期 / 2 个半衰期）
 - 规则 4 kind 差异接口（默认不区分；per_kind 覆盖；[freshness.user] 段）
-- 规则 5 decay 与 index.freshness_factor 数值口径一致（独立实现 + 防漂移断言）
-- 规则 6 时钟可注入、全确定性
+- 规则 5 来源内容变化降级（source_changed_at 晚于复核 → 至少 review_due，只升不降）
+- 规则 6 decay 与 index.freshness_factor 数值口径一致（独立实现 + 防漂移断言）
+- 规则 7 时钟可注入、全确定性
 
 全部零网络、零模型调用；固定时钟 NOW，断言精确到数值。
 """
@@ -19,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from researchwiki.wiki import freshness as fr
-from researchwiki.wiki.frontmatter import NoteMeta, dump, parse
+from researchwiki.wiki.frontmatter import NoteMeta, SourceRef, dump, parse
 from researchwiki.wiki.index import DEFAULT_HALF_LIFE_DAYS as INDEX_HALF_LIFE_DAYS
 from researchwiki.wiki.index import freshness_factor, wiki_settings
 from researchwiki.wiki.store import Note, WikiStore
@@ -437,7 +438,131 @@ def test_from_config_reads_kind_sections() -> None:
     assert (user.review_due_ratio, user.stale_ratio) == (0.9, 0.3)
 
 
-# ---- 规则 5：与 index.freshness_factor 的口径一致性 ---------------------------
+# ---- 规则 5：来源内容变化降级（floor：只升不降严重度） ------------------------
+
+
+def test_source_changed_after_review_floors_to_review_due() -> None:
+    """stable 笔记本应 fresh；来源内容在复核之后变化 → 至少 review_due。"""
+    reviewed = (NOW - timedelta(days=10)).isoformat()
+    changed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=0.0, reviewed_at=reviewed,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+    assert any(
+        f"来源内容已变化（source_changed_at={changed}）" in r
+        and "晚于最近复核" in r
+        and "不判 fresh" in r
+        for r in state.reasons
+    )
+    # decay 本身仍是 1.0（新证据不影响确定性衰减的计算，只影响结论）
+    assert state.decay == 1.0
+
+
+def test_source_changed_without_review_record_floors_to_review_due() -> None:
+    """没有 reviewed_at（从未复核）时同样降级，理由写明"无复核记录"。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="drifting", age_days=1.0, reviewed_at=None,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+    assert any("无复核记录" in r and "→ review_due" in r for r in state.reasons)
+
+
+def test_source_changed_keeps_stale_when_decay_already_stale() -> None:
+    """衰减本已判 stale 时保持 stale（取更严重者，新证据不提升有效性）。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=60.0, source_changed_at=changed), now=NOW
+    )
+    assert state.state == fr.FRESHNESS_STALE
+    assert any("→ 保持 stale（取更严重者" in r for r in state.reasons)
+
+
+def test_source_changed_does_not_keep_review_due_fresh() -> None:
+    """衰减判 review_due 时也保持 review_due（floor 不把状态修好也不加码）。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=30.0, source_changed_at=changed), now=NOW
+    )
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+    assert any("保持 review_due" in r for r in state.reasons)
+
+
+def test_source_changed_before_review_is_noop() -> None:
+    """变化时间不晚于最近复核（已复核过这次变化）→ 不降级。"""
+    changed = (NOW - timedelta(days=10)).isoformat()
+    reviewed = (NOW - timedelta(days=1)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=0.0, reviewed_at=reviewed,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_FRESH
+    assert any("不晚于最近复核" in r and "不降级" in r for r in state.reasons)
+    # 恰好等于复核时刻（同刻复核过）同样不降级
+    same = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=0.0, reviewed_at=changed,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert same.state == fr.FRESHNESS_FRESH
+
+
+def test_source_changed_unparseable_is_treated_as_undeclared() -> None:
+    """非 ISO 的 source_changed_at 不参与判定，且不抛异常（与 valid_* 同口径）。"""
+    state = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=1.0, source_changed_at="刚刚"), now=NOW
+    )
+    assert state.state == fr.FRESHNESS_FRESH
+    assert any(
+        "source_changed_at=刚刚 不是合法 ISO 时间，按未声明处理" in r for r in state.reasons
+    )
+
+
+def test_source_changed_absent_changes_nothing() -> None:
+    """未声明 source_changed_at：与不接线前一模一样（默认行为不变）。"""
+    with_field = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=30.0, source_changed_at=None), now=NOW
+    )
+    without_field = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=30.0), now=NOW
+    )
+    assert with_field == without_field
+    assert not any("source_changed_at" in r for r in with_field.reasons)
+
+
+def test_explicit_expiry_still_beats_source_change() -> None:
+    """规则 2 早退优先级不变：valid_until 过期仍 stale（不因来源变化措辞改变）。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    expired = (NOW - timedelta(days=2)).isoformat()
+    state = fr.evaluate_freshness(
+        make_note(volatility="stable", age_days=0.0, valid_until=expired,
+                  source_changed_at=changed),
+        now=NOW,
+    )
+    assert state.state == fr.FRESHNESS_STALE
+    assert any("已过期" in r for r in state.reasons)
+
+
+def test_source_changed_drives_queue_membership() -> None:
+    """待复核队列：来源变化的 stable 笔记会被列进队列（原本 fresh 不入队）。"""
+    changed = (NOW - timedelta(days=1)).isoformat()
+    notes = [
+        make_note(note_id="N-0001", volatility="stable", age_days=0.0,
+                  source_changed_at=changed),
+        make_note(note_id="N-0002", volatility="stable", age_days=0.0),
+    ]
+    queue = fr.freshness_queue(notes, now=NOW)
+    assert [s.note_id for s in queue] == ["N-0001"]
+    assert queue[0].state == fr.FRESHNESS_REVIEW_DUE
+
+
+# ---- 规则 6：与 index.freshness_factor 的口径一致性 ---------------------------
 
 
 def _factor(note: Note) -> float:
@@ -498,7 +623,7 @@ def test_freshness_module_does_not_import_index() -> None:
     assert not any("index" in line for line in imports)
 
 
-# ---- 规则 6：时钟注入与确定性 -------------------------------------------------
+# ---- 规则 7：时钟注入与确定性 -------------------------------------------------
 
 
 def test_clock_injection_is_required_for_determinism() -> None:
@@ -758,3 +883,66 @@ def test_store_save_and_get_validity_fields(tmp_path) -> None:
     state = fr.evaluate_freshness(reloaded, now=NOW)
     assert state.age_days == pytest.approx(30.0)
     assert state.state == fr.FRESHNESS_REVIEW_DUE
+
+
+def test_source_changed_at_round_trip() -> None:
+    """source_changed_at 进 frontmatter：round-trip 一致，None 时省略。"""
+    meta = NoteMeta(id="N-0001", source_changed_at="2026-05-01T00:00:00+00:00")
+    meta_dict, _ = parse(dump(meta.to_dict(), "正文"))
+    assert meta_dict["source_changed_at"] == "2026-05-01T00:00:00+00:00"
+    restored = NoteMeta.from_dict(meta_dict)
+    assert restored.source_changed_at == meta.source_changed_at
+    assert restored == meta
+
+    plain = NoteMeta(id="N-0001")
+    assert "source_changed_at" not in plain.to_dict()
+    assert NoteMeta.from_dict({"id": "N-0001"}).source_changed_at is None
+    # 宽容解析：数字 / YAML 时间戳都不抛异常（与 valid_* 同口径）
+    numeric = NoteMeta.from_dict({"id": "N-0001", "source_changed_at": 20260501})
+    assert numeric.source_changed_at == "20260501"
+    stamped, _ = parse("---\nid: N-0001\nsource_changed_at: 2026-05-01 08:30:00\n---\n正文\n")
+    assert NoteMeta.from_dict(stamped).source_changed_at.startswith("2026-05-01T08:30:00")
+
+
+def test_store_mark_source_changed_drives_freshness(tmp_path) -> None:
+    """端到端：来源内容变化的标记 → freshness 降级 → 复核后恢复 fresh（闭环）。"""
+    store = WikiStore(tmp_path / "wiki-data")
+    url = "https://example.com/x"
+    long_ago = (NOW - timedelta(days=30)).isoformat()
+    note = store.save_note(
+        "来源变化前的断言。",
+        title="观测记录",
+        volatility="stable",
+        observed_at=long_ago,
+        created=long_ago,
+        reviewed_at=long_ago,
+        sources=[SourceRef(url=url, content_hash="a" * 64)],
+    )
+    fresh_before = fr.evaluate_freshness(store.get_note(note.id), now=NOW)
+    assert fresh_before.state == fr.FRESHNESS_FRESH
+
+    marked = store.mark_source_changed(url, "b" * 64, now=NOW.isoformat())
+    assert marked == [note.id]
+    reloaded = store.get_note(note.id)
+    assert reloaded is not None
+    downgraded = fr.evaluate_freshness(reloaded, now=NOW)
+    assert downgraded.state == fr.FRESHNESS_REVIEW_DUE
+    assert any("来源内容已变化" in r for r in downgraded.reasons)
+    assert [s.note_id for s in fr.freshness_queue([reloaded], now=NOW)] == [note.id]
+
+    # 复核（reviewed_at 晚于 source_changed_at）后恢复 fresh：复核就是"已看过新证据"，
+    # 若复核结论认为旧断言仍成立，不需要改写来源哈希
+    reviewed = store.save_note(
+        reloaded.body,
+        note_id=reloaded.id,
+        title=reloaded.title,
+        volatility=reloaded.volatility,
+        observed_at=reloaded.meta.observed_at,
+        created=reloaded.meta.created,
+        reviewed_at=(NOW + timedelta(days=1)).isoformat(),
+        source_changed_at=reloaded.meta.source_changed_at,
+        sources=list(reloaded.meta.sources),
+    )
+    restored = fr.evaluate_freshness(reviewed, now=NOW)
+    assert restored.state == fr.FRESHNESS_FRESH
+    assert any("不晚于最近复核" in r for r in restored.reasons)

@@ -332,3 +332,47 @@ def test_cli_lint_json_includes_freshness_and_conflicts(tmp_path: Path, capsys):
 def test_cli_lint_missing_root_is_healthy(tmp_path: Path, capsys):
     assert main(["lint", "--root", str(tmp_path / "nope")]) == 0
     assert "笔记：0 条" in capsys.readouterr().out
+
+
+def _lint_json(root: Path, capsys) -> dict:
+    """跑一次 CLI lint --json 并解析输出（配置文件由调用方经 CONFIG_PATH 注入）。"""
+    assert main(["lint", "--root", str(root), "--json"]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_cli_lint_reads_freshness_and_wiki_config(tmp_path: Path, capsys, monkeypatch):
+    """lint 读 [freshness] + [wiki] 段注入时效参数；缺配置时行为与默认一致。
+
+    夹具取"年龄 1 天 + volatile"：默认参数下 decay≈0.977 判 fresh，收窄阈值后
+    判 stale——同一批笔记、只换配置，即可证明参数确实从 config.toml 接了进来。
+    """
+    from researchwiki import cli
+
+    store = make_store(tmp_path)
+    now = datetime.now(UTC)
+    observed = (now - timedelta(days=1)).isoformat()
+    store.save_note("时效断言。", note_id="N-0001", volatility="volatile",
+                    observed_at=observed, created=observed)
+    root = tmp_path / "wiki-data"
+
+    # ① 无配置文件（缺省路径不存在）→ 全默认参数，判定与接线前一致
+    monkeypatch.setattr(cli, "CONFIG_PATH", tmp_path / "no-such-config.toml")
+    assert _lint_json(root, capsys)["freshness"] == {"fresh": 1, "review_due": 0, "stale": 0}
+
+    # ② [freshness] 段（阈值收窄到 decay 也算过期）→ 同一笔记改判 stale
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[freshness]\nreview_due_ratio = 0.99\nstale_ratio = 0.98\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "CONFIG_PATH", config_path)
+    assert _lint_json(root, capsys)["freshness"] == {"fresh": 0, "review_due": 0, "stale": 1}
+
+    # ③ 只写 [wiki].half_life_days 时也生效（与检索层同一张表：半衰期回退读 [wiki]）
+    config_path.write_text(
+        '[wiki]\nhalf_life_days = { volatile = 0.01, drifting = 0.01 }\n', encoding="utf-8"
+    )
+    assert _lint_json(root, capsys)["freshness"] == {"fresh": 0, "review_due": 0, "stale": 1}
+
+    # ④ 配置文件损坏 → 按空配置处理（回退默认，不崩）
+    config_path.write_text("[freshness\n坏掉的 toml", encoding="utf-8")
+    assert _lint_json(root, capsys)["freshness"] == {"fresh": 1, "review_due": 0, "stale": 0}
