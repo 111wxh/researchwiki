@@ -163,17 +163,24 @@ class TestProtocolLayer:
             "new_content",
             "reason",
             "source_urls",
+            "confidence",  # 修复轮 1/5：新证据的置信度（不再硬编码 medium）
         }
+        assert supersede_schema["properties"]["confidence"]["default"] is None
         # source_urls 的元素形态在 schema 里可读：URL 字符串 或 {url, content_hash} 映射
         for schema in (update_schema, supersede_schema):
             assert schema["properties"]["source_urls"]["default"] is None
             items = schema["properties"]["source_urls"]["anyOf"][0]["items"]
             assert [option.get("type") for option in items["anyOf"]] == ["string", "object"]
-        # 描述必须交代 evidence 语义（调用方要知道自己有没有挂上来源）
+        # 描述必须交代 evidence / confidence 语义（调用方要知道自己有没有挂上来源、
+        # 拿到的置信度是什么，以及"升级"该走哪条通道）
         for name in ("memory_update", "memory_supersede"):
             description = tools[name].description or ""
             assert "source_urls" in description, name
             assert "evidence" in description, name
+        supersede_description = tools["memory_supersede"].description or ""
+        assert "confidence" in supersede_description
+        assert "memory_store" in supersede_description  # 说明"别用 store 代替"的可执行提醒
+        assert "空列表" in tools["memory_update"].description or "空列表" in supersede_description
 
     def test_write_read_search_roundtrip(self, server: FastMCP) -> None:
         written = _tool_call(
@@ -1132,6 +1139,7 @@ class TestMemoryTools:
         assert "https://old.example.com/v1" not in str(new_meta["sources"])
         # 新证据不继承旧证据的置信度：high → medium（缺省）
         assert new_meta["confidence"] == "medium"
+        assert payload["confidence"] == "medium"
         # 身份连续性字段照旧继承
         assert new_meta["entities"] == ["glm-5-3"]
         assert "200k" in new_body and "128k" not in new_body
@@ -1149,7 +1157,8 @@ class TestMemoryTools:
         assert read["note"]["sources"] == [
             {"url": "https://new.example.com/v2", "content_hash": ""}
         ]
-        assert "confidence 重置为 medium" in payload["message"]
+        assert "confidence=medium" in payload["message"]
+        assert "不继承旧证据的置信度" in payload["message"]
 
     def test_supersede_sources_accept_url_and_hash_mapping_mixed(
         self, service: WikiService, wiki_root: Path
@@ -1180,7 +1189,7 @@ class TestMemoryTools:
     def test_supersede_without_sources_keeps_p1a_behavior(
         self, service: WikiService, wiki_root: Path
     ) -> None:
-        """不带来源：逐字段维持 P1-A 行为 + 返回体多出 evidence='none' 标注。"""
+        """不带来源、不带 confidence：逐字段维持 P1-A 行为 + 返回体多出标注字段。"""
         _write_note(
             service,
             "GLM-5.3 支持 128k。",
@@ -1204,11 +1213,14 @@ class TestMemoryTools:
             "backup",
             "path",
             "evidence",
+            "confidence",
             "message",
             "warnings",
-        }, "相对 P1-A 只应多出 evidence"
+        }, "相对 P1-A 只应多出 evidence / confidence 两个标注字段"
         assert payload["superseded_by"] == "N-0002"
+        assert payload["confidence"] == "high"
         assert "evidence=none" in payload["message"]
+        assert "沿用旧值" in payload["message"]
         # 旧的"未提供 sources"告警保留（调用方仍被提醒证据链缺口）
         assert "未提供 sources" in payload["warnings"][0]
 
@@ -1219,6 +1231,103 @@ class TestMemoryTools:
         assert meta["importance"] == 0.7
         assert meta["entities"] == ["glm-5-3"]
         assert meta["sources"] == []  # 不继承旧来源（P1-A 行为）
+
+    # ---- 修复轮 1/5（Important）：supersede 的 confidence 参数 -----------------
+
+    def test_supersede_explicit_confidence_takes_effect(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """① 显式 confidence：'有来源 + 具体事实要素 → high' 在本通道可执行。"""
+        _write_note(
+            service,
+            "GLM-5.3 支持 128k 上下文。",
+            title="上下文长度",
+            confidence="low",
+            sources=["https://old.example.com/v1"],
+        )
+        payload = service.supersede_memory(
+            "N-0001",
+            "GLM-5.3 支持 200k 上下文。",
+            "官方文档更新：支持 200k",
+            source_urls=["https://new.example.com/v2"],
+            confidence="high",
+        )
+        assert payload["ok"] is True
+        assert payload["confidence"] == "high"
+        meta, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta["confidence"] == "high"  # 显式值落盘
+        assert meta["sources"] == [  # 与来源同时生效（两者不互斥）
+            {"url": "https://new.example.com/v2", "content_hash": ""}
+        ]
+        assert "confidence=high" in payload["message"] and "显式指定" in payload["message"]
+        # 旧 ID 沿链可达新版本（升级通道没有断链，也没有留下第二条 active 记忆）
+        read = service.read("N-0001")
+        assert read["note"]["note_id"] == "N-0002"
+        assert service.health()["notes"] == {
+            "total": 2,
+            "active": 1,
+            "merged": 0,
+            "superseded": 1,
+        }
+
+    def test_supersede_explicit_confidence_without_sources(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """显式 confidence 与来源解耦：没带来源也能标定，此时不继承旧值。"""
+        _write_note(service, "旧结论。", title="结论", confidence="high")
+        payload = service.supersede_memory(
+            "N-0001", "新结论。", "结论修正", confidence="low"
+        )
+        assert payload["ok"] is True
+        assert payload["evidence"] == "none"
+        assert payload["confidence"] == "low"
+        meta, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta["confidence"] == "low"  # 显式值优先于"无来源则继承"
+        assert meta["sources"] == []
+        assert "显式指定" in payload["message"]
+
+    def test_supersede_default_confidence_stays_medium_with_sources(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """② 缺省：带来源但不给 confidence → medium（不继承旧值）。"""
+        _write_note(service, "旧结论。", title="结论", confidence="high")
+        payload = service.supersede_memory(
+            "N-0001", "新结论。", "结论修正", source_urls=["https://a.example.com/v1"]
+        )
+        assert payload["confidence"] == "medium"
+        meta, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta["confidence"] == "medium"  # 旧值是 high，仍是 medium（硬约束）
+
+    @pytest.mark.parametrize("bad_confidence", ["bogus", "HIGHEST", "", None, 5, True])
+    def test_supersede_invalid_confidence_writes_nothing(
+        self, service: WikiService, wiki_root: Path, bad_confidence: Any
+    ) -> None:
+        """③ 非法 confidence 走 validation_failed，且零落盘（新笔记/备份都不产生）。
+
+        注意 ``None`` 不是非法值而是"没传"（走缺省规则），所以这一例断言的是
+        "等同于不传"，与参数化里的其它非法值分开处理。
+        """
+        _write_note(service, "旧正文", title="标题", sources=["https://old.example.com/v1"])
+        path = wiki_root / "notes" / "N-0001.md"
+        before = path.read_text(encoding="utf-8")
+        backups_before = sorted(p.name for p in (wiki_root / ".backups").iterdir())
+        payload = service.supersede_memory(
+            "N-0001",
+            "新内容",
+            "原因",
+            source_urls=["https://new.example.com/v1"],
+            confidence=bad_confidence,
+        )
+        if bad_confidence is None:
+            assert payload["ok"] is True
+            assert payload["confidence"] == "medium"  # None = 缺省规则（带来源 → medium）
+            return
+        assert payload["ok"] is False, bad_confidence
+        assert payload["error"]["code"] == "validation_failed", bad_confidence
+        assert "confidence" in payload["error"]["message"]
+        assert path.read_text(encoding="utf-8") == before  # 原笔记零改写
+        assert not (wiki_root / "notes" / "N-0002.md").exists()  # 无半成品新笔记
+        assert sorted(p.name for p in (wiki_root / ".backups").iterdir()) == backups_before
 
     def test_update_appends_sources_deduped_by_url_and_hash(
         self, service: WikiService, wiki_root: Path
@@ -1326,6 +1435,58 @@ class TestMemoryTools:
         assert path.read_text(encoding="utf-8") == before  # 原笔记零改写
         assert not (wiki_root / "notes" / "N-0002.md").exists()  # supersede 未写出新笔记
         assert sorted(p.name for p in (wiki_root / ".backups").iterdir()) == backups_before
+
+    def test_evidence_source_errors_take_precedence_over_missing_note(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """修复轮 Minor c：证据/参数校验先于 note_id 查找。
+
+        顺序是刻意的：参数非法是"请求本身有问题"，与目标是否存在无关；
+        两个工具都在任何读写之前给出 validation_failed（而不是 not_found）。
+        confidence 走同一优先级（修复轮 Important 的配套口径）。
+        """
+        for payload in (
+            service.update_memory("N-9999", "新正文", "原因", source_urls=[]),
+            service.supersede_memory("N-9999", "新内容", "原因", source_urls=[""]),
+            service.supersede_memory(
+                "N-9999", "新内容", "原因", source_urls=["https://a.example.com"], confidence="x"
+            ),
+        ):
+            assert payload["ok"] is False
+            assert payload["error"]["code"] == "validation_failed", payload
+        assert not (wiki_root / "notes").exists()  # 什么都没写（连 notes/ 都没建）
+        # 反例：参数合法但目标不存在 → 仍然是 not_found（优先级确实来自参数校验）
+        assert service.update_memory("N-9999", "新正文", "原因")["error"]["code"] == "not_found"
+        assert service.supersede_memory(
+            "N-9999", "新内容", "原因", source_urls=["https://a.example.com"]
+        )["error"]["code"] == "not_found"
+        assert service.supersede_memory(
+            "N-9999", "新内容", "原因", confidence="high"
+        )["error"]["code"] == "not_found"
+
+    def test_store_path_keeps_empty_sources_behaviour(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """修复轮 Minor b：write/memory_store 的 ``sources=[]`` 仍是"告警后照写"。
+
+        收紧成 validation_failed 的只有两个新证据参数（``_evidence_sources``）；
+        ``write()`` 的既有宽容度（``_validate_write_inputs``）保持不变。
+        """
+        written = _write_note(service, "正文", title="标题", sources=[])
+        assert written["ok"] is True
+        assert written["warnings"] == ["sources 解析后为空：笔记没有可用来源 URL"]
+        meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        assert "sources" not in meta or meta["sources"] == []
+
+        # memory_store 走同一条通道，行为一致（note_id 仍是 N-0001 的下一个）
+        stored = service.store_memory("另一条正文", source_urls=[])
+        assert stored["ok"] is True
+        assert stored["note_id"] == "N-0002"
+        assert "sources 解析后为空" in stored["warnings"][0]
+        meta2, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert "sources" not in meta2 or meta2["sources"] == []
+        # 两个工具都没因为空列表被拒（与证据参数的收紧口径区分开）
+        assert service.health()["notes"]["total"] == 2
 
     def test_evidence_sources_stay_visible_after_index_sync(
         self, service: WikiService

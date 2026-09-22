@@ -17,7 +17,8 @@
   - memory_search     语义检索记忆（可按 kind 过滤）
   - memory_recall     动态召回入口（结果带 status/observed_at/kind 标注）
   - memory_update     修订既有记忆正文（必须留 reason，自动备份；可追加 source_urls）
-  - memory_supersede  用新内容替代旧记忆（新旧 ID 沿链可达；可带 source_urls 挂证据）
+  - memory_supersede  用新内容替代旧记忆（新旧 ID 沿链可达；可带 source_urls 挂证据、
+                      用 confidence 表达新证据的置信度）
   - memory_invalidate 判定记忆失效（自动生成墓碑笔记，保持链可达）
   - memory_timeline   单条记忆的版本史
   - memory_conflicts  冲突台账查询
@@ -64,10 +65,15 @@ SERVER_INSTRUCTIONS = (
     "内容已过时且有新结论用 memory_supersede（新笔记替代，旧 ID 沿链可达新 ID）；"
     "判定失效且没有替代内容用 memory_invalidate（自动生成墓碑笔记，旧记忆沿链可达墓碑）。\n"
     "- 替代/修订要挂证据：两者都接受 source_urls（元素为 URL 字符串或"
-    ' {"url": ..., "content_hash": ...} 映射）。memory_supersede 给了来源 → 新记忆'
-    "的 sources=提供值且 confidence 重置为 medium（不继承旧证据的置信度）；"
+    ' {"url": ..., "content_hash": ...} 映射；给空列表会被拒，不提供即表示本次无证据）。'
+    "memory_supersede 给了来源 → 新记忆的 sources=提供值（不继承旧来源）；"
     "没给 → 新记忆没有来源，返回体 evidence=none 会明确告诉你。memory_update 的来源"
     "是追加去重（修订是补证据，不替换旧证据）。\n"
+    "- 新结论的置信度：memory_supersede 另有 confidence（high/medium/low，可选，"
+    "**从不继承旧记忆的值**）——带了来源而没给 confidence 时缺省 medium；"
+    "有来源又有具体事实要素（如「支持 200k」这类数值/anchor）就显式给 high，"
+    "这与自动沉淀同一口径。别用 memory_store 去补置信度：那是新建一条 active 记忆，"
+    "旧 ID 不退役、supersede 链也断了。\n"
     "- 别直接改写或忽视过时记忆：修订/取代/失效都会留 reason 与备份，"
     "这是记忆系统的审计底线。\n"
     "- 查单条记忆的版本史用 memory_timeline；查冲突台账用 memory_conflicts；"
@@ -197,10 +203,13 @@ _DESC_MEMORY_UPDATE = (
     "参数：note_id 记忆 ID（形如 N-0001，必须是 active 状态）；content 修订后的完整正文"
     "（覆盖原正文）；reason 修订原因（必填）；source_urls 本次用到的新来源（可选，"
     '元素为 URL 字符串或 {"url": ..., "content_hash": ...} 映射），'
-    "**追加**到既有 sources 并按 (url, content_hash) 去重（修订是补充证据，不替换旧证据）。\n"
+    "**追加**到既有 sources 并按 (url, content_hash) 去重（修订是补充证据，不替换旧证据）；"
+    "source_urls 给空列表视为非法（要么给至少一个来源、要么省略该参数）。\n"
     "安全保障：写前自动备份原稿到 wiki-data/.backups/；reason 追加进 frontmatter 的"
     " update_reasons 列表（按修订顺序保留全部原因，含时间戳）并刷新 reviewed_at"
-    "——禁止静默覆盖，审计留痕是硬要求。confidence 不因本工具改变。\n"
+    "——禁止静默覆盖，审计留痕是硬要求。confidence 不因本工具改变：要按新证据重标"
+    "置信度请用 memory_supersede(source_urls=..., confidence=...)，不要用 memory_store"
+    "（那会留下两条 active 记忆且断掉 supersede 链）。\n"
     "返回：{ok, note_id, reason, reviewed_at, backup, indexed, path, evidence, sources_added}"
     "——evidence 为 provided（带 source_urls）/ none（没带，既有来源原样保留），"
     "sources_added 是去重后新增的来源条数。\n"
@@ -216,16 +225,23 @@ _DESC_MEMORY_SUPERSEDE = (
     "不带也能替代，但返回体会标注 evidence=none（提醒你这条新记忆没有证据链）。\n"
     "参数：note_id 旧记忆 ID（必须是 active）；new_content 新内容正文（必填）；"
     "reason 替代原因（必填）；source_urls 新记忆的来源（可选，元素为 URL 字符串或"
-    ' {"url": ..., "content_hash": ...} 映射；hash 可省）。\n'
+    ' {"url": ..., "content_hash": ...} 映射；hash 可省；给空列表视为非法，'
+    "要么给至少一个来源、要么省略）；confidence 新记忆的置信度 high/medium/low（可选，"
+    "不填按下面的缺省规则）。\n"
     "语义：新记忆继承旧记忆的 entities/kind/volatility/importance；sources **不继承**"
     "旧记忆的来源（避免把旧证据伪装成新结论的证据）——给了 source_urls 就用提供值，"
-    "同时 confidence 重置为 medium（不把旧证据的 high 接到新证据上）；没给则 sources 为空"
-    "且 confidence 沿用旧值。旧记忆 status=superseded、superseded_by=新 ID，"
-    "之后读旧 ID 会自动跟随到新记忆；reason 记入旧记忆的 supersede_reason。\n"
-    "返回：{ok, old_note_id, new_note_id, superseded_by, reason, backup, path, evidence}"
-    "——evidence 为 provided（新记忆有来源）/ none（无来源的替代记忆）。\n"
+    "没给则 sources 为空。confidence **不继承**旧值：显式传了就用你给的值"
+    "（如「有来源 + 具体事实要素 → high」，与自动沉淀同口径）；没传但带了 source_urls"
+    "则缺省 medium；两者都没传才沿用旧值。旧记忆 status=superseded、"
+    "superseded_by=新 ID，之后读旧 ID 会自动跟随到新记忆；reason 记入旧记忆的 "
+    "supersede_reason。**本工具就是这条链路的升级通道**：不要为了重标置信度改用"
+    " memory_store 新建一条记忆（那会留下两条 active 记忆、旧 ID 也不退役，"
+    "supersede 链直接断掉）。\n"
+    "返回：{ok, old_note_id, new_note_id, superseded_by, reason, backup, path, evidence,"
+    " confidence}——evidence 为 provided（新记忆有来源）/ none（无来源的替代记忆），"
+    "confidence 是本次实际写入新记忆的值。\n"
     "失败：code='not_found' / 'invalid_argument' / 'validation_failed'（含 source_urls "
-    "非法：空列表、空 URL、非字符串元素）。"
+    "非法：空列表、空 URL、非字符串元素；或 confidence 不在 high/medium/low 白名单）。"
 )
 
 _DESC_MEMORY_INVALIDATE = (
@@ -460,6 +476,7 @@ def build_server(
         reason: str,
         *,
         source_urls: list[SourceInput] | None = None,
+        confidence: str | None = None,
     ) -> dict[str, Any]:
         """用新内容替代旧记忆：新笔记 + 旧笔记 superseded_by 链到新 ID。"""
         return _call(
@@ -468,6 +485,7 @@ def build_server(
             new_content,
             reason,
             source_urls=source_urls,
+            confidence=confidence,
         )
 
     @mcp.tool(

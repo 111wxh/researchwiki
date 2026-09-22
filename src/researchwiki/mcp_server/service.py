@@ -43,11 +43,16 @@ profile（User Memory 视图）。wiki_* 五工具保持原样作为兼容层。
 ---------------------------
 supersede / update 接受可选 ``source_urls``（元素为 URL 字符串或
 ``{"url", "content_hash"}`` 映射，见 ``SourceInput``；校验与 ``write()`` 共用
-``_normalize_sources``）：supersede 提供了来源 → 新笔记 sources=提供值且
-confidence 重置为 medium（不把旧证据的置信度接到新证据上），未提供 → sources
+``_normalize_sources``；**显式空列表视为非法参数**，省略才表示"不提供证据"）：
+supersede 提供了来源 → 新笔记 sources=提供值（不继承旧来源），未提供 → sources
 为空并在返回体标注 ``evidence: "none"``；update 是修订语义，来源按
 ``(url, content_hash)`` 去重后**追加**到既有 sources。两个工具的正确性都不依赖
 调用方自觉：返回体的 ``evidence`` 字段就是"这条记忆有没有证据"的机器可读声明。
+
+supersede 另有可选 ``confidence``（high/medium/low，缺省按"有来源 → medium、
+两者都没给 → 继承旧值"），**从不为了新证据继承旧置信度**：显式给值即可表达
+"有来源 + 具体事实要素 → high"（``wiki/formation.py`` 的确定性口径），
+不必绕道 memory_store（那会留下两条 active 记忆且断掉 supersede 链）。
 
 错误码词汇表（错误结构里的 ``error.code``）
 ------------------------------------------
@@ -751,8 +756,13 @@ class WikiService:
         ``{"url": ..., "content_hash": ...}`` 映射（hash 可省/可为空串）。
         **update 是修订而非替换，所以来源按 ``(url, content_hash)`` 去重后追加**
         到既有 sources（不替换、不丢旧证据）；不给该参数时 sources 原样不动。
-        confidence 不受本参数影响（修订不改变原记忆的置信度）——要给新证据配
-        置信度请用 memory_store / wiki_write 重新沉淀。
+        **空列表视为非法参数**（``validation_failed``）：要么给至少一个来源、
+        要么省略该参数——省略才表示"本次不补充证据"。
+
+        confidence 不受本参数影响（修订不改变原记忆的置信度）。要按新证据重标
+        置信度请用 ``memory_supersede(source_urls=..., confidence=...)``（旧 ID
+        沿 superseded_by 链可达新版本）；**不要**用 memory_store 代替——那会新建
+        一条 active 记忆而旧 ID 不被退役，同一事实会留下两条 active 记忆。
 
         返回体带 ``evidence``：给了 ``source_urls`` 为 ``"provided"``（附
         ``sources_added`` = 去重后新增条数），没给为 ``"none"``。
@@ -847,30 +857,49 @@ class WikiService:
         reason: str,
         *,
         source_urls: Sequence[SourceInput] | None = None,
+        confidence: str | None = None,
     ) -> dict[str, Any]:
         """用新内容替代旧记忆：先写新笔记，再把旧笔记标 superseded_by=新 ID。
 
-        不带 ``source_urls`` 时（原 P1-A 行为，逐字段不变）：新笔记继承旧笔记的
-        entities/kind/confidence/volatility/importance（身份连续性），**不继承
-        sources**，正文与标题来自 new_content；旧笔记沿 superseded_by 链可达新
-        笔记（active），reason 记入 extra 的 ``supersede_reason``。
+        不带 ``source_urls`` 也不带 ``confidence`` 时（原 P1-A 行为，逐字段不变）：
+        新笔记继承旧笔记的 entities/kind/confidence/volatility/importance（身份
+        连续性），**不继承 sources**，正文与标题来自 new_content；旧笔记沿
+        superseded_by 链可达新笔记（active），reason 记入 extra 的
+        ``supersede_reason``。
 
         证据链（carried 项④）
         --------------------
         ``source_urls`` 是可选的新证据入口，元素为 URL 字符串或
         ``{"url": ..., "content_hash": ...}`` 映射（hash 可省/可为空串；同一
-        ``(url, content_hash)`` 只保留一条，去重口径与 memory_update 一致）：
+        ``(url, content_hash)`` 只保留一条，去重口径与 memory_update 一致）。
+        **空列表视为非法参数**（``validation_failed``）：要么给至少一个来源、
+        要么省略该参数——省略才表示"本次不提供证据"。
 
         - **提供了来源**：新笔记的 sources = 提供值，而不是旧笔记的来源（旧证据
-          不该被伪装成新结论的证据）；并且 **confidence 不再继承旧值**，一律
-          重置为 ``"medium"``——旧记忆的 high 是给旧证据的 high，把新证据接到
-          这个 high 上等于凭空背书。本工具不提供 confidence 参数（避免"有参数
-          但语义可疑"），要标更高级别请走 memory_store / wiki_write 重新沉淀。
+          不该被伪装成新结论的证据）。
         - **未提供来源**：sources 保持为空（不继承旧来源），其余字段照旧继承，
           同时在返回体标注 ``evidence: "none"``——调用方能看出自己造了一条
           没有证据链的替代记忆，而不是静默以为证据跟着过来了。
 
-        返回体的 ``evidence``：提供了来源为 ``"provided"``，未提供为 ``"none"``。
+        confidence（**从不继承旧值**，简报硬约束）
+        ------------------------------------------
+        旧记忆的 confidence 是给**旧证据**打的，把新证据接到它上面等于用旧证据的
+        背书为新结论担保。取值优先级：
+
+        1. 显式给了 ``confidence`` → 用该值（走与 ``write()`` 相同的白名单校验；
+           非法/非字符串值在**锁外**以 ``validation_failed`` 拒绝——与
+           ``source_urls`` 同一优先级，先于 note_id 查找，且不产生任何备份或落盘）；
+        2. 没给但带了 ``source_urls`` → 缺省 ``"medium"``（= "未特别标定"）；
+        3. 两者都没给 → 继承旧值（P1-A 兼容路径，仅此一种继承）。
+
+        所以"有来源 + 具体事实要素 → high"（``wiki/formation.py`` 的确定性口径）
+        在本工具里是可执行的：``memory_supersede(..., source_urls=[...],
+        confidence="high")``。**不要**用 memory_store / wiki_write 来"补标定"：
+        那会新建一条 active 记忆而旧 ID 不被退役，同一事实留下两条 active 记忆、
+        supersede 链也断了。
+
+        返回体的 ``evidence``：提供了来源为 ``"provided"``，未提供为 ``"none"``；
+        ``confidence`` 是本次实际写入新笔记的值。
         """
         if not isinstance(new_content, str) or not new_content.strip():
             raise WikiToolError(
@@ -883,6 +912,9 @@ class WikiService:
         # 证据链参数在锁外、在任何写入（含新笔记落盘与旧笔记标记）之前校验：
         # 非法参数不会留下半成品（既无新笔记也无备份）。
         provided = _evidence_sources(source_urls)
+        # confidence 同样在锁外提前校验（与 source_urls 同一优先级）：非法值不应
+        # 因为"目标恰好不存在"就变成 not_found；也保证零落盘。
+        explicit_confidence = _require_confidence(confidence) if confidence is not None else None
         # 去重口径与 update 一致（(url, content_hash) 只留一条），保证新笔记的
         # sources 恰好等于"去重后的提供值"；回传给 write() 的是映射形态，
         # 与 _normalize_sources 的归一结果等价（url 已 strip、hash 已归一）。
@@ -894,15 +926,20 @@ class WikiService:
         with self._write_lock:
             old = self._require_active(note_id)
             now = _now_iso()
+            # confidence 一律不继承旧值：显式给出就用给出的，带了来源则缺省
+            # medium，只有"既没来源也没显式值"这条 P1-A 兼容路径才继承。
+            resolved_confidence = (
+                explicit_confidence
+                if explicit_confidence is not None
+                else ("medium" if provided else old.meta.confidence)
+            )
             # 第一步：新笔记走完整写保护通道（校验/备份/落盘/索引）。
             # 备份失败会在这里整体失败，旧笔记尚未动——无半成品状态。
             written = self.write(
                 new_content,
                 title=derive_title(new_content, fallback=old.title or "替代笔记"),
                 entities=list(old.meta.entities),
-                # 给了新证据 → 置信度回到缺省 medium（不继承旧证据的 high）；
-                # 没给来源 → 维持原行为，继承旧笔记的 confidence。
-                confidence="medium" if provided else old.meta.confidence,
+                confidence=resolved_confidence,
                 volatility=old.meta.volatility,
                 kind=old.meta.kind,
                 importance=old.meta.importance,
@@ -913,6 +950,24 @@ class WikiService:
             new_id = str(written["note_id"])
             # 第二步：旧笔记 → superseded，链到新笔记。
             marked = self._mark_superseded(old, superseded_by=new_id, now=now, reason=reason_text)
+        # 落盘值已由 write() 归一（strip + lower），返回体报告的就是实际写入值
+        confidence_used = str(resolved_confidence).strip().lower()
+        if provided:
+            tail = (
+                f"；新笔记来源=本次提供的 {len(deduped)} 条"
+                f"（按 (url, content_hash) 去重），confidence={confidence_used}"
+                + (
+                    "（显式指定）"
+                    if explicit_confidence is not None
+                    else "（缺省 medium，不继承旧证据的置信度）"
+                )
+            )
+        else:
+            tail = (
+                "；本次未提供来源（evidence=none）：新笔记没有证据链，"
+                f"confidence={confidence_used}"
+                + ("（显式指定）" if explicit_confidence is not None else "（沿用旧值）")
+            )
         payload: dict[str, Any] = {
             "ok": True,
             "old_note_id": old.id,
@@ -922,17 +977,10 @@ class WikiService:
             "backup": written.get("backup"),
             "path": _relative_path(marked.path, self.root),
             "evidence": "provided" if provided else "none",
+            "confidence": confidence_used,
             "message": (
                 f"旧记忆 {old.id} 已被 {new_id} 取代（status=superseded，"
-                f"沿 superseded_by 可达；原因记入 supersede_reason）"
-                + (
-                    f"；新笔记来源=本次提供的 {len(deduped)} 条"
-                    "（按 (url, content_hash) 去重），"
-                    "confidence 重置为 medium（不继承旧证据的置信度）"
-                    if provided
-                    else "；本次未提供来源（evidence=none）：新笔记没有证据链，"
-                    "confidence 沿用旧值——若要挂新来源请重来一次并带上 source_urls"
-                )
+                f"沿 superseded_by 可达；原因记入 supersede_reason）" + tail
             ),
         }
         if written.get("warnings"):
@@ -1408,11 +1456,7 @@ def _validate_write_inputs(
         errors.append(f"entities 必须是字符串列表，得到 {type(entities).__name__}")
         normalized_entities = []
 
-    conf = confidence.strip().lower() if isinstance(confidence, str) else confidence
-    if conf not in CONFIDENCE_LEVELS:
-        errors.append(
-            f"confidence 非法：{confidence!r}，只能是 {' / '.join(CONFIDENCE_LEVELS)}"
-        )
+    conf = _normalize_confidence(confidence, errors)
     vol = volatility.strip().lower() if isinstance(volatility, str) else volatility
     if vol not in VOLATILITY_LEVELS:
         errors.append(
@@ -1535,6 +1579,34 @@ def _evidence_sources(source_urls: Sequence[SourceInput] | str | None) -> list[S
             errors=errors,
         )
     return normalized
+
+
+def _normalize_confidence(value: Any, errors: list[str]) -> Any:
+    """confidence 白名单归一（``write()`` 与 ``memory_supersede`` 共用同一份规则）。
+
+    非字符串、大小写/空白不规整、不在 high/medium/low 内 → 往 ``errors`` 追加一条
+    可读中文错误（文案与历史行为逐字一致），否则返回归一后的字符串。
+    """
+    conf = value.strip().lower() if isinstance(value, str) else value
+    if conf not in CONFIDENCE_LEVELS:
+        errors.append(f"confidence 非法：{value!r}，只能是 {' / '.join(CONFIDENCE_LEVELS)}")
+    return conf
+
+
+def _require_confidence(value: Any) -> str:
+    """memory_supersede 的 ``confidence`` 参数提前校验（锁外、任何写入之前）。
+
+    用 ``write()`` 的同一套白名单（``_normalize_confidence``），只把"拒绝时机"
+    提前——参数非法与目标是否存在无关，应当与 ``source_urls`` 同优先级返回
+    ``validation_failed``，而不是先落到 not_found。write() 内的校验仍是最终裁决。
+    """
+    errors: list[str] = []
+    normalized = _normalize_confidence(value, errors)
+    if errors:
+        raise WikiToolError(
+            "validation_failed", "参数校验未通过：" + "；".join(errors), errors=errors
+        )
+    return str(normalized)
 
 
 def _merge_sources(
