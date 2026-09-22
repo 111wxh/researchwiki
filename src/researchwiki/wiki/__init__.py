@@ -19,6 +19,14 @@ from researchwiki.wiki.index import (
     wiki_search,
     wiki_settings,
 )
+from researchwiki.wiki.prior import (
+    PRIOR_CONTEXT_LABEL,
+    PriorContext,
+    PriorHit,
+    ensure_index_fresh,
+    format_prior_context,
+    retrieve_priors,
+)
 from researchwiki.wiki.store import Conflict, Note, Page, WikiStore
 
 __all__ = [
@@ -32,16 +40,22 @@ __all__ = [
     "Note",
     "NoteMeta",
     "OpenAICompatibleEmbedding",
+    "PRIOR_CONTEXT_LABEL",
     "Page",
+    "PriorContext",
+    "PriorHit",
     "SearchIndex",
     "SearchMatch",
     "SourceRef",
     "WikiSettings",
     "WikiStore",
     "dump",
+    "ensure_index_fresh",
+    "format_prior_context",
     "freshness_factor",
     "get_embedding_provider",
     "parse",
+    "retrieve_priors",
     "rrf_fuse",
     "slugify",
     "wiki_search",
