@@ -9,19 +9,29 @@
   warm run  同一 wiki 根目录、同一问题、全新 AgentLoop 实例：Prior 检索必须
             命中冷启动沉淀的笔记（prior_hit_count > 0）。
 
-每次 run 收集 <run_dir>/run-metrics.json（PLAN §4.4，14 字段），并把两次 run
-的硬断言做实：warm 的 prior_hit_count > 0；两次 run 的 input/output tokens
-与 sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致
-（TokenAccountant 由本脚本构造、指向同一 tokens.jsonl）。任一断言不满足
-即打印原因并以非零退出码结束——这是"复用收益可复算"的脚本化闸，绝不静默通过。
+每次 run 收集 <run_dir>/run-metrics.json（PLAN §4.4，14 字段），并把硬断言做实：
+
+  1. cold run prior_hit_count == 0（必须是空 Wiki 冷启动；--wiki-root 指向
+     已含相关笔记的目录时在此拦住"假绿"对照）；
+  2. cold run notes_created >= 1（cold 必须沉淀 ≥1 条 active note，否则 warm
+     的命中不可能来自本次 cold 产物）；
+  3. warm run prior_hit_count > 0；
+  4. 两次 run 的 input/output tokens 与
+     sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致
+     （TokenAccountant 由本脚本构造、指向同一 tokens.jsonl）。
+
+任一断言不满足即打印原因并以非零退出码结束——这是"复用收益可复算"的
+脚本化闸，绝不静默通过。
 
 ── 两种 provider 模式（--provider）──────────────────────────────────────
   mock（默认）  ScriptedProvider 驱动 strong/cheap 两档（极简 TierRouter 注入，
-                gate 脚本 / tests/test_loop_prior.py 同款造法）+
-                get_search_provider({}) 的零 key 搜索（MockSearch）；
-                embedding 用确定性 MockEmbeddingProvider，tokenizer 固定 trigram。
-                全程零网络、零 API key；两次 run 用同一份剧本、各自全新 provider
-                实例，模型响应完全脚本化、可重复（mock 模式不读 .env / 环境变量）。
+                gate 脚本 / tests/test_loop_prior.py 同款造法）+ 显式锁定的
+                MockSearch（get_search_provider 收 {"search": {"provider":
+                "mock"}}，不受 SEARCH_PROVIDER / TAVILY_API_KEY /
+                BOCHA_API_KEY 环境变量影响）；embedding 用确定性
+                MockEmbeddingProvider，tokenizer 固定 trigram。全程零网络、
+                零 API key、不读 .env；两次 run 用同一份剧本、各自全新
+                provider 实例，模型响应完全脚本化、可重复。
   config        从 config.toml 读真实 strong/cheap 档位（ModelRouter）、真实搜索
                 provider 与真实 embedding（get_embedding_provider，缓存指向
                 <wiki_root>/index.db）；输出行记录 model 名与 base_url
@@ -204,11 +214,14 @@ class ProviderStack:
 
 
 def build_mock_stack(question: str) -> ProviderStack:
-    """mock 模式：ScriptedProvider 两档 + 零 key 搜索 + 确定性 Mock embedding。
+    """mock 模式：ScriptedProvider 两档 + 显式锁定的 MockSearch + 确定性 Mock embedding。
 
-    llm_config 按 tests/test_loop_prior.py 的口径给 cheap 配置 base_url，
-    使蒸馏/子 agent 明确走 cheap 档；wiki_config 固定 trigram（不探测 vendor
-    DLL，保证确定性）；prior_config 缺省 = enabled + 默认预算。
+    搜索组装显式传 ``{"search": {"provider": "mock"}}``：get_search_provider 的
+    provider 名命中不了 tavily/bocha 分支，也不再看 SEARCH_PROVIDER /
+    TAVILY_API_KEY / BOCHA_API_KEY 环境变量兜底——mock 模式的零网络不依赖
+    环境巧合。llm_config 按 tests/test_loop_prior.py 的口径给 cheap 配置
+    base_url，使蒸馏/子 agent 明确走 cheap 档；wiki_config 固定 trigram
+    （不探测 vendor DLL，保证确定性）；prior_config 缺省 = enabled + 默认预算。
     """
     llm_config = {
         "strong": {"base_url": "https://mock"},
@@ -223,7 +236,7 @@ def build_mock_stack(question: str) -> ProviderStack:
         llm_config=llm_config,
         wiki_config={"fts_tokenizer": "trigram"},
         prior_config=None,
-        search_provider=get_search_provider({}),
+        search_provider=get_search_provider({"search": {"provider": "mock"}}),
         embedding=MockEmbeddingProvider(dim=512),
         make_router=lambda: make_mock_router(question),
     )
@@ -298,12 +311,35 @@ def run_once(
 def verify_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     """硬断言（PLAN §4.5 阶段验收口径），返回失败原因列表（空 = 全部通过）。
 
-    1. warm run 的 prior_hit_count > 0（mock / config 都断言；config 真模型
+    1. cold run 的 prior_hit_count == 0（空 Wiki 冷启动的口径本身也要被验证；
+       --wiki-root 指向已含相关笔记的目录时，cold 直接命中旧笔记、对照假绿，
+       在此拦住）；
+    2. cold run 的 notes_created >= 1（cold 必须沉淀 ≥1 条 active note，否则
+       warm 的命中不可能来自本次 cold 产物）；
+    3. warm run 的 prior_hit_count > 0（mock / config 都断言；config 真模型
        蒸馏没产出可命中笔记时在此明确报失败）；
-    2. 两次 run 的 input/output tokens 与
+    4. 两次 run 的 input/output tokens 与
        sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致。
     """
     failures: list[str] = []
+    cold = next((row for row in rows if str(row.get("run")) == "cold"), None)
+    if cold is None:
+        failures.append("缺少 cold run 的结果行，无法验证冷启动口径")
+    else:
+        metrics = dict(cold.get("metrics") or {})
+        hits = int(metrics.get("prior_hit_count") or 0)
+        if hits != 0:
+            failures.append(
+                f"cold run prior_hit_count={hits}，必须 == 0：cold 必须从空 Wiki 冷启动，"
+                "命中说明 --wiki-root 已含相关笔记、本次对照是假绿"
+                "（换一个空目录或清空后重跑）"
+            )
+        created = int(metrics.get("notes_created") or 0)
+        if created < 1:
+            failures.append(
+                f"cold run notes_created={created}，必须 >= 1：cold 蒸馏必须沉淀"
+                " ≥1 条 active note，否则 warm 的 prior 命中不可能来自本次 cold 产物"
+            )
     warm = next((row for row in rows if str(row.get("run")) == "warm"), None)
     if warm is None:
         failures.append("缺少 warm run 的结果行，无法验证 Prior 复用")
@@ -509,10 +545,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"JSONL 已写入 {out_path}（断言未通过，退出码 {EXIT_ASSERT_FAILED}）")
         return EXIT_ASSERT_FAILED
 
+    cold = next(row for row in rows if row["run"] == "cold")
     warm = next(row for row in rows if row["run"] == "warm")
     print("-" * 76)
     print(
-        f"✓ 断言通过：warm run prior_hit_count={warm['metrics']['prior_hit_count']} > 0；"
+        f"✓ 断言通过：cold 空 Wiki 冷启动（prior_hit_count=0，沉淀 "
+        f"{cold['metrics']['notes_created']} 条 active note）；"
+        f"warm run prior_hit_count={warm['metrics']['prior_hit_count']} > 0；"
         "两次 run 的 input/output tokens 与 "
         "sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致（可复算）。"
     )

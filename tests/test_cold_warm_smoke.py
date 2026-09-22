@@ -18,6 +18,7 @@ from types import ModuleType
 import pytest
 
 from researchwiki.loop.metrics import RunMetrics, sum_tokens_from_jsonl
+from researchwiki.tools import MockSearch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +38,8 @@ smoke = _load("cold_warm_smoke", "scripts/cold_warm_smoke.py")
 
 @pytest.fixture(autouse=True)
 def _no_search_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """零网络保证：清掉可能让 get_search_provider({}) 选中真实搜索的环境变量。"""
+    """零网络保证：mock 模式已显式锁定 MockSearch；这里再清掉搜索相关环境变量，
+    兜住 config 模式测试（空 config 时 get_search_provider 会回退读环境变量）。"""
     for var in ("SEARCH_PROVIDER", "TAVILY_API_KEY", "BOCHA_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
@@ -92,12 +94,13 @@ def test_mock_end_to_end_prior_hit_and_token_reconciliation(tmp_path, capsys) ->
     assert rows[0]["metrics"]["prior_note_ids"] == []
     assert rows[1]["metrics"]["prior_hit_count"] > 0
     assert rows[1]["metrics"]["prior_note_ids"], "warm 命中必须带 note id"
+    # cold 沉淀 ≥1 条 active note（warm 能命中的前提），且运行时硬断言全绿
+    assert rows[0]["metrics"]["notes_created"] >= 1
+    assert smoke.verify_rows(rows) == []
 
     # 同一份剧本的两次 run 行为一致（完全脚本化、可重复）
     assert rows[0]["metrics"]["fresh_search_count"] == rows[1]["metrics"]["fresh_search_count"]
     assert rows[0]["metrics"]["fresh_search_count"] == 1
-    # cold 蒸馏沉淀 ≥1 条 active note（warm 能命中的前提）
-    assert rows[0]["metrics"]["notes_created"] >= 1
 
     # token 可复算：两次 run 的 metrics 与 tokens.jsonl 按 trace_id 复算完全一致
     for row in rows:
@@ -133,6 +136,18 @@ def test_mock_mode_supports_custom_question(tmp_path) -> None:
     assert rc == smoke.EXIT_PASS
     assert rows[0]["metrics"]["prior_hit_count"] == 0
     assert rows[1]["metrics"]["prior_hit_count"] > 0
+
+
+def test_mock_mode_locks_mock_search_even_with_env_keys(monkeypatch, tmp_path) -> None:
+    """环境里恰好有搜索 key 时，mock 模式仍显式锁定 MockSearch——零网络不靠环境巧合。"""
+    monkeypatch.setenv("TAVILY_API_KEY", "smoke-test-not-a-real-key")
+    stack = smoke.build_mock_stack(smoke.DEFAULT_QUESTION)
+    assert isinstance(stack.search_provider, MockSearch)
+    # 端到端仍然通过（不会向真实搜索发起请求）
+    rc, _rows, _out = _run(
+        tmp_path, ["--provider", "mock", "--wiki-root", str(tmp_path / "wiki")]
+    )
+    assert rc == smoke.EXIT_PASS
 
 
 # ---- config 模式：真模型不可用时必须明确报失败 ---------------------------------
@@ -174,9 +189,11 @@ def test_verify_rows_flags_zero_prior_and_token_mismatch(tmp_path) -> None:
     )
     rows = [
         {"run": "cold", "trace_id": "t1", "wiki_root": str(tmp_path),
-         "metrics": {"input_tokens": 100, "output_tokens": 10, "prior_hit_count": 0}},
+         "metrics": {"input_tokens": 100, "output_tokens": 10, "prior_hit_count": 0,
+                     "notes_created": 1}},
         {"run": "warm", "trace_id": "t2", "wiki_root": str(tmp_path),
-         "metrics": {"input_tokens": 5, "output_tokens": 5, "prior_hit_count": 0}},
+         "metrics": {"input_tokens": 5, "output_tokens": 5, "prior_hit_count": 0,
+                     "notes_created": 0}},
     ]
     failures = smoke.verify_rows(rows)
     assert any("prior_hit_count" in failure for failure in failures)
@@ -187,6 +204,30 @@ def test_verify_rows_flags_zero_prior_and_token_mismatch(tmp_path) -> None:
     # warm 命中后仅剩的问题是对账失败
     rows[1]["metrics"]["prior_hit_count"] = 2
     assert all("prior_hit_count" not in failure for failure in smoke.verify_rows(rows))
+
+
+def test_verify_rows_flags_dirty_cold_start(tmp_path) -> None:
+    """cold 闸：--wiki-root 已含相关笔记（cold 直接命中）或蒸馏零产出时必须拦住假绿对照。"""
+    rows = [
+        {"run": "cold", "trace_id": "t1", "wiki_root": str(tmp_path),
+         "metrics": {"input_tokens": 0, "output_tokens": 0, "prior_hit_count": 1,
+                     "notes_created": 0}},
+        {"run": "warm", "trace_id": "t2", "wiki_root": str(tmp_path),
+         "metrics": {"input_tokens": 0, "output_tokens": 0, "prior_hit_count": 1,
+                     "notes_created": 0}},
+    ]
+    failures = smoke.verify_rows(rows)
+    assert any(
+        "cold run prior_hit_count=1" in failure and "假绿" in failure
+        for failure in failures
+    )
+    assert any("cold run notes_created=0" in failure for failure in failures)
+
+    # 修正 cold 口径后这两条失败消失（warm 命中 1 保持合法）
+    rows[0]["metrics"]["prior_hit_count"] = 0
+    rows[0]["metrics"]["notes_created"] = 1
+    remaining = smoke.verify_rows(rows)
+    assert not any("cold run" in failure for failure in remaining)
 
 
 def test_verify_rows_flags_missing_warm_row() -> None:
