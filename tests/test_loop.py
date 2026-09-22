@@ -570,12 +570,11 @@ def test_subagent_stops_on_its_own_token_budget_only(tmp_path):
     payload = json.loads(strong.calls[2][3].content)
     assert payload["steps"] == 2
     assert "".join(e["delta"] for e in events if e["type"] == "text-delta") == REPORT_TEXT
-    # 主循环 input tokens 不含子 agent 消耗（独立预算），state 只记主循环
-    assert loop.input_tokens == sum(
-        r["input_tokens"]
-        for r in accountant_steps(tmp_path)
-        if not r["step"].startswith("subagent")
-    )
+    # 子 agent 用量经 on_usage 回流主计数（独立预算只管它自己的熔断步数）：
+    # loop.input_tokens 与 tokens.jsonl 按 trace_id 全量可对账
+    rows = accountant_steps(tmp_path)
+    assert loop.input_tokens == sum(r["input_tokens"] for r in rows)
+    assert loop.output_tokens == sum(r["output_tokens"] for r in rows)
 
 
 def test_subagent_standalone_run_returns_fixed_schema(tmp_path):

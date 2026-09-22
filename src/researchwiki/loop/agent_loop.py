@@ -5,8 +5,8 @@ start / reasoning-* / data-task / data-note / data-conflict / text-* / source-ur
 前端零改动；蒸馏与子 agent 优先用 cheap 档（未配置则复用 strong）。
 
 熔断：max_steps（默认 12，计 act 循环的模型调用次数）与 token_budget
-（默认 200_000，主循环 LLM 调用的 input tokens 累计）任一超限即强制收尾，
-给报告模型一条"预算耗尽，基于已有信息直接写报告"的指示。
+（默认 200_000，主循环/蒸馏/子 agent 的 input tokens 累计）任一超限即强制
+收尾，给报告模型一条"预算耗尽，基于已有信息直接写报告"的指示。
 
 state 约定：每次 run 落盘 wiki-data/runs/{时间戳}-{trace_id}/：
 - research-plan.md：规划阶段产出的研究计划；
@@ -22,6 +22,7 @@ Prior 注入（PLAN §4.2）：run 开始前对问题检索历史 Wiki 的 activ
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -656,6 +657,9 @@ class AgentLoop:
             max_steps=self.subagent_steps,
             token_budget=self.subagent_budget,
             clock=self.clock,
+            # 子 agent 用量回流主循环滚动计数（独立预算只管它自己的熔断），
+            # 保证 run-metrics 与 tokens.jsonl 按 trace_id 可对账
+            on_usage=self._absorb_usage,
         )
         result = sub.run()
         # 子 agent 产物汇入本次 run：笔记进蒸馏队列（同样走入库去重），来源进引用池
@@ -729,9 +733,20 @@ class AgentLoop:
     # ---- 事件主流程 ----------------------------------------------------------
 
     def events(self) -> Iterator[dict[str, Any]]:
+        """SSE 主流程：start … finish（与 mock 同构的事件序列）。
+
+        run-metrics.json 恰好落盘一次：正常结束、中途异常、生成器被 close 三种
+        关闭路径都经 try/finally 写一次（数据取当时实况）；落盘自身失败不抛出，
+        既不压过流中的原异常，也不让已写出 report.md 的 run 在收尾时崩掉。
+        """
         t_start = self.clock()
         yield {"type": "start"}
+        try:
+            yield from self._events()
+        finally:
+            self._write_run_metrics_guarded(t_start)
 
+    def _events(self) -> Iterator[dict[str, Any]]:
         # ---- 阶段 0：Prior 检索（PLAN §4.2：plan 步骤之前，不污染来源池）----
         self._retrieve_priors()
         plan_content = self.question
@@ -971,17 +986,33 @@ class AgentLoop:
 
         atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
         self._write_state("done")
-        self._write_run_metrics(t_start)
         yield {"type": "finish"}
 
     # ---- 辅助 ----------------------------------------------------------
 
-    def _write_run_metrics(self, t_start: float) -> None:
-        """收尾落盘 run-metrics.json（PLAN §4.4/§4.5，report 写盘后、finish 前）。
+    def _write_run_metrics_guarded(self, t_start: float) -> None:
+        """run-metrics.json 恰好落盘一次的守卫入口（events() 的 try/finally 配套）。
 
-        token 口径：self.input_tokens / self.output_tokens 已含子 agent 与蒸馏吸收；
-        与 tokens.jsonl 可复算对账（metrics.sum_tokens_from_jsonl）。latency 为
-        events() 全程的 self.clock 差取整。
+        落盘自身失败只记 stderr、不抛出：不得压过流中的原异常，也不得让
+        已写出 report.md 的 run 在收尾阶段崩掉。
+        """
+        try:
+            self._write_run_metrics(t_start)
+        except Exception as exc:  # noqa: BLE001 -- 指标是辅助产物，失败不能推翻本次 run
+            print(
+                f"[agent-loop] run-metrics.json 落盘失败：{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _write_run_metrics(self, t_start: float) -> None:
+        """落盘 run-metrics.json（PLAN §4.4/§4.5；恰好写一次由 events() 的
+        try/finally 守卫保证，含异常/被 close 的关闭路径）。
+
+        token 口径：self.input_tokens / self.output_tokens 含主循环、蒸馏与
+        子 agent 三路用量（子 agent 经 ResearchSubagent.on_usage → _absorb_usage
+        回流；蒸馏/入库走 on_usage 同机制），与 tokens.jsonl 按 trace_id 经
+        sum_tokens_from_jsonl 可复算对账。latency 为 events() 全程的
+        self.clock 差取整（异常关闭路径取到抛错时刻）。
         """
         prior = self.prior_context
         source_count = len(self.ctx.source_pool.entries)

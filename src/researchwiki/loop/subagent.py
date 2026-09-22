@@ -107,6 +107,7 @@ class ResearchSubagent:
         max_steps: int = 6,
         token_budget: int = 50_000,
         clock: Callable[[], float] = time.perf_counter,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> None:
         self.topic = topic
         self.brief = brief
@@ -117,6 +118,7 @@ class ResearchSubagent:
         self.max_steps = max_steps
         self.token_budget = token_budget
         self.clock = clock
+        self.on_usage = on_usage
         self.input_tokens = 0
 
     # ---- 内部 ----------------------------------------------------------
@@ -169,6 +171,10 @@ class ResearchSubagent:
             steps_used += 1
             if usage is not None:
                 self.input_tokens += usage.input_tokens
+                # 用量回流主循环滚动计数（与 Distiller/Ingestor 的 on_usage 同模式），
+                # 保证 run-metrics 与 tokens.jsonl 按 trace_id 可对账
+                if self.on_usage is not None:
+                    self.on_usage(usage)
             self._record(f"subagent:step:{steps_used}", usage, t0)
 
             if not tool_calls:

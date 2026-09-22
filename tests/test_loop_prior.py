@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import ScriptedProvider, StreamEvent, TokenUsage
@@ -59,10 +60,14 @@ def call(name: str, arguments: dict, *, id: str = "c1") -> dict:
 class FakeRouter:
     """按档位返回预置 Provider（未配置的档位被请求即失败，防止测试里静默串线）。"""
 
-    def __init__(self, strong: ScriptedProvider) -> None:
+    def __init__(self, strong: ScriptedProvider, cheap: ScriptedProvider | None = None) -> None:
         self._providers = {"strong": strong}
+        if cheap is not None:
+            self._providers["cheap"] = cheap
 
     def get(self, tier: str) -> ScriptedProvider:
+        if tier not in self._providers:
+            raise AssertionError(f"测试未配置 {tier} 档 Provider，却被请求了")
         return self._providers[tier]
 
 
@@ -70,15 +75,25 @@ def make_loop(
     tmp_path: Path,
     *,
     strong_turns: list[list[StreamEvent]],
+    cheap_turns: list[list[StreamEvent]] | None = None,
     prior_config: dict | None = None,
     fetch_transport: httpx.BaseTransport | None = None,
     **kwargs,
 ) -> AgentLoop:
+    strong = ScriptedProvider(strong_turns, model="mock-strong")
+    cheap = None
+    # cheap 未配置 base_url → 蒸馏/子 agent 复用 strong（与 tests/test_loop.py 同口径）
+    llm_config = {"strong": {"base_url": "https://mock"}, "cheap": {"base_url": ""}}
+    if cheap_turns is not None:
+        cheap = ScriptedProvider(cheap_turns, tier="cheap", model="mock-cheap")
+        llm_config = {
+            "strong": {"base_url": "https://mock"},
+            "cheap": {"base_url": "https://mock-cheap"},
+        }
     return AgentLoop(
         QUESTION,
-        router=FakeRouter(ScriptedProvider(strong_turns, model="mock-strong")),
-        # cheap 未配置 base_url → 蒸馏复用 strong（与 tests/test_loop.py 同口径）
-        llm_config={"strong": {"base_url": "https://mock"}, "cheap": {"base_url": ""}},
+        router=FakeRouter(strong, cheap),
+        llm_config=llm_config,
         accountant=TokenAccountant(tmp_path / "tokens.jsonl"),
         search_provider=MockSearch(),
         wiki_root=tmp_path / "wiki-data",
@@ -309,3 +324,110 @@ def test_prior_disabled_skips_retrieval_and_injection(tmp_path: Path) -> None:
     metrics = load_metrics(tmp_path)
     assert metrics["prior_hit_count"] == 0
     assert metrics["prior_note_ids"] == []
+
+
+# ---- 7. dispatch 路径：子 agent 用量回流主计数，metrics 可对账 -------------------
+
+
+def test_dispatch_run_tokens_reconcile_with_tokens_jsonl(tmp_path: Path) -> None:
+    """含 dispatch_research 的 run：子 agent 的 token 经 on_usage 回流主循环滚动
+    计数，run-metrics.json 与 tokens.jsonl 按 trace_id 仍可精确对账（评审修复项）。"""
+    sub_json = json.dumps(
+        {
+            "findings": "子问题结论：70% 阈值触发压缩。",
+            "notes": [],
+            "sources": [{"url": "https://example.com/sub", "title": "子来源"}],
+        },
+        ensure_ascii=False,
+    )
+    loop = make_loop(
+        tmp_path,
+        strong_turns=[
+            text_turn(PLAN_TEXT),
+            tool_turn([call("dispatch_research", {"topic": "上下文压缩"}, id="c1")]),
+            text_turn("汇总完毕。"),
+            text_turn(REPORT_TEXT),
+        ],
+        cheap_turns=[
+            tool_turn([call("web_search", {"query": "上下文压缩"}, id="s1")]),
+            text_turn(sub_json),
+            text_turn(DISTILL_JSON),  # cheap 配置后蒸馏也走 cheap 档
+        ],
+    )
+    events = list(loop.events())
+    assert events[-1]["type"] == "finish"
+
+    # 子 agent 真实跑过：2 步收尾、其来源进了引用池
+    payload = json.loads(loop.provider.calls[2][3].content)  # type: ignore[attr-defined]
+    assert payload["steps"] == 2
+    assert "https://example.com/sub" in [e["url"] for e in events if e["type"] == "source-url"]
+
+    # 对账：run-metrics == tokens.jsonl 按 trace_id 全量合计 == 主循环滚动计数
+    metrics = load_metrics(tmp_path)
+    token_in, token_out = sum_tokens_from_jsonl(tmp_path / "tokens.jsonl", loop.trace_id)
+    assert token_in > 0  # 子 agent 与蒸馏的用量真实入账
+    assert metrics["input_tokens"] == token_in == loop.input_tokens
+    assert metrics["output_tokens"] == token_out == loop.output_tokens
+
+
+# ---- 8. 流中途异常：run-metrics 仍恰好写一次 -------------------------------------
+
+
+class _BoomProvider:
+    """第一次调用即抛错的 Provider：模拟流在 plan 步骤中途死亡。"""
+
+    model = "mock-strong"
+    tier = "strong"
+
+    def stream(self, messages, *, system=None, tools=None):
+        raise RuntimeError("模型连接中断")
+
+
+def test_run_metrics_still_written_when_stream_dies_midway(tmp_path: Path) -> None:
+    """生成器异常关闭：metrics 经 try/finally 写一次（取当时实况），原异常照常抛出。"""
+    store = WikiStore(tmp_path / "wiki-data")
+    preload_note(
+        store,
+        f"历史结论：关于{QUESTION}，Letta 的后台 subagent 方案最成熟。",
+        note_id="N-0001",
+        title="记忆方案（历史）",
+    )
+    loop = AgentLoop(
+        QUESTION,
+        router=FakeRouter(_BoomProvider()),  # type: ignore[arg-type]
+        llm_config={"strong": {"base_url": "https://mock"}, "cheap": {"base_url": ""}},
+        accountant=TokenAccountant(tmp_path / "tokens.jsonl"),
+        search_provider=MockSearch(),
+        wiki_root=tmp_path / "wiki-data",
+        run_dir=tmp_path / "run",
+        embedding=MockEmbeddingProvider(dim=512),
+        wiki_config={"fts_tokenizer": "trigram"},
+    )
+    with pytest.raises(RuntimeError, match="模型连接中断"):
+        list(loop.events())
+
+    # Prior 已检索（异常发生在 plan 调用）、metrics 已落盘且与记账一致
+    assert loop.prior_context is not None and len(loop.prior_context.hits) == 1
+    metrics = load_metrics(tmp_path)
+    token_in, token_out = sum_tokens_from_jsonl(tmp_path / "tokens.jsonl", loop.trace_id)
+    assert metrics["input_tokens"] == token_in == loop.input_tokens == 0
+    assert metrics["prior_hit_count"] == 1
+    assert metrics["prior_note_ids"] == ["N-0001"]
+    assert metrics["citation_coverage"] is None  # 无报告无来源，取当时实况
+
+
+def test_run_metrics_written_exactly_once_on_happy_path(monkeypatch, tmp_path: Path) -> None:
+    """正常结束：落盘恰好一次（try/finally 单一写点，不因守卫重复写）。"""
+    loop = make_loop(tmp_path, strong_turns=default_turns())
+    calls: list[float] = []
+    original = AgentLoop._write_run_metrics
+
+    def spy(self: AgentLoop, t_start: float) -> None:
+        calls.append(t_start)
+        original(self, t_start)
+
+    monkeypatch.setattr(AgentLoop, "_write_run_metrics", spy)
+    list(loop.events())
+
+    assert len(calls) == 1
+    assert (tmp_path / "run" / "run-metrics.json").is_file()
