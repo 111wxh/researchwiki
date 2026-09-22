@@ -401,6 +401,15 @@ class SearchIndex:
             count += 1
         return count
 
+    def indexed_status(self) -> dict[str, str]:
+        """索引内 ``{note_id: status}`` 的只读快照。
+
+        仅供索引新鲜度检查（如 ``prior.ensure_index_fresh``）比对 store 全量
+        状态用；不代表检索可用性，调用方不得据此写入或改判笔记状态。
+        """
+        rows = self._conn.execute("SELECT note_id, status FROM note_meta").fetchall()
+        return {str(r[0]): str(r[1] or "") for r in rows}
+
     # ---- 检索 ----
 
     def search(self, query: str, k: int = 5) -> list[SearchMatch]:

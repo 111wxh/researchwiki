@@ -21,11 +21,12 @@ created）、来源 URL 列表、正文（可截断）、以及若有重定向�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from researchwiki.wiki.index import SearchIndex, SearchMatch
-from researchwiki.wiki.store import WikiStore
+from researchwiki.wiki.store import Note, WikiStore
 
 # 标签行原文（PLAN §4.2 一字不差；后续任务在测试里断言它）
 PRIOR_CONTEXT_LABEL = "历史 Prior，仅供核验，不是本轮 fresh evidence"
@@ -36,7 +37,7 @@ DEFAULT_MAX_CHARS = 4000
 _MAX_BODY_CHARS = 600
 # 预算再紧，单条正文也至少保留的长度（低于此不如整条丢弃）
 _MIN_BODY_CHARS = 80
-# 重定向链防御性跟随的最大步数（follow_redirect 自身已防环，这里再兜底）
+# 重定向链防御性跟随的最大步数（自行走链同样防环，双保险）
 _MAX_CHAIN_STEPS = 10
 
 
@@ -82,6 +83,46 @@ class PriorContext:
         return format_prior_context(self.hits)
 
 
+# ---- 配置 -------------------------------------------------------------------
+
+
+@dataclass
+class PriorSettings:
+    """``[prior]`` 段的解析结果：注入开关与检索预算（缺省 = 开启 + 默认值）。"""
+
+    enabled: bool = True
+    k: int = DEFAULT_K
+    max_chars: int = DEFAULT_MAX_CHARS
+
+
+def prior_settings(config: Mapping[str, Any] | None) -> PriorSettings:
+    """解析 ``[prior]`` 段（enabled / top_k / max_chars）。
+
+    入参就是 [prior] 段本身（AgentLoop.prior_config，server 传
+    ``config.get("prior")``）；缺省或 None = enabled=true + 默认值（模块内
+    默认，不强制用户配置）；非法值回退默认（与 wiki_settings / dedup_settings
+    同风格）。
+    """
+    settings = PriorSettings()
+    section: Mapping[str, Any] = config if isinstance(config, Mapping) else {}
+    enabled = section.get("enabled")
+    if enabled is not None:
+        settings.enabled = bool(enabled)
+    top_k = section.get("top_k")
+    if top_k is not None:
+        try:
+            settings.k = max(1, int(top_k))
+        except (TypeError, ValueError):
+            settings.k = DEFAULT_K
+    max_chars = section.get("max_chars")
+    if max_chars is not None:
+        try:
+            settings.max_chars = max(0, int(max_chars))
+        except (TypeError, ValueError):
+            settings.max_chars = DEFAULT_MAX_CHARS
+    return settings
+
+
 # ---- 检索 -------------------------------------------------------------------
 
 
@@ -97,8 +138,8 @@ def retrieve_priors(
 
     - 检索排序沿用 ``index.search``（置信度/新鲜度调权），本层不重排；
       命中 merged/superseded 时取最终 active note（``SearchMatch.redirected_from``
-      指向被命中的旧 ID；若拿到的 note 仍是 merged/superseded 则防御性地
-      再走 ``store.follow_redirect``）。
+      指向被命中的旧 ID；若拿到的 note 仍是 merged/superseded，则防御性地
+      自行走链到最终 active——有界防环、不抛异常，走不到就丢弃该命中）。
     - 总上下文不超过 ``max_chars``：按分数从高到低装入，放不下的整条丢弃，
       末位命中可压缩正文到最低保留长度；被保留的 hits 才进入 ``PriorContext``。
     - 空 Wiki / 无命中 / 预算内一条也放不下 → 空 PriorContext，不抛异常。
@@ -126,10 +167,11 @@ def _collect_hits(matches: Sequence[SearchMatch], store: WikiStore) -> list[Prio
         if m.redirected_from:
             aliases.extend(_redirect_chain(store, m.redirected_from, note.id))
         if note.status != "active":
-            # 防御：索引快照过期等导致命中结果仍指向非 active 笔记时，
-            # 再走 store 的链式跟随；SearchMatch.note_id 也计入旧 ID。
-            final = store.follow_redirect(note.id)
-            if final is None or final.status != "active":
+            # 防御：索引快照过期等导致命中结果仍指向非 active 笔记时，自行走链
+            # 到最终 active。不调 store.follow_redirect——它在链成环时会 raise
+            # ValueError，这里保持"检索不抛异常"口径（走不到就丢弃该命中）。
+            final = _follow_to_active(store, note.id)
+            if final is None:
                 continue
             if final.id != note.id:
                 aliases.extend(_redirect_chain(store, note.id, final.id))
@@ -178,6 +220,31 @@ def _redirect_chain(store: WikiStore, alias_id: str, final_id: str) -> list[str]
             break
         current = target
     return chain
+
+
+def _follow_to_active(store: WikiStore, note_id: str) -> Note | None:
+    """沿 redirect 链走到最终 active 笔记（有界防环）；走不到返回 None，不抛异常。
+
+    与 ``_redirect_chain`` 同一套防御口径：visited 去重 + 步数上限；断裂、成环、
+    落点非 active 一律返回 None（调用方丢弃该命中）。与 ``store.follow_redirect``
+    的差别只在失败语义：这里返回 None 而不是 raise。
+    """
+    visited: set[str] = set()
+    current = note_id
+    for _ in range(_MAX_CHAIN_STEPS):
+        if current in visited:
+            return None  # 成环
+        visited.add(current)
+        note = store.get_note(current)
+        if note is None:
+            return None  # 断裂
+        if note.status == "active":
+            return note
+        target = note.meta.redirect_to if note.status == "merged" else note.meta.superseded_by
+        if not target:
+            return None  # 状态非 active 又没有跳转目标
+        current = target
+    return None  # 超过步数上限：按走不到处理
 
 
 def _fit_within_budget(hits: list[PriorHit], max_chars: int) -> list[PriorHit]:
@@ -278,9 +345,7 @@ def ensure_index_fresh(store: WikiStore, index: SearchIndex) -> tuple[bool, str]
     ``(True, 原因)``；新鲜返回 ``(False, 原因)``，不做任何写入。
     """
     store_status = {n.id: n.status for n in store.list_notes(status=None)}
-    # 包内私有访问：SearchIndex 未暴露 note_meta 只读接口，且本任务不得改 index.py
-    rows = index._conn.execute("SELECT note_id, status FROM note_meta").fetchall()
-    index_status = {str(r[0]): str(r[1] or "") for r in rows}
+    index_status = index.indexed_status()
     if store_status == index_status:
         return False, (
             f"索引与 store 一致（{len(store_status)} 条笔记，集合与 status 均相同），无需 rebuild"
