@@ -1270,3 +1270,109 @@ def test_public_time_helper_keeps_lenient_parsing() -> None:
     assert fr.parse_ts("") is None
     assert fr.parse_ts(True) is None
     assert fr.parse_ts(None) is None
+
+
+# ---- 修复轮 3/5：判官越权拦截（结构性不变量）--------------------------------
+
+
+def test_guard_is_machine_readable_on_entity_shortfall() -> None:
+    """①护栏触发时 guard / judge_verdict 机器可读（接线层不必匹配中文理由）。"""
+    judge, calls = counting_judge(None)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", observed_at=LATER, entities=["Qwen-3"]),
+        judge=judge,
+    )
+    assert len(calls) == 1
+    assert result.guard == vf.GUARD_ENTITIES_DISJOINT
+    assert result.judge_verdict is None  # 判官没给合法 verdict
+    payload = json.loads(json.dumps(result.to_dict(), ensure_ascii=False))
+    assert payload["guard"] == "entities_disjoint"
+    assert payload["judge_verdict"] is None
+
+
+def test_guard_rejects_judge_override_to_newer() -> None:
+    """②护栏触发 + judge 返回 newer → 最终 uncertain / none，judge_verdict 仍可读。
+
+    判官给出的覆盖动作（新证据更晚 → supersede）在主体同一性未确认时被结构性拒绝：
+    最终判定保持 uncertain、建议动作 none（memory_update 层据此不会写盘），
+    但"判官说了什么"完整留痕（判官越权拦截，修复轮 3/5）。
+    """
+    judge, calls = counting_judge(vf.VERDICT_NEWER)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", observed_at=LATER, entities=["Qwen-3"]),
+        judge=judge,
+    )
+    assert len(calls) == 1
+    assert result.guard == vf.GUARD_ENTITIES_DISJOINT
+    assert result.judge_verdict == vf.VERDICT_NEWER  # 原始 verdict 可读
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.judge_used is True
+    joined = "\n".join(result.reasons)
+    assert "判官建议被护栏拒绝" in joined
+    assert "保持 uncertain" in joined
+    # 不得再出现"最终判定 newer"这类结句（判官建议没被采纳）
+    assert "→ 最终判定 newer" not in joined
+    assert result.reasons[-1].endswith("→ uncertain（建议人工或语义判官复核，本轮不做动作）")
+
+
+@pytest.mark.parametrize(
+    "rejected",
+    [vf.VERDICT_NEWER, vf.VERDICT_MORE_SPECIFIC, vf.VERDICT_CONSISTENT],
+)
+def test_guard_rejects_every_non_conservative_judge_verdict(rejected: str) -> None:
+    """护栏只放行 conflicting / uncertain：三个非保守判定一律被拒（覆盖动作 + 假一致）。"""
+    judge, _ = counting_judge(rejected)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", entities=["Qwen-3"]),
+        judge=judge,
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.judge_verdict == rejected
+
+
+def test_guard_allows_judge_conflicting() -> None:
+    """③护栏触发 + judge 返回 conflicting → 允许（保守动作 open_conflict）。"""
+    judge, calls = counting_judge(vf.VERDICT_CONFLICTING)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", entities=["Qwen-3"]),
+        judge=judge,
+    )
+    assert len(calls) == 1
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert result.suggested_action == vf.ACTION_OPEN_CONFLICT
+    assert result.judge_verdict == vf.VERDICT_CONFLICTING
+    assert result.guard == vf.GUARD_ENTITIES_DISJOINT
+    assert "判官建议被护栏拒绝" not in "\n".join(result.reasons)
+
+
+def test_no_guard_keeps_judge_behaviour_unchanged() -> None:
+    """④无护栏时判官行为逐字段不变（回归）：newer 照常采纳，guard 恒 None。"""
+    judge, calls = counting_judge(vf.VERDICT_NEWER)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert len(calls) == 1
+    assert result.guard is None
+    assert result.judge_verdict == vf.VERDICT_NEWER
+    assert result.verdict == vf.VERDICT_NEWER
+    assert result.suggested_action == vf.ACTION_SUPERSEDE
+    assert vf.CONSERVATIVE_VERDICTS == (vf.VERDICT_CONFLICTING, vf.VERDICT_UNCERTAIN)
+
+
+def test_deterministic_paths_leave_guard_and_judge_verdict_none() -> None:
+    """judge=None 的确定性路径：guard / judge_verdict 恒 None（不误报护栏）。"""
+    conflict = vf.compare_prior_and_evidence(
+        make_note(body="共 3 个模型"), evi("共 5 个模型")
+    )
+    assert conflict.verdict == vf.VERDICT_CONFLICTING
+    assert conflict.guard is None and conflict.judge_verdict is None
+    consistent = vf.compare_prior_and_evidence(
+        make_note(body="项目使用 uv 管理依赖。"), evi("项目使用 uv 管理依赖。")
+    )
+    assert consistent.verdict == vf.VERDICT_CONSISTENT
+    assert consistent.guard is None and consistent.judge_verdict is None

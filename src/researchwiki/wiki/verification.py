@@ -80,6 +80,29 @@ judge 注入约束（逐条可测）
   reasons；异常被吞掉，确定性链路不受影响（判定模块不因模型侧故障而失败）。
 - ``EvidenceComparison.judge_used`` 记录是否调用过（研究用成本核算）。
 
+判官越权拦截（修复轮 3/5，结构性不变量）
+--------------------------------------
+
+**问题**：``judge`` 原先的唯一拒绝条件是 ``verdict not in VERDICTS``，而
+``VERDICT_ACTIONS`` 把 ``newer→supersede``、``more_specific→merge``——即判官可以
+改判出**确定性护栏刚刚拒绝过的覆盖动作**（护栏触发的场景下，判官一句
+``newer`` 就能让它变成 "建议 supersede"）。更糟的是模块只暴露 ``judge_used``，
+接线层无法机器可读地知道"护栏已触发"，只能去匹配中文 reasons（脆弱）。
+
+**不变量**（本模块内约束，不靠接线层自觉）：
+
+- ``EvidenceComparison.guard``：机器可读的护栏标记（当前只有
+  ``"entities_disjoint"``；无护栏为 ``None``）。
+- ``EvidenceComparison.judge_verdict``：判官给出的**原始** verdict（未调用判官或
+  判官未给出合法值时为 ``None``）——即使该 verdict 被护栏拒绝，原始值仍可读，
+  接线层与评测都不必去匹配中文理由。
+- 护栏触发时 ``_finish_uncertain`` 把 allowlist 收窄到 ``CONSERVATIVE_VERDICTS``
+  （``conflicting`` / ``uncertain``）：判官返回 ``newer`` / ``more_specific`` /
+  ``consistent`` 一律**不采纳**（最终 verdict 保持 ``uncertain``、动作 ``none``），
+  reasons 写明"判官建议被护栏拒绝"。无护栏时判官行为逐字段不变（回归）。
+  方向选择与护栏本身一致：主体同一性未确认时，宁可少一次自动判定，不可多一次
+  静默覆盖。
+
 冲突槽位识别规则（纯函数，逐条可测）
 ------------------------------------
 
@@ -171,6 +194,15 @@ VERDICTS: tuple[str, ...] = (
     VERDICT_CONFLICTING,
     VERDICT_UNCERTAIN,
 )
+# 护栏触发时**判官**允许产出的保守判定（修复轮 3/5 的判官越权拦截）：
+# conflicting / uncertain 都不产生覆盖动作（开台账 / 不做动作），是主体同一性未
+# 确认时唯一可放行的两类；newer / more_specific / consistent 都会被拒（前者建议
+# supersede / merge，后者宣称"仍然成立"——都是需要主体同一性的判定）。
+CONSERVATIVE_VERDICTS: tuple[str, ...] = (VERDICT_CONFLICTING, VERDICT_UNCERTAIN)
+
+# 护栏名（EvidenceComparison.guard）：实体护栏是当前唯一的护栏，取值即"护栏名"本身，
+# 供接线层机器可读地复核（memory_update.py 按 guard 非 None 拒绝 supersede/merge）。
+GUARD_ENTITIES_DISJOINT = "entities_disjoint"
 
 ACTION_REFRESH_REVIEWED_AT = "refresh_reviewed_at"
 ACTION_SUPERSEDE = "supersede"
@@ -337,7 +369,7 @@ class SlotScan:
 
 @dataclass
 class EvidenceComparison:
-    """一条旧记忆 vs 一条新证据的判定结论（六个简报字段 + 四个审计字段）。
+    """一条旧记忆 vs 一条新证据的判定结论（六个简报字段 + 六个审计字段）。
 
     - ``verdict``：五类之一（VERDICTS）。
     - ``reasons``：人类可读判定依据，每条引用具体值（时间戳、hash 前 8 位、令牌
@@ -349,6 +381,10 @@ class EvidenceComparison:
       字段清单但只增不改语义）——相似度数值、命中的冲突槽位（P2-D 写台账时引用具体
       取值）、是否调用过语义判官（成本核算）、来源侧全量 hash 留痕（理由里只有 8 位
       截断，碰撞时字面相同）。
+    - ``guard`` / ``judge_verdict``（修复轮 3/5）：机器可读的安全不变量字段——
+      前者是触发的护栏名（``None`` = 无护栏），后者是判官给出的**原始** verdict
+      （``None`` = 未调用或未给出合法值）。护栏触发时判官只能产出保守判定，
+      被拒的原始值仍从这里可读（详见模块 docstring「判官越权拦截」）。
     """
 
     verdict: str
@@ -360,11 +396,15 @@ class EvidenceComparison:
     conflicts: list[SlotConflict] = field(default_factory=list)
     judge_used: bool = False
     source: SourceComparison | None = None
+    guard: str | None = None
+    judge_verdict: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """序列化（留痕 / lint --json / MCP 复用；reasons 原样保留）。
 
-        ``source`` 带**完整**新旧 content_hash（理由里只有前 8 位截断），供台账复算。
+        ``source`` 带**完整**新旧 content_hash（理由里只有前 8 位截断），供台账复算；
+        ``guard`` / ``judge_verdict`` 是护栏与判官的机器可读留痕（接线层按它们
+        复核动作，不必匹配中文 reasons）。
         """
         return {
             "prior_note_id": self.prior_note_id,
@@ -373,6 +413,8 @@ class EvidenceComparison:
             "suggested_action": self.suggested_action,
             "similarity": self.similarity,
             "judge_used": self.judge_used,
+            "guard": self.guard,
+            "judge_verdict": self.judge_verdict,
             "reasons": list(self.reasons),
             "conflicts": [c.to_dict() for c in self.conflicts],
             "source": self.source.to_dict() if self.source is not None else None,
@@ -831,6 +873,7 @@ def compare_prior_and_evidence(
             judge=judge,
             blockers="实体不交，无法确认主体同一性 → 不做更新判定"
             "（不判 newer / consistent / 更具体，也不据此开冲突台账）",
+            guard=GUARD_ENTITIES_DISJOINT,
         )
     if scan.conflicts:
         reasons.append(
@@ -1029,8 +1072,15 @@ def _make(
     conflicts: Sequence[SlotConflict] = (),
     judge_used: bool = False,
     source: SourceComparison | None = None,
+    guard: str | None = None,
+    judge_verdict: str | None = None,
 ) -> EvidenceComparison:
-    """按 verdict 组装结论（动作查 VERDICT_ACTIONS 表；reasons 就地共享同一列表）。"""
+    """按 verdict 组装结论（动作查 VERDICT_ACTIONS 表；reasons 就地共享同一列表）。
+
+    ``guard`` / ``judge_verdict`` 是机器可读的安全留痕（见模块 docstring
+    「判官越权拦截」）：前者记录触发的护栏名，后者记录判官给出的**原始** verdict
+    （即使它被护栏拒绝也照样可读）。
+    """
     return EvidenceComparison(
         verdict=verdict,
         reasons=reasons,
@@ -1041,6 +1091,8 @@ def _make(
         conflicts=list(conflicts),
         judge_used=judge_used,
         source=source,
+        guard=guard,
+        judge_verdict=judge_verdict,
     )
 
 
@@ -1073,18 +1125,34 @@ def _finish_uncertain(
     source: SourceComparison | None,
     judge: Callable[[Note, EvidenceItem], str | None] | None,
     blockers: str,
+    guard: str | None = None,
 ) -> EvidenceComparison:
     """兜底出口（规则 6 与"实体不交"全局短路共用）：默认 uncertain，judge 可改判。
 
     ``blockers`` 是"为什么确定性判据不足"的一句（引用具体值）；结句按**最终**判定
     生成——判官改判后不能再留一句"→ uncertain"与 verdict 自相牵制（修复轮 1/5 Minor c）。
     judge=None 时本函数是纯确定性路径（uncertain / none）。
+
+    ``guard`` 非 None 时判官的 allowlist 收窄到 ``CONSERVATIVE_VERDICTS``（修复轮
+    3/5 的判官越权拦截）：判官给出的覆盖动作（newer / more_specific / consistent）
+    不采纳，最终 verdict 保持 uncertain / none，但 ``judge_verdict`` 仍记录原始值
+    ——接线层不必匹配中文 reasons 就能看出"判官想覆盖、护栏拦住了"。
     """
     judge_used = judge is not None
     verdict = VERDICT_UNCERTAIN
+    judge_verdict: str | None = None
     if judge is not None:
-        judged = _apply_judge(judge, prior, evidence, reasons)
-        if judged is not None:
+        allowed = CONSERVATIVE_VERDICTS if guard is not None else VERDICTS
+        judged, accepted = _apply_judge(
+            judge,
+            prior,
+            evidence,
+            reasons,
+            allowed_verdicts=allowed,
+            guard=guard,
+        )
+        judge_verdict = judged
+        if accepted and judged is not None:
             verdict = judged
     if verdict == VERDICT_UNCERTAIN:
         reasons.append(f"{blockers} → uncertain（建议人工或语义判官复核，本轮不做动作）")
@@ -1101,6 +1169,8 @@ def _finish_uncertain(
         similarity=similarity,
         judge_used=judge_used,
         source=source,
+        guard=guard,
+        judge_verdict=judge_verdict,
     )
 
 
@@ -1109,8 +1179,18 @@ def _apply_judge(
     prior: Note,
     evidence: EvidenceItem,
     reasons: list[str],
-) -> str | None:
-    """调用语义判官（**仅在 uncertain 路径**）；返回合法 verdict 或 None（保持 uncertain）。"""
+    *,
+    allowed_verdicts: Sequence[str] = VERDICTS,
+    guard: str | None = None,
+) -> tuple[str | None, bool]:
+    """调用语义判官（**仅在 uncertain 路径**）；返回 ``(原始 verdict | None, 是否采纳)``。
+
+    返回原始 verdict 而不是"采纳后的判定"，是修复轮 3/5 的接口选择：护栏拒绝判官
+    建议时，调用方仍需要把**判官说了什么**记进 ``judge_verdict``，否则接线层只能去
+    匹配中文 reasons 才知道护栏拦过一次（脆弱）。第二项 False 表示"判官给了合法
+    verdict 但不被允许采纳"（护栏触发），与"判官没给（None/非法/异常）"区分开。
+    两种情况下 reasons 都写明了原因，确定性链路都不受影响。
+    """
     try:
         raw = judge(prior, evidence)
     except Exception as exc:
@@ -1118,21 +1198,31 @@ def _apply_judge(
             f"语义判官调用失败（{type(exc).__name__}: {exc}）→ 保持 uncertain"
             "（确定性判定不受模型侧故障影响）"
         )
-        return None
+        return None, False
     if raw is None:
         reasons.append("语义判官未给出判定（返回 None）→ 保持 uncertain")
-        return None
+        return None, False
     verdict = str(raw).strip().lower()
     if verdict not in VERDICTS:
         reasons.append(
             f"语义判官返回「{raw}」不是合法判定（合法值：{'/'.join(VERDICTS)}）→ 保持 uncertain"
         )
-        return None
+        return None, False
+    if verdict not in allowed_verdicts:
+        # 判官越权拦截：护栏触发时只允许保守判定（模块 docstring「判官越权拦截」）。
+        # 不采纳、不落可疑判定，但把原始 verdict 原样返回给调用方留痕。
+        reasons.append(
+            f"语义判官判定 {verdict}（建议动作 {VERDICT_ACTIONS[verdict]}），"
+            f"但护栏「{guard}」触发时只允许保守判定"
+            f"（{'/'.join(allowed_verdicts)}）→ 判官建议被护栏拒绝，保持 uncertain"
+            "（主体同一性未确认时不得放行覆盖/一致判定）"
+        )
+        return verdict, False
     reasons.append(
         f"语义判官判定 {verdict}（仅在确定性判据不足时调用；"
         f"建议动作 {VERDICT_ACTIONS[verdict]}）"
     )
-    return verdict
+    return verdict, True
 
 
 def _match_source_ref(prior: Note, evidence: EvidenceItem) -> SourceRef | None:
@@ -1187,10 +1277,12 @@ __all__ = [
     "ACTION_OPEN_CONFLICT",
     "ACTION_REFRESH_REVIEWED_AT",
     "ACTION_SUPERSEDE",
+    "CONSERVATIVE_VERDICTS",
     "DEFAULT_CONSISTENT_SIMILARITY",
     "DEFAULT_CONTEXT_CHARS",
     "DEFAULT_SIMILARITY_DIM",
     "DEFAULT_SIMILARITY_FLOOR",
+    "GUARD_ENTITIES_DISJOINT",
     "VERDICTS",
     "VERDICT_ACTIONS",
     "VERDICT_CONFLICTING",
