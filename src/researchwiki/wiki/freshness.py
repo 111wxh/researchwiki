@@ -14,7 +14,9 @@ valid_from / valid_until / kind）+ 一个"现在"的时刻，输出一个 ``Fre
 2. **显式有效期优先**：``valid_until`` 存在且 ``now > valid_until`` → 直接
    ``stale``（**不看 volatility 衰减**）；``valid_from`` 存在且
    ``now < valid_from`` → "尚未生效"，state ``review_due``（不判 fresh）。两个
-   字段写了但不是合法 ISO 时不报错，按"未声明"处理并在理由里说明。
+   字段写了但不是合法 ISO 时不报错，按"未声明"处理并在理由里说明。有效期已经
+   定论时若同时缺时间基准，理由只写"无时间基准……不影响有效期判定"，不写
+   "建议人工确认"——有效期判定不需要年龄基准，两种提示同时出现会自相牵制。
 3. **volatility 衰减**：``stable`` 不衰减（``decay`` 恒 1.0、``half_life_days``
    为 None，state 恒 ``fresh``，除非命中规则 2 或规则 1 的"缺基准"）；
    ``drifting`` / ``volatile`` 按半衰期指数衰减 ``decay = 0.5 ** (age / half)``，
@@ -38,6 +40,10 @@ valid_from / valid_until / kind）+ 一个"现在"的时刻，输出一个 ``Fre
 
 其它约定：
 
+- **配置**：``from_config`` 读 ``[freshness]`` 段（也接受完整 config，自动取段）；
+  半衰期按 ``DEFAULT_HALF_LIFE_DAYS`` → ``[wiki].half_life_days``（项目既有配置位，
+  检索层 ``index.wiki_settings`` 读的同一张表）→ ``[freshness].half_life_days``
+  逐键合并，保证配置态下 decay 与 freshness_factor 仍同口径。
 - **零网络、零模型调用、全确定性**：同一 (note, now, settings) 恒得同一结果。
 - **时钟可注入**：``now`` 缺省 ``datetime.now(UTC)``；传入的 naive 时间按 UTC 解释。
 - 本模块只回答"该不该复核/该怎么看待"，**不**检索过滤、**不**写盘、**不**改
@@ -204,15 +210,27 @@ def from_config(config: Mapping[str, Any] | None = None) -> FreshnessSettings:
         [freshness.user]          # 按 kind 覆盖（键名不是已知参数时即视为 kind 段）
         review_due_ratio = 0.7
 
-    half_life_days 与 index.wiki_settings 同策略：在默认表上 merge（只写 volatile
-    时 drifting 的默认值保留）。per_kind 段缺省为空 = 默认不区分 kind。
+    半衰期的取值优先级（逐 volatility 键合并，与 index.wiki_settings 读 ``[wiki]``
+    的同一张表）：``DEFAULT_HALF_LIFE_DAYS`` → ``[wiki].half_life_days`` →
+    ``[freshness].half_life_days``。**回退读 ``[wiki]`` 段是必要的**——项目既有的
+    半衰期配置就在那里（config.toml 的 ``[wiki] half_life_days``，检索层
+    ``index.wiki_settings`` 正是读它）：若本函数只认 ``[freshness]``，用户改
+    ``[wiki]`` 会只改检索打分、freshness 判定仍用默认 30/90，"decay 与
+    freshness_factor 口径一致"就在配置态静默失效。只给 ``[wiki]`` 时按它算
+    （有测试锁定），两段都给时 ``[freshness]`` 的同名键优先、``[wiki]`` 独有的键
+    继续生效。per_kind 段缺省为空 = 默认不区分 kind。
     """
     section: Mapping[str, Any] = {}
+    wiki_section: Mapping[str, Any] = {}
     if isinstance(config, Mapping):
         raw = config.get("freshness")
         section = raw if isinstance(raw, Mapping) else config
+        wiki_raw = config.get("wiki")
+        wiki_section = wiki_raw if isinstance(wiki_raw, Mapping) else {}
     known = {"half_life_days", "review_due_ratio", "stale_ratio"}
     half_life = dict(DEFAULT_HALF_LIFE_DAYS)
+    # 先 wiki（项目既有配置位）再 freshness（本模块专属段，优先）
+    half_life.update(_half_life_overrides(wiki_section.get("half_life_days")))
     half_life.update(_half_life_overrides(section.get("half_life_days")))
     return FreshnessSettings(
         half_life_days=half_life,
@@ -308,19 +326,29 @@ def evaluate_freshness(
 
     # 基准时间与年龄（规则 1）
     base_field, base_ts = _resolve_base_time(meta)
-    if base_ts is None:
-        age_days = 0.0
-        reasons.append(
-            "缺少时间基准（observed_at 与 created 均缺失或不可解析）"
-            "，年龄按 0.0 天计，建议人工确认"
-        )
-    else:
+    if base_ts is not None:
         age_days = max(0.0, (moment - base_ts).total_seconds() / 86400.0)
         reasons.append(f"时间基准 {base_field}（{base_ts.isoformat()}），年龄 {age_days:.1f} 天")
+    else:
+        age_days = 0.0
 
     # 显式有效期（规则 2）：先记录不可解析的写法，再判两个方向
     valid_from = _parse_ts(meta.valid_from)
     valid_until = _parse_ts(meta.valid_until)
+    expired = valid_until is not None and moment > valid_until
+    not_yet = valid_from is not None and moment < valid_from
+    if base_ts is None:
+        # 缺基准的提示按"规则 2 是否命中"分两种措辞：有效期已能定论时再说
+        # "建议人工确认"会与判定行自相牵制（有效期判定不需要年龄基准）
+        if expired or not_yet:
+            reasons.append(
+                "无时间基准（observed_at 与 created 均缺失或不可解析），不影响有效期判定"
+            )
+        else:
+            reasons.append(
+                "缺少时间基准（observed_at 与 created 均缺失或不可解析）"
+                "，年龄按 0.0 天计，建议人工确认"
+            )
     for field_name, raw, parsed in (
         ("valid_from", meta.valid_from, valid_from),
         ("valid_until", meta.valid_until, valid_until),
@@ -338,7 +366,7 @@ def evaluate_freshness(
             f"年龄 {age_days:.1f} 天 → decay {decay:.3f}"
         )
 
-    # 规则 2：显式失效 / 显式未生效，优先于 volatility 衰减
+    # 规则 2：显式失效 / 显式未生效，优先于 volatility 衰减与"缺基准"
     if valid_until is not None and moment > valid_until:
         reasons.append(
             f"valid_until={valid_until.isoformat()} 已过期"

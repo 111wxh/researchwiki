@@ -21,7 +21,7 @@ import pytest
 from researchwiki.wiki import freshness as fr
 from researchwiki.wiki.frontmatter import NoteMeta, dump, parse
 from researchwiki.wiki.index import DEFAULT_HALF_LIFE_DAYS as INDEX_HALF_LIFE_DAYS
-from researchwiki.wiki.index import freshness_factor
+from researchwiki.wiki.index import freshness_factor, wiki_settings
 from researchwiki.wiki.store import Note, WikiStore
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -270,6 +270,60 @@ def test_valid_until_beats_valid_from_when_both_decide() -> None:
         now=NOW,
     )
     assert result.state == fr.FRESHNESS_STALE
+
+
+@pytest.mark.parametrize(
+    ("window", "state"),
+    [
+        ({"valid_until": "expired"}, fr.FRESHNESS_STALE),
+        ({"valid_from": "future"}, fr.FRESHNESS_REVIEW_DUE),
+        ({}, fr.FRESHNESS_REVIEW_DUE),
+    ],
+)
+def test_expiry_rules_beat_missing_base(window: dict[str, str], state: str) -> None:
+    """规则 2 命中时优先于"缺基准"（R1 → R2 的优先级由此锁定）。
+
+    - 过期的 valid_until + 无基准 → stale（有效期不需要年龄基准）；
+    - 未到的 valid_from + 无基准 → review_due（同上）；
+    - 两者都没有 + 无基准 → review_due，且带"建议人工确认"提示。
+    前两种情况下理由里不得再出现"建议人工确认"（否则与判定行自相牵制）。
+    """
+    window_values = {
+        "expired": (NOW - timedelta(days=1)).isoformat(),
+        "future": (NOW + timedelta(days=7)).isoformat(),
+    }
+    kwargs = {key: window_values[value] for key, value in window.items()}
+    result = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=None, observed_at=None, created="", **kwargs),
+        now=NOW,
+    )
+    assert result.state == state
+    assert result.age_days == 0.0 and result.decay == 1.0
+    assert result.half_life_days == 30.0
+    if window:
+        assert any("无时间基准" in r and "不影响有效期判定" in r for r in result.reasons)
+        assert not any("建议人工确认" in r for r in result.reasons)
+        assert not any("缺少时间基准 → review_due" in r for r in result.reasons)
+    else:
+        assert any("建议人工确认" in r for r in result.reasons)
+    if "valid_until" in kwargs:
+        assert any("已过期" in r and "→ stale" in r for r in result.reasons)
+    if "valid_from" in kwargs:
+        assert any("未到生效时间" in r and "→ review_due" in r for r in result.reasons)
+
+
+def test_expired_with_base_does_not_advise_manual_review_base() -> None:
+    """有基准时过期判定同样不夹带缺基准提示（只有有效期判定行）。"""
+    result = fr.evaluate_freshness(
+        make_note(
+            volatility="volatile", age_days=10.0,
+            valid_until=(NOW - timedelta(days=1)).isoformat(),
+        ),
+        now=NOW,
+    )
+    assert result.state == fr.FRESHNESS_STALE
+    assert any("时间基准 observed_at" in r for r in result.reasons)
+    assert not any("建议人工确认" in r or "无时间基准" in r for r in result.reasons)
 
 
 def test_valid_window_unparseable_is_treated_as_declared_nothing() -> None:
@@ -586,6 +640,59 @@ def test_from_config_defaults_and_tolerance() -> None:
     # 布尔不算数值（bool 是 int 子类，必须排除）
     booleans = fr.FreshnessSettings(review_due_ratio=True)
     assert booleans.review_due_ratio == fr.DEFAULT_REVIEW_DUE_RATIO
+
+
+def test_from_config_reads_wiki_half_life_fallback() -> None:
+    """只给项目既有的 [wiki].half_life_days 时，freshness 必须用它（不能退回默认 30/90）。"""
+    config = {
+        "wiki": {"fts_tokenizer": "trigram", "half_life_days": {"volatile": 15, "drifting": 45}}
+    }
+    settings = fr.from_config(config)
+    assert settings.half_life_days == {"volatile": 15.0, "drifting": 45.0}
+    # 判定确实按 [wiki] 的半衰期算：volatile 15 天 = 恰好一个半衰期
+    state = fr.evaluate_freshness(
+        make_note(volatility="volatile", age_days=15.0), now=NOW, settings=settings
+    )
+    assert state.half_life_days == 15.0
+    assert state.decay == pytest.approx(0.5)
+    assert state.state == fr.FRESHNESS_REVIEW_DUE
+
+
+def test_from_config_freshness_section_wins_over_wiki() -> None:
+    """两段都给时 [freshness] 优先；[wiki] 独有的键继续生效（逐键合并）。"""
+    config = {
+        "wiki": {"half_life_days": {"volatile": 15, "drifting": 45}},
+        "freshness": {"half_life_days": {"volatile": 20}, "review_due_ratio": 0.6},
+    }
+    settings = fr.from_config(config)
+    assert settings.half_life_days == {"volatile": 20.0, "drifting": 45.0}
+    assert settings.review_due_ratio == 0.6
+    # 两段都没写的 volatility 仍用默认表
+    assert fr.from_config({"wiki": {"half_life_days": {"volatile": 1}}}).half_life_days == {
+        "volatile": 1.0,
+        "drifting": 90.0,
+    }
+
+
+def test_from_config_half_life_matches_index_wiki_settings() -> None:
+    """配置态口径一致：同一份 config，freshness 的 decay 与按 [wiki] 半衰期算的
+    index.freshness_factor 逐点一致（防"配置态静默漂移"）。"""
+    config = {"wiki": {"half_life_days": {"volatile": 7, "drifting": 14}}}
+    settings = fr.from_config(config)
+    index_settings = wiki_settings(config)
+    assert settings.half_life_days == index_settings.half_life_days
+    for volatility in ("stable", "drifting", "volatile"):
+        for age in (0.0, 7.0, 14.0, 60.0):
+            note = make_note(volatility=volatility, age_days=age)
+            state = fr.evaluate_freshness(note, now=NOW, settings=settings)
+            expected = freshness_factor(
+                volatility,
+                note.meta.observed_at,
+                note.meta.created,
+                half_life_days=index_settings.half_life_days,
+                now=NOW,
+            )
+            assert state.decay == pytest.approx(expected), (volatility, age)
 
 
 # ---- 字段读写（frontmatter / store round-trip） -------------------------------
