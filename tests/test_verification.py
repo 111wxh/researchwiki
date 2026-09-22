@@ -913,3 +913,255 @@ def test_compare_batch_judge_call_count_matches_uncertain_items() -> None:
         vf.VERDICT_UNCERTAIN,
     ]
     assert [r.judge_used for r in results] == [False, True, False]
+
+
+# ---- 修复轮 1/5：Critical（一致判据改槽位级）--------------------------------
+
+
+SWAPPED_PRIOR = "上下文窗口 128k，参数量 70B。"
+SWAPPED_EVIDENCE = "上下文窗口 70B，参数量 128k。"
+
+
+def test_critical_swapped_values_is_not_consistent() -> None:
+    """Critical 复现用例：取值错位互换不得判 consistent。
+
+    旧 `上下文窗口 128k，参数量 70B` 对新 `上下文窗口 70B，参数量 128k`：两侧用到的
+    (kind, value) 集合完全相同、相似度 0.946、无槽位冲突，集合级检查会判"仍然成立"。
+    实际 verdict = uncertain（action=none）——这才是正确的：两个槽位在两份文本间
+    根本建立不起对应关系（旧 `number:k:上下文窗口` 在证据里变成 `number:b:上下文窗口`、
+    旧 `number:b:参数量` 变成 `number:k:参数量`），既不能说"取值没变"（一致），也不能
+    说"同一个槽位上无法同时成立"（冲突只对得上槽位时才成立）——这正是"来源换版时
+    表格列序/标签错位"的形态，交人工/判官复核是正确的方向。
+    """
+    result = vf.compare_prior_and_evidence(make_note(body=SWAPPED_PRIOR), evi(SWAPPED_EVIDENCE))
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.verdict != vf.VERDICT_CONSISTENT
+    assert result.similarity > 0.9  # 字面极像，所以"看起来没变"最危险
+    assert result.conflicts == []  # 槽位键都对不上，冲突门本就命中不了
+    joined = "\n".join(result.reasons)
+    assert "一致判定被保留" in joined
+    assert "槽位级取值对不上" in joined
+    assert "number:k:上下文窗口=128" in joined and "number:b:上下文窗口=70" in joined
+
+
+def test_slot_level_agreement_pure_function() -> None:
+    """槽位级一致判据（`scan_slots(...).slots_agree`）的四个边界。"""
+    # 逐槽位同值 → 一致
+    assert vf.scan_slots("共 3 个模型。", "共 3 个模型。").slots_agree is True
+    # 错位互换 → 不一致（集合级看不见）
+    assert vf.scan_slots(SWAPPED_PRIOR, SWAPPED_EVIDENCE).slots_agree is False
+    # 证据多出一个可比槽位（该取值在旧文里也出现过）→ 不一致
+    assert vf.scan_slots("参数量 128k。", "参数量 128k，上下文窗口 128k。").slots_agree is False
+    # 两侧都抽不到可比令牌 → 恒等（无可比事实即无可反驳）
+    assert vf.scan_slots("用户偏好中文回答。", "用户喜欢用中文交流。").slots_agree is True
+
+
+def test_same_slot_same_value_still_consistent() -> None:
+    """Critical 修复不得把正常的"同槽位同值"重述赶出 consistent。"""
+    body = "共 3 个模型，上下文窗口 128k。"
+    result = vf.compare_prior_and_evidence(make_note(body=body), evi(body))
+    assert result.verdict == vf.VERDICT_CONSISTENT
+    assert result.suggested_action == vf.ACTION_REFRESH_REVIEWED_AT
+    assert vf.scan_slots(body, body).slots_agree is True
+
+
+def test_swapped_values_with_later_time_is_not_consistent() -> None:
+    """错位互换 + 时间更晚：不判 consistent；时间规则给 newer（supersede 保留旧版本）。
+
+    为什么这里 newer 可以接受：时间确实更晚，而"取值错位"只能说明两边对不上号，
+    不能说明新证据错了；按 PLAN"历史版本永不删除"的口径，supersede 会把旧记忆整条
+    留档（旧 ID 仍可读），审计链完整。真正不能接受的是 consistent（＝断言仍然成立）
+    ——那才会让错位的事实静默留在"当前事实"里。
+    """
+    result = vf.compare_prior_and_evidence(
+        make_note(body=SWAPPED_PRIOR), evi(SWAPPED_EVIDENCE, observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert result.verdict != vf.VERDICT_CONSISTENT
+    assert "一致判定被保留" in "\n".join(result.reasons)
+
+
+# ---- 修复轮 1/5：Important（实体护栏纳入冲突门）----------------------------
+
+
+def test_entity_disjoint_skips_conflict_gate() -> None:
+    """Important 复现用例：两侧实体不交时不得判 conflicting。
+
+    旧「模型 A 参数 70B。」(entities=["GLM-5.3"]) 对新「模型 B 参数 128B。」
+    (entities=["Qwen-3"])：槽位键里不含主语，`number:b:参数` 同槽位不同值看似冲突，
+    但两个句子说的是两个模型。判 conflicting 会直接产出 open_conflict、污染冲突台账
+    与评测冲突计数，所以这里跳过冲突判定 → 实际 verdict = uncertain（交人工/判官）。
+    """
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", entities=["Qwen-3"]),
+    )
+    assert result.verdict != vf.VERDICT_CONFLICTING
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.conflicts == []
+    joined = "\n".join(result.reasons)
+    assert "两侧实体不交（旧=glm-5-3；新=qwen-3）→ 跳过冲突判定" in joined
+    assert "冲突检测命中" not in joined
+
+
+def test_entity_overlap_keeps_conflict_gate() -> None:
+    """同一对文本 + 实体相交 → 冲突门照常命中（证明跳过是实体信号触发的）。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。", entities=["GLM-5.3"]),
+        evi("模型 B 参数 128B。", entities=["glm-5-3", "qwen-3"]),
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert any("冲突检测命中" in reason for reason in result.reasons)
+
+
+def test_missing_entities_keep_conflict_gate() -> None:
+    """任一侧实体为空 = 无从判断主语 → 护栏不生效，冲突门照常。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 参数 70B。"), evi("模型 B 参数 128B。")
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert any("冲突检测命中" in reason for reason in result.reasons)
+
+
+def test_entity_disjoint_still_newer_when_source_changed() -> None:
+    """实体护栏只作用于冲突门：来源换版（规则 2）不受影响。"""
+    result = vf.compare_prior_and_evidence(
+        source_url_note(entities=["GLM-5.3"], source_changed_at="2026-08-01T00:00:00+00:00"),
+        evi(
+            "模型 B 的上下文窗口是 128k，另有 256k 可选。",
+            source_url=URL,
+            content_hash=HASH_NEW,
+            entities=["Qwen-3"],
+        ),
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert any("来源变化" in reason for reason in result.reasons)
+
+
+# ---- 修复轮 1/5：随修（Minor a–e）------------------------------------------
+
+
+def test_similarity_calibration_samples_are_locked() -> None:
+    """标定样例实测值锁定（可复算产物；报告 §9.2 的区间以本断言为准）。
+
+    `consistent_similarity=0.8` 是经验阈值，必须能用固定样例复算：同一句话 = 1.0；
+    "只换一个数值"的改写落在 0.68–0.95（几乎都在 0.8 之上，所以"换数值"要靠冲突门
+    而不是相似度阈值兜住，见下一个用例）；语义相近但换说法 ≈ 0.35；不相关 ≈ 0.08。
+    数值改动会让本断言失败——那是提醒重新标定，不是允许放宽。
+    """
+    samples = {
+        ("项目使用 uv 管理依赖，Python 3.12。", "项目使用 uv 管理依赖，Python 3.12。"): 1.0,
+        ("该系列有 3 个版本。", "该系列有 4 个版本。"): 0.9259,
+        ("支持 30% 的折扣。", "支持 20% 的折扣。"): 0.8828,
+        ("发布于 2026-08。", "发布于 2026-09。"): 0.8889,
+        ("共 3 个模型。", "共 5 个模型。"): 0.8293,
+        ("上下文窗口 128k。", "上下文窗口 256k。"): 0.7009,
+        ("GLM-5.3 的上下文窗口是 128k。", "GLM-4.5 的上下文窗口是 64k。"): 0.6844,
+        (SWAPPED_PRIOR, SWAPPED_EVIDENCE): 0.9459,
+        ("用户偏好中文回答。", "用户喜欢用中文交流。"): 0.3504,
+        ("项目使用 uv 管理依赖。", "今天天气不错，适合出门散步。"): 0.0770,
+    }
+    for (left, right), expected in samples.items():
+        assert vf.token_similarity(left, right) == pytest.approx(expected, abs=1e-3), left
+
+
+def test_value_change_above_consistency_threshold_hits_conflict_gate() -> None:
+    """相似度高于一致阈值也不能把"换了数值"判成一致——冲突门必须先兜住。"""
+    result = vf.compare_prior_and_evidence(
+        make_note(body="该系列有 3 个版本。"), evi("该系列有 4 个版本。")
+    )
+    assert result.similarity > 0.8
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    joined = "\n".join(result.reasons)
+    assert "旧=3" in joined and "新=4" in joined
+
+
+def test_source_change_ignores_reviewed_at_and_says_so() -> None:
+    """Minor a：来源变化规则不看 reviewed_at（与 freshness 规则 5 取舍不同），留痕写明。"""
+    result = vf.compare_prior_and_evidence(
+        source_url_note(
+            source_changed_at="2026-05-01T00:00:00+00:00",
+            reviewed_at="2026-06-05T00:00:00+00:00",
+        ),
+        evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW),
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    joined = "\n".join(result.reasons)
+    assert "注：source_changed_at 不晚于 reviewed_at=2026-06-05T00:00:00+00:00" in joined
+    assert "本模块仍按来源变化处理" in joined
+
+
+def test_comparison_to_dict_carries_full_hashes() -> None:
+    """Minor d：结构化留痕带完整新旧 hash（理由里只有 8 位截断，碰撞时字面相同）。"""
+    result = vf.compare_prior_and_evidence(
+        source_url_note(source_changed_at="2026-08-01T00:00:00+00:00"),
+        evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW),
+    )
+    assert result.source is not None
+    assert result.source.to_dict() == {
+        "url": URL,
+        "prior_content_hash": HASH_OLD,
+        "evidence_content_hash": HASH_NEW,
+        "source_changed_at": "2026-08-01T00:00:00+00:00",
+    }
+    payload = json.loads(json.dumps(result.to_dict(), ensure_ascii=False))
+    assert payload["source"]["prior_content_hash"] == HASH_OLD
+    assert payload["source"]["evidence_content_hash"] == HASH_NEW
+    assert HASH_OLD not in "\n".join(result.reasons)  # 理由仍只有前 8 位
+    assert "1a2b3c4d" in "\n".join(result.reasons)
+
+
+def test_source_trace_is_none_without_url_hit() -> None:
+    result = vf.compare_prior_and_evidence(make_note(), evi("项目使用 uv 管理依赖。"))
+    assert result.source is None
+    assert result.to_dict()["source"] is None
+
+
+def test_judge_override_rewrites_uncertain_tail() -> None:
+    """Minor c：judge 改判后不得再留"→ uncertain"结句（留痕与 verdict 自相牵制）。"""
+    judge, _ = counting_judge(vf.VERDICT_NEWER)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    joined = "\n".join(result.reasons)
+    assert "→ 最终判定 newer（由语义判官给出，建议动作 supersede）" in joined
+    assert "→ uncertain" not in joined
+    assert result.reasons[-1].endswith("（由语义判官给出，建议动作 supersede）")
+
+
+def test_uncertain_tail_kept_when_judge_gives_nothing() -> None:
+    """judge 没给出结论时结句仍是 uncertain（结句随最终判定走）。"""
+    judge, _ = counting_judge(None)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.reasons[-1].endswith("→ uncertain（建议人工或语义判官复核，本轮不做动作）")
+
+
+def test_time_helpers_are_public_in_freshness_and_shared() -> None:
+    """Minor e：基准时间/时间解析提升为 freshness 公开名，旧私有名保持可用且同一对象。"""
+    from researchwiki.wiki import freshness as fr
+
+    assert fr.parse_ts is fr._parse_ts
+    assert fr.resolve_base_time is fr._resolve_base_time
+    assert "parse_ts" in fr.__all__ and "resolve_base_time" in fr.__all__
+    # verification 复用的是同一个实现（不是另抄一份）
+    assert vf.parse_ts is fr.parse_ts
+    assert vf.resolve_base_time is fr.resolve_base_time
+    meta = NoteMeta(id="N-1", observed_at=None, created=NOW)
+    assert fr.resolve_base_time(meta) == ("created", fr.parse_ts(NOW))
+
+
+def test_public_time_helper_keeps_lenient_parsing() -> None:
+    """公开名行为与旧口径一致：无时区按 UTC、非法值回 None、bool 不当时间。"""
+    from researchwiki.wiki import freshness as fr
+
+    assert fr.parse_ts("2026-06-01T00:00:00").isoformat() == NOW
+    assert fr.parse_ts("昨天") is None
+    assert fr.parse_ts("") is None
+    assert fr.parse_ts(True) is None
+    assert fr.parse_ts(None) is None

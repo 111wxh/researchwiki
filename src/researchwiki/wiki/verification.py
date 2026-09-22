@@ -18,7 +18,11 @@
    2），这里把它提到时间与具体度之上，理由有两条：简报规则 1 自己就写明"若冲突
    检测命中 → CONFLICTING"；PLAN §3.3 要求"冲突独立落在 conflicts/，不把冲突
    伪装成普通 merge"，而"更晚但自相矛盾"的证据若判 newer/supersede，冲突就被
-   supersede 静默掩盖了。
+   supersede 静默掩盖了。**前置护栏（实体）**：两侧实体集合都非空且不交时**跳过**
+   冲突判定（写一行原因）——槽位键里不含主语，"模型 A 参数 70B" 与 "模型 B 参数
+   128B" 的同槽位不同值说的是两个主体，判冲突会直接产出 ``open_conflict`` 并污染
+   冲突台账与评测冲突计数；方向选择：宁漏一次自动冲突（人工/判官仍会看到 uncertain）
+   也不误开台账。
 2. **来源变化**：``evidence.source_url`` 命中旧记忆某条 ``SourceRef``——
    - ``content_hash`` **相同**（两侧都非空）→ 来源未变，**不早退**，只追加审计行
      后继续走 3/4/5（同一快照的重述 → consistent；同一快照里更完整的事实 →
@@ -29,15 +33,23 @@
      ISO）→ **不据此判定**，追加审计行后继续（来源标记由 P2-B 的检测器写入，
      本模块不替它背判定）。
    - ``source_url`` 命中但证据未给 ``content_hash`` → 记一行"无法判定是否换版"。
-3. **一致**：``相似度 ≥ consistent_similarity``、证据没有新增事实令牌、**且没有
-   被跳过的槽位** → ``consistent`` / ``refresh_reviewed_at``（PLAN §3.3"一致则更新
-   reviewed_at"）。放在时间规则之前：时间更晚但断言未变 = 只是重新观察，不该制造
-   无意义的新版本。被跳过的槽位（单侧多值、无法确定比较对象）会让"一致"这一结论
-   退回 uncertain——"还成立"的判定必须建立在**所有可比槽位都真的比过**之上，
-   漏判一致性只是多一次复核，误判一致性等于把可能已经变化的事实当成仍然成立。
+3. **一致**：``相似度 ≥ consistent_similarity``、证据没有新增事实令牌、**没有
+   被跳过的槽位**、**且槽位级取值逐一对得上** → ``consistent`` /
+   ``refresh_reviewed_at``（PLAN §3.3"一致则更新 reviewed_at"）。放在时间规则之前：
+   时间更晚但断言未变 = 只是重新观察，不该制造无意义的新版本。
+   **"槽位级"是修复轮 1/5 的关键修正**：一致必须逐槽位比（旧记忆的每个可比槽位在
+   证据中有同一槽位且取值相同、证据也不多出可比槽位），不能只看"证据用到的
+   ``(kind, value)`` 有没有在旧文里出现过"——集合级检查会把**取值错位互换**判成
+   仍然成立（旧 ``上下文窗口 128k，参数量 70B`` 对证据 ``上下文窗口 70B，
+   参数量 128k``：取值集合完全相同、相似度 0.946、无冲突，但事实已经错位），
+   而这正是来源换版时"表格列序/标签错位"的真实形态，方向恰是"不静默覆盖"最不能
+   出错的一侧。被跳过的槽位（单侧多值）同样让"一致"退回 uncertain——"还成立"的
+   判定必须建立在**所有可比槽位都真的比过且对得上**之上：漏判一致性只是多一次复核，
+   误判一致性等于把可能已经变化的事实当成仍然成立。
 4. **时间**：``evidence.observed_at`` 晚于旧记忆基准时间（``observed_at`` →
-   ``created``，**与 P2-A freshness 同口径**，直接复用其 ``_resolve_base_time``，
-   不写第二份）→ ``newer`` / ``supersede``；相等或更早、旧记忆缺基准、证据时间
+   ``created``，**与 P2-A freshness 同口径**，直接复用其公开的
+   ``freshness.resolve_base_time`` / ``freshness.parse_ts``，不写第二份）→
+   ``newer`` / ``supersede``；相等或更早、旧记忆缺基准、证据时间
    不可解析 → **不因时间判更新**（各写一行理由）。
 5. **具体度**：证据的事实令牌数 **多于**旧记忆且无冲突 → ``more_specific`` /
    ``merge``。建议动作取 ``merge`` 而非 ``supersede``：证据是旧记忆事实集合的
@@ -93,6 +105,33 @@ judge 注入约束（逐条可测）
   0.9 = 近乎重复；本模块 0.8 = 断言重述，0.3 = 还值得比较）。
 - **不写盘**：本模块不 import 任何写接口（``store.save_conflict`` 由 P2-D 调用）。
 - 相似度与令牌都用纯函数实现，可单测；``scan_slots`` 暴露完整扫描细节供审计。
+- 时间解析与基准时间直接复用 ``freshness.parse_ts`` / ``freshness.resolve_base_time``
+  （修复轮 1/5 把这两个名字从私有提升为公开：口径只有一份，freshness 侧内部重构
+  不再能静默改变判定结果；旧私有名保留为别名）。
+
+与 freshness 规则 5 的取舍差异（**声明式取舍，P2-D 接线的决策输入**）
+---------------------------------------------------------------------
+
+``freshness._apply_source_change_floor`` 的口径是"``source_changed_at`` 晚于
+``reviewed_at``（或没复核过）才把记忆降到至少 ``review_due``"，即**看过就不再降级**。
+本模块规则 2 **不看 ``reviewed_at``**：只要 ``source_changed_at`` 存在且可解析、
+证据 URL 命中旧来源、证据 ``content_hash`` 与记录不同，就建议 ``newer``（即使
+``reviewed_at`` 已经晚于 ``source_changed_at``——此时会在 reasons 里额外留一行
+"注：source_changed_at 不晚于 reviewed_at …本模块仍按来源变化处理"）。
+
+为什么两侧口径可以不同（这是刻意取舍，不是疏漏）：
+
+- 两边回答的是不同的问题。freshness 答"这条记忆**该不该复核**"，复核是一个幂等的
+  用户/系统动作，看过一次就不该被同一个标记反复拉起来；本模块答"**本轮新证据相对
+  旧记忆该怎么处置**"，是一个一次性判定，输出的是建议动作。
+- 本模块的触发条件里有**独立于该标记的新事实**：证据侧给出了一个与旧记录**不同**
+  的 ``content_hash``。哪怕旧标记已经复核过，来源内容与记忆里记录的快照仍然不同
+  （P2-B 的 ``mark_source_changed`` 不改 ``sources.content_hash``），此时按 newer
+  建议 supersede 是把记录追上现实。
+- 若 P2-D 想采用"复核过就忽略旧标记"的口径，需要在**证据侧**加判据（例如
+  "已复核过的来源变化且证据 hash 与旧记录相同"），而不是直接沿用 freshness 的
+  floor——那会把上一条的新事实一并抹掉。该决策留给 P2-D（本模块的 reasons 已把
+  ``reviewed_at`` 与 ``source_changed_at`` 的具体值都写出来，接线时可回放）。
 """
 
 from __future__ import annotations
@@ -104,7 +143,7 @@ from functools import lru_cache
 from typing import Any
 
 from researchwiki.wiki.embeddings import MockEmbeddingProvider
-from researchwiki.wiki.freshness import _parse_ts, _resolve_base_time
+from researchwiki.wiki.freshness import parse_ts, resolve_base_time
 from researchwiki.wiki.frontmatter import SourceRef
 from researchwiki.wiki.ingest import cosine, entity_keys
 from researchwiki.wiki.store import Note
@@ -246,20 +285,50 @@ class SlotConflict:
         }
 
 
+@dataclass(frozen=True)
+class SourceComparison:
+    """来源侧的结构化留痕：命中的来源 URL 与**完整**新旧 content_hash。
+
+    reasons 里的 hash 只有前 8 位（人类可读），字面截断在哈希碰撞时无法区分；本结构
+    带全量 hash，供 P2-D 写台账/复算时逐字比对（``EvidenceComparison.source``）。
+    """
+
+    url: str
+    prior_content_hash: str
+    evidence_content_hash: str
+    source_changed_at: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "url": self.url,
+            "prior_content_hash": self.prior_content_hash,
+            "evidence_content_hash": self.evidence_content_hash,
+            "source_changed_at": self.source_changed_at,
+        }
+
+
 @dataclass
 class SlotScan:
-    """一次冲突扫描的完整细节（供审计与单测；``detect_slot_conflicts`` 只回 conflicts）。"""
+    """一次冲突扫描的完整细节（供审计与单测；``detect_slot_conflicts`` 只回 conflicts）。
+
+    ``slots_agree``：旧记忆的**每个可比槽位**在证据中都有同一槽位且取值相同，**且**
+    证据没有多余的可比槽位——即两侧的可比"槽位 → 取值"映射完全相等。判定"一致"
+    必须用它（槽位级），不能用"证据的每个 (kind,value) 是否在旧文任何位置出现过"
+    （集合级）：后者会把"取值错位互换"（如旧 `上下文窗口 128k，参数量 70B` 对新
+    `上下文窗口 70B，参数量 128k`）判成仍然成立。缺省 False = 不宣称一致（方向安全）。
+    """
 
     conflicts: list[SlotConflict] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # 单侧多值等跳过说明
     prior_tokens: list[FactToken] = field(default_factory=list)
     evidence_tokens: list[FactToken] = field(default_factory=list)
     new_tokens: list[FactToken] = field(default_factory=list)
+    slots_agree: bool = False
 
 
 @dataclass
 class EvidenceComparison:
-    """一条旧记忆 vs 一条新证据的判定结论（六个简报字段 + 三个审计字段）。
+    """一条旧记忆 vs 一条新证据的判定结论（六个简报字段 + 四个审计字段）。
 
     - ``verdict``：五类之一（VERDICTS）。
     - ``reasons``：人类可读判定依据，每条引用具体值（时间戳、hash 前 8 位、令牌
@@ -267,9 +336,10 @@ class EvidenceComparison:
     - ``prior_note_id`` / ``evidence_index``：旧记忆 id 与该证据在输入列表中的下标
       （回填留痕用，``compare_batch`` 保证下标与输入一一对应）。
     - ``suggested_action``：VERDICT_ACTIONS 给出的建议动作，**只是建议**。
-    - ``similarity`` / ``conflicts`` / ``judge_used``：审计字段（超出简报字段清单
-      但只增不改语义）——相似度数值、命中的冲突槽位（P2-D 写台账时引用具体取值）、
-      是否调用过语义判官（成本核算）。
+    - ``similarity`` / ``conflicts`` / ``judge_used`` / ``source``：审计字段（超出简报
+      字段清单但只增不改语义）——相似度数值、命中的冲突槽位（P2-D 写台账时引用具体
+      取值）、是否调用过语义判官（成本核算）、来源侧全量 hash 留痕（理由里只有 8 位
+      截断，碰撞时字面相同）。
     """
 
     verdict: str
@@ -280,9 +350,13 @@ class EvidenceComparison:
     similarity: float = 0.0
     conflicts: list[SlotConflict] = field(default_factory=list)
     judge_used: bool = False
+    source: SourceComparison | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化（留痕 / lint --json / MCP 复用；reasons 原样保留）。"""
+        """序列化（留痕 / lint --json / MCP 复用；reasons 原样保留）。
+
+        ``source`` 带**完整**新旧 content_hash（理由里只有前 8 位截断），供台账复算。
+        """
         return {
             "prior_note_id": self.prior_note_id,
             "evidence_index": self.evidence_index,
@@ -292,6 +366,7 @@ class EvidenceComparison:
             "judge_used": self.judge_used,
             "reasons": list(self.reasons),
             "conflicts": [c.to_dict() for c in self.conflicts],
+            "source": self.source.to_dict() if self.source is not None else None,
         }
 
 
@@ -586,7 +661,32 @@ def scan_slots(
         prior_tokens=prior_tokens,
         evidence_tokens=evidence_tokens,
         new_tokens=[t for t in evidence_tokens if (t.kind, t.value) not in prior_labels],
+        slots_agree=_slots_agree(prior_slots, evidence_slots),
     )
+
+
+def _slots_agree(left: Mapping[str, list[str]], right: Mapping[str, list[str]]) -> bool:
+    """两侧的"可比槽位 → 取值"映射是否完全相等（槽位级一致判据，见 SlotScan 注释）。
+
+    要求：键集合相同、每个槽位两侧都只有一个取值且相等。任一槽位在单侧有多个取值
+    （无法确定比较对象）即判不成立——"仍然成立"必须建立在两边**逐槽位**对得上之上。
+    两个空映射（两侧都抽不到可比令牌）恒等，返回 True（无可比事实即无可反驳）。
+    """
+    if set(left) != set(right):
+        return False
+    for slot, values in left.items():
+        if len(values) != 1 or right[slot] != values:
+            return False
+    return True
+
+
+def _slot_summary(slots: Mapping[str, list[str]], *, limit: int = 4) -> str:
+    """槽位映射的可读摘要（理由文案用）：``槽位键=取值`` 按槽位排序、超限截断。"""
+    rendered = [f"{slot}={_join_values(slots[slot])}" for slot in sorted(slots)]
+    if not rendered:
+        return "无"
+    shown = "、".join(rendered[:limit])
+    return shown + ("…" if len(rendered) > limit else "")
 
 
 def _slot_kind(slot: str) -> str:
@@ -661,6 +761,16 @@ def compare_prior_and_evidence(
     """
     cfg = settings if settings is not None else VerificationSettings()
     reasons: list[str] = []
+    # 来源解析与实体护栏都只读、且被多条规则共用，先算好（保证每条返回路径都能带上
+    # 结构化留痕；判定口径本身不受此顺序影响——它们都不写 reasons 以外的状态）。
+    ref = _match_source_ref(prior, evidence)
+    source_trace = SourceComparison(
+        url=ref.url,
+        prior_content_hash=ref.content_hash,
+        evidence_content_hash=evidence.content_hash,
+        source_changed_at=str(prior.meta.source_changed_at or ""),
+    ) if ref is not None else None
+    entities_disjoint, prior_entity_keys, evidence_entity_keys = _entities_disjoint(prior, evidence)
 
     # 规则 0：相似度地板（先决门；命中即 uncertain，且不调用 judge）
     similarity = token_similarity(prior.body, evidence.text, settings=cfg)
@@ -674,13 +784,30 @@ def compare_prior_and_evidence(
             "：证据与旧记忆不构成同一断言，不进入确定性比较"
             "（也不调用语义判官——地板就是为了不让无关证据消耗比较器）→ uncertain"
         )
-        return _make(prior, evidence_index, VERDICT_UNCERTAIN, reasons, similarity=similarity)
+        return _make(
+            prior,
+            evidence_index,
+            VERDICT_UNCERTAIN,
+            reasons,
+            similarity=similarity,
+            source=source_trace,
+        )
 
     # 冲突门（规则 1）+ 审计行
     scan = scan_slots(prior.body, evidence.text, settings=cfg)
     reasons.append(_token_summary(scan))
     reasons.extend(scan.skipped)
-    if scan.conflicts:
+    if entities_disjoint:
+        # 实体护栏（修复轮 1/5）：两侧实体集合都非空且不交 = 说的不是同一主语，
+        # 槽位键里不含主语，此时同槽位不同值多为"不同主体的同名参数"而非冲突。
+        # 判 conflicting 会直接产出 open_conflict 并污染冲突台账与评测冲突计数，
+        # 故这里**跳过冲突判定**（写清原因，交后续规则/人工），而不是判冲突。
+        reasons.append(
+            f"两侧实体不交（旧={'、'.join(prior_entity_keys)}；"
+            f"新={'、'.join(evidence_entity_keys)}）→ 跳过冲突判定"
+            "（主语不同时同槽位不同值不构成对同一条记忆的反驳）"
+        )
+    elif scan.conflicts:
         reasons.append(
             f"冲突检测命中 {len(scan.conflicts)} 个槽位："
             + "；".join(conflict.describe() for conflict in scan.conflicts)
@@ -696,10 +823,10 @@ def compare_prior_and_evidence(
             reasons,
             similarity=similarity,
             conflicts=scan.conflicts,
+            source=source_trace,
         )
 
-    # 规则 2：来源变化（url 命中旧来源的两个分支）
-    ref = _match_source_ref(prior, evidence)
+    # 规则 2：来源变化（url 命中旧来源的分支）
     if ref is not None:
         if not evidence.content_hash:
             reasons.append(
@@ -712,7 +839,7 @@ def compare_prior_and_evidence(
                 "与旧记忆记录一致（同一快照）→ 不判更新，继续比较表述与事实"
             )
         else:
-            changed = _parse_ts(prior.meta.source_changed_at)
+            changed = parse_ts(prior.meta.source_changed_at)
             if changed is not None:
                 reasons.append(
                     f"来源变化：url={ref.url} 命中旧来源，content_hash "
@@ -720,9 +847,25 @@ def compare_prior_and_evidence(
                     f"（source_changed_at={changed.isoformat()}）"
                     " → 新证据更新（建议 supersede）"
                 )
+                reviewed = parse_ts(prior.meta.reviewed_at)
+                if reviewed is not None and changed <= reviewed:
+                    # 与 freshness 规则 5 的取舍不同，显式留痕（见模块 docstring
+                    # 「与 freshness 规则 5 的取舍差异」）：本模块判"新证据怎么处置"，
+                    # 触发条件里还有证据侧的新 hash，不看复核时间。
+                    reasons.append(
+                        f"注：source_changed_at 不晚于 reviewed_at="
+                        f"{reviewed.isoformat()}（旧记忆已复核过），本模块仍按来源变化"
+                        "处理——本模块判的是「新证据怎么处置」，且证据侧 hash 与记录不同"
+                        "本身即新事实（取舍见模块 docstring）"
+                    )
                 reasons.extend(_new_token_notes(scan))
                 return _make(
-                    prior, evidence_index, VERDICT_NEWER, reasons, similarity=similarity
+                    prior,
+                    evidence_index,
+                    VERDICT_NEWER,
+                    reasons,
+                    similarity=similarity,
+                    source=source_trace,
                 )
             if prior.meta.source_changed_at:
                 reasons.append(
@@ -735,29 +878,35 @@ def compare_prior_and_evidence(
                 "source_changed_at → 本轮不据此判定"
             )
 
-    # 规则 3：一致（高相似重述且无新增事实令牌）→ 只刷新 reviewed_at
-    if similarity >= cfg.consistent_similarity and not scan.new_tokens and not scan.skipped:
+    # 规则 3：一致（高相似重述、无新增令牌且**槽位级取值对得上**）→ 只刷新 reviewed_at
+    if similarity >= cfg.consistent_similarity and not scan.new_tokens:
+        blockers = _consistency_blockers(scan)
+        if not blockers:
+            reasons.append(
+                f"一致：相似度 {similarity:.3f} ≥ 一致阈值 {cfg.consistent_similarity:.2f}，"
+                "且证据未引入新的事实令牌、无冲突、槽位级取值逐一对得上"
+                " → consistent（只需刷新 reviewed_at）"
+            )
+            return _make(
+                prior,
+                evidence_index,
+                VERDICT_CONSISTENT,
+                reasons,
+                similarity=similarity,
+                source=source_trace,
+            )
         reasons.append(
-            f"一致：相似度 {similarity:.3f} ≥ 一致阈值 {cfg.consistent_similarity:.2f}，"
-            "且证据未引入新的事实令牌、无冲突 → consistent（只需刷新 reviewed_at）"
-        )
-        return _make(
-            prior, evidence_index, VERDICT_CONSISTENT, reasons, similarity=similarity
-        )
-    if similarity >= cfg.consistent_similarity and not scan.new_tokens and scan.skipped:
-        reasons.append(
-            "一致判定被保留：证据虽高度相似且无新增令牌，但有槽位因单侧多值无法比较"
-            "（可能藏着取值差异）→ 不判 consistent，交后续规则或人工复核"
+            "一致判定被保留：" + "；".join(blockers) + " → 不判 consistent，交后续规则或人工复核"
         )
 
     # 规则 4：时间先后（基准口径与 P2-A freshness 一致：observed_at → created）
-    evidence_ts = _parse_ts(evidence.observed_at)
+    evidence_ts = parse_ts(evidence.observed_at)
     if evidence.observed_at and evidence_ts is None:
         reasons.append(
             f"证据 observed_at={evidence.observed_at} 不是合法 ISO 时间，按未提供处理"
             "（不参与判定）"
         )
-    base_field, base_ts = _resolve_base_time(prior.meta)
+    base_field, base_ts = resolve_base_time(prior.meta)
     if evidence_ts is not None and base_ts is not None:
         if evidence_ts > base_ts:
             reasons.append(
@@ -765,7 +914,14 @@ def compare_prior_and_evidence(
                 f"{base_field}={base_ts.isoformat()} → 新证据更新（建议 supersede）"
             )
             reasons.extend(_new_token_notes(scan))
-            return _make(prior, evidence_index, VERDICT_NEWER, reasons, similarity=similarity)
+            return _make(
+                prior,
+                evidence_index,
+                VERDICT_NEWER,
+                reasons,
+                similarity=similarity,
+                source=source_trace,
+            )
         reasons.append(
             f"时间：证据 observed_at={evidence_ts.isoformat()} 不晚于旧记忆 "
             f"{base_field}={base_ts.isoformat()}（相等或更早）→ 不因时间判更新"
@@ -778,14 +934,13 @@ def compare_prior_and_evidence(
     else:
         reasons.append("时间：证据未提供可解析的 observed_at → 不因时间判更新")
 
-    # 规则 5：具体度（事实令牌更多；实体不交时不判）
+    # 规则 5：具体度（事实令牌更多）
     if len(scan.evidence_tokens) > len(scan.prior_tokens):
-        disjoint, prior_keys, evidence_keys = _entities_disjoint(prior, evidence)
-        if disjoint:
+        if entities_disjoint:
             reasons.append(
                 f"具体度：证据事实令牌 {len(scan.evidence_tokens)} 个 > 旧记忆 "
-                f"{len(scan.prior_tokens)} 个，但两侧实体不交（旧={'、'.join(prior_keys)}；"
-                f"新={'、'.join(evidence_keys)}）→ 不判更具体"
+                f"{len(scan.prior_tokens)} 个，但两侧实体不交（旧={'、'.join(prior_entity_keys)}；"
+                f"新={'、'.join(evidence_entity_keys)}）→ 不判更具体"
             )
         else:
             fresh = "、".join(t.label() for t in scan.new_tokens) or "无"
@@ -795,7 +950,12 @@ def compare_prior_and_evidence(
                 " 且无冲突 → 更具体（建议 merge 并入旧记忆，保留规范 ID）"
             )
             return _make(
-                prior, evidence_index, VERDICT_MORE_SPECIFIC, reasons, similarity=similarity
+                prior,
+                evidence_index,
+                VERDICT_MORE_SPECIFIC,
+                reasons,
+                similarity=similarity,
+                source=source_trace,
             )
     else:
         reasons.append(
@@ -804,10 +964,9 @@ def compare_prior_and_evidence(
         )
 
     # 规则 6：兜底（judge 只在此处注入）
-    reasons.append(
+    blockers = (
         "无确定性判据：相似度高于地板、无冲突，但时间不更新、也无新增事实令牌可用，"
-        "既不足以判「一致」也不足以判「更具体」 → uncertain"
-        "（建议人工或语义判官复核，本轮不做动作）"
+        "既不足以判「一致」也不足以判「更具体」"
     )
     judge_used = judge is not None
     verdict = VERDICT_UNCERTAIN
@@ -815,6 +974,14 @@ def compare_prior_and_evidence(
         judged = _apply_judge(judge, prior, evidence, reasons)
         if judged is not None:
             verdict = judged
+    # 结句按**最终**判定写：判官改判时不能留一句"→ uncertain"与 verdict 自相牵制
+    if verdict == VERDICT_UNCERTAIN:
+        reasons.append(f"{blockers} → uncertain（建议人工或语义判官复核，本轮不做动作）")
+    else:
+        reasons.append(
+            f"{blockers} → 最终判定 {verdict}"
+            f"（由语义判官给出，建议动作 {VERDICT_ACTIONS[verdict]}）"
+        )
     return _make(
         prior,
         evidence_index,
@@ -822,6 +989,7 @@ def compare_prior_and_evidence(
         reasons,
         similarity=similarity,
         judge_used=judge_used,
+        source=source_trace,
     )
 
 
@@ -857,6 +1025,7 @@ def _make(
     similarity: float = 0.0,
     conflicts: Sequence[SlotConflict] = (),
     judge_used: bool = False,
+    source: SourceComparison | None = None,
 ) -> EvidenceComparison:
     """按 verdict 组装结论（动作查 VERDICT_ACTIONS 表；reasons 就地共享同一列表）。"""
     return EvidenceComparison(
@@ -868,7 +1037,27 @@ def _make(
         similarity=similarity,
         conflicts=list(conflicts),
         judge_used=judge_used,
+        source=source,
     )
+
+
+def _consistency_blockers(scan: SlotScan) -> list[str]:
+    """列出"一致"为何被保留（空列表 = 可以判 consistent）。
+
+    两条护栏，都指向同一件事：**必须逐槽位比过**才能说"仍然成立"。
+    - 有槽位单侧多值 → 无法确定比较对象（可能藏着取值差异）；
+    - 槽位级取值对不上（旧记忆的某个可比槽位在证据里没有对应槽位、或取值不同）
+      → 典型形态是"取值错位互换"（表格列序/标签错位），集合级检查看不见它
+      （旧文出现过的取值在新文里都还在，只是换了槽位）。
+    """
+    blockers: list[str] = []
+    if scan.skipped:
+        blockers.append("有槽位因单侧多值无法比较（可能藏着取值差异）")
+    if not scan.slots_agree:
+        prior_slots = _slot_summary(_slot_values(scan.prior_tokens))
+        evidence_slots = _slot_summary(_slot_values(scan.evidence_tokens))
+        blockers.append(f"槽位级取值对不上（旧={prior_slots}；新={evidence_slots}）")
+    return blockers
 
 
 def _apply_judge(
@@ -970,6 +1159,7 @@ __all__ = [
     "FactToken",
     "SlotConflict",
     "SlotScan",
+    "SourceComparison",
     "VerificationSettings",
     "compare_batch",
     "compare_prior_and_evidence",

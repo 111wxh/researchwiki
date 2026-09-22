@@ -260,11 +260,13 @@ def from_config(config: Mapping[str, Any] | None = None) -> FreshnessSettings:
 # ---- 时间工具（与 index.freshness_factor 同口径的独立实现）-------------------
 
 
-def _parse_ts(text: Any) -> datetime | None:
+def parse_ts(text: Any) -> datetime | None:
     """宽松解析 ISO 时间戳；无时区的按 UTC 解释，不可解析返回 None。
 
     与 index._parse_ts / mcp_server.service._parse_ts 同约定（本模块独立实现，
-    不 import index）。
+    不 import index）。**公开名**：``wiki/verification.py``（P2-C 判定模块）与
+    ``resolve_base_time`` 一起复用它，保证"基准时间/时间解析"只有一份口径——内部
+    重构不再可能静默改变下游判定。旧私有名 ``_parse_ts`` 保留为别名。
     """
     if text is None or isinstance(text, bool):
         return None
@@ -278,18 +280,28 @@ def _parse_ts(text: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _resolve_base_time(meta: Any) -> tuple[str | None, datetime | None]:
+# 旧私有名保留为别名（兼容既有调用点）；新代码请用公开名 parse_ts。
+_parse_ts = parse_ts
+
+
+def resolve_base_time(meta: Any) -> tuple[str | None, datetime | None]:
     """基准时间：``(字段名, 时间)``；observed_at 优先，缺失/不可解析回退 created。
 
     两者都拿不到返回 ``(None, None)`` —— 即"未知年龄"（规则 1）。
+    **公开名**（同上：``verification.py`` 的规则 4 时间比较复用本函数）；旧私有名
+    ``_resolve_base_time`` 保留为别名。
     """
-    observed = _parse_ts(meta.observed_at)
+    observed = parse_ts(meta.observed_at)
     if observed is not None:
         return "observed_at", observed
-    created = _parse_ts(meta.created)
+    created = parse_ts(meta.created)
     if created is not None:
         return "created", created
     return None, None
+
+
+# 旧私有名保留为别名（兼容既有调用点）；新代码请用公开名 resolve_base_time。
+_resolve_base_time = resolve_base_time
 
 
 def _effective_half_life(half_life_days: Mapping[str, float], volatility: str) -> float | None:
@@ -337,7 +349,7 @@ def evaluate_freshness(
     reasons: list[str] = []
 
     # 基准时间与年龄（规则 1）
-    base_field, base_ts = _resolve_base_time(meta)
+    base_field, base_ts = resolve_base_time(meta)
     if base_ts is not None:
         age_days = max(0.0, (moment - base_ts).total_seconds() / 86400.0)
         reasons.append(f"时间基准 {base_field}（{base_ts.isoformat()}），年龄 {age_days:.1f} 天")
@@ -345,8 +357,8 @@ def evaluate_freshness(
         age_days = 0.0
 
     # 显式有效期（规则 2）：先记录不可解析的写法，再判两个方向
-    valid_from = _parse_ts(meta.valid_from)
-    valid_until = _parse_ts(meta.valid_until)
+    valid_from = parse_ts(meta.valid_from)
+    valid_until = parse_ts(meta.valid_until)
     expired = valid_until is not None and moment > valid_until
     not_yet = valid_from is not None and moment < valid_from
     if base_ts is None:
@@ -442,13 +454,13 @@ def _apply_source_change_floor(
     处理并说明。
     """
     raw = meta.source_changed_at
-    changed_at = _parse_ts(raw)
+    changed_at = parse_ts(raw)
     if raw and changed_at is None:
         reasons.append(f"source_changed_at={raw} 不是合法 ISO 时间，按未声明处理（不参与判定）")
         return state
     if changed_at is None:
         return state
-    reviewed_at = _parse_ts(meta.reviewed_at)
+    reviewed_at = parse_ts(meta.reviewed_at)
     if reviewed_at is not None and changed_at <= reviewed_at:
         reasons.append(
             f"来源内容已变化（source_changed_at={changed_at.isoformat()}）"
@@ -517,4 +529,6 @@ __all__ = [
     "freshness_counts",
     "freshness_queue",
     "from_config",
+    "parse_ts",
+    "resolve_base_time",
 ]
