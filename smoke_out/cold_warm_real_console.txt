@@ -1,0 +1,21 @@
+⚠ 成本警告：config 模式将用真实模型与真实搜索完整跑两次研究（cold + warm），会产生真实 API 费用；请确认 key 与配额后再继续。
+=== cold/warm 对照冒烟（Prior MVP 阶段验收证据）===
+question    : Agent 长期记忆的主流方案（Letta、Mem0 等）如何做记忆固化与检索？
+provider    : config
+model       : strong=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）  cheap=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）
+wiki_root   : D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T072837Z
+out         : smoke_out\cold_warm_real.jsonl
+----------------------------------------------------------------------------
+[cold] run 开始（空 Wiki 冷启动）
+  [note] N-0001 conf=high
+  [note] N-0002 conf=high
+  [note] N-0003 conf=high
+  [note] N-0004 conf=high
+  [note] N-0005 conf=medium
+  [note] N-0006 conf=medium
+  [note] N-0007 conf=high
+  [note] N-0008 conf=medium
+[cold] trace_id=c13d72fd36be  prior_hit=0  notes(created/merged)=8/0  sources=6  in/out=63273/5252  latency=120879ms
+[warm] run 开始（同一 wiki 根目录二次研究）
+✗ 运行异常：OperationalError: database is locked
+（config 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）
