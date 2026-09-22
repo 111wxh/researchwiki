@@ -39,6 +39,16 @@ invalidate（判定失效，自动生成墓碑笔记而非新增状态——"sup
 active"的不变量与状态机都留给 P2）/ timeline（版本史）/ conflicts（冲突台账）/
 profile（User Memory 视图）。wiki_* 五工具保持原样作为兼容层。
 
+证据链入口（P2 carried 项④）
+---------------------------
+supersede / update 接受可选 ``source_urls``（元素为 URL 字符串或
+``{"url", "content_hash"}`` 映射，见 ``SourceInput``；校验与 ``write()`` 共用
+``_normalize_sources``）：supersede 提供了来源 → 新笔记 sources=提供值且
+confidence 重置为 medium（不把旧证据的置信度接到新证据上），未提供 → sources
+为空并在返回体标注 ``evidence: "none"``；update 是修订语义，来源按
+``(url, content_hash)`` 去重后**追加**到既有 sources。两个工具的正确性都不依赖
+调用方自觉：返回体的 ``evidence`` 字段就是"这条记忆有没有证据"的机器可读声明。
+
 错误码词汇表（错误结构里的 ``error.code``）
 ------------------------------------------
 invalid_argument 参数非法｜invalid_kind kind 不在 knowledge/user/experience 白名单｜
@@ -92,6 +102,11 @@ logger = logging.getLogger(__name__)
 NOTE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 # WikiStore.next_note_id() 生成的 id 形态（机器生成，不接受客户端传入）
 GENERATED_NOTE_ID_RE = re.compile(r"^N-\d{4,}$")
+
+# 来源参数（sources / source_urls）的元素形态：URL 字符串，或
+# {"url": ..., "content_hash": ...} 映射（content_hash 可省/可为 None）。
+# server.py 的工具签名直接复用这个别名，保证 MCP schema 与校验一致。
+SourceInput = str | Mapping[str, Any]
 
 
 # ---- 错误结构 ---------------------------------------------------------------
@@ -573,7 +588,7 @@ class WikiService:
         entities: Sequence[str] | None = None,
         confidence: str = "medium",
         volatility: str = "stable",
-        sources: Sequence[str] | None = None,
+        sources: Sequence[SourceInput] | None = None,
         kind: str = "knowledge",
         importance: float | None = None,
     ) -> dict[str, Any]:
@@ -581,6 +596,7 @@ class WikiService:
 
         ``kind``/``importance`` 是记忆载体字段（P1-A）：wiki_write 不暴露它们
         （工具签名不变，走默认值），memory_store 经此通道透传。
+        ``sources`` 的元素可以是 URL 字符串或 ``{"url", "content_hash"}`` 映射。
         """
         fields = _validate_write_inputs(
             body=body,
@@ -710,7 +726,14 @@ class WikiService:
         return payload
 
     @_structured_errors
-    def update_memory(self, note_id: str, content: str, reason: str) -> dict[str, Any]:
+    def update_memory(
+        self,
+        note_id: str,
+        content: str,
+        reason: str,
+        *,
+        source_urls: Sequence[SourceInput] | None = None,
+    ) -> dict[str, Any]:
         """修订既有记忆正文（不新增 ID）：写前备份 + reason 落盘，禁止静默覆盖。
 
         - 备份：create_backup(existed=True)，原稿进 wiki-data/.backups/；
@@ -721,6 +744,18 @@ class WikiService:
           首条目，随后旧键移除（round-trip 归一，不丢历史原因）；
         - 只允许修订 active 笔记：merged/superseded 的内容归属最终版本，
           应先 wiki_read 跟随重定向，再用 memory_supersede 取代。
+
+        证据链（carried 项④）
+        --------------------
+        ``source_urls`` 是可选的新证据入口，元素为 URL 字符串或
+        ``{"url": ..., "content_hash": ...}`` 映射（hash 可省/可为空串）。
+        **update 是修订而非替换，所以来源按 ``(url, content_hash)`` 去重后追加**
+        到既有 sources（不替换、不丢旧证据）；不给该参数时 sources 原样不动。
+        confidence 不受本参数影响（修订不改变原记忆的置信度）——要给新证据配
+        置信度请用 memory_store / wiki_write 重新沉淀。
+
+        返回体带 ``evidence``：给了 ``source_urls`` 为 ``"provided"``（附
+        ``sources_added`` = 去重后新增条数），没给为 ``"none"``。
         """
         if not isinstance(content, str) or not content.strip():
             raise WikiToolError("validation_failed", "content 不能为空：请提供修订后的记忆正文")
@@ -728,6 +763,8 @@ class WikiService:
             raise WikiToolError(
                 "validation_failed", "reason 不能为空：修订必须留下原因（审计留痕）"
             )
+        # 证据链参数在锁外、在任何写入（含备份）之前校验：非法参数零落盘。
+        provided = _evidence_sources(source_urls)
         reason_text = reason.strip()
         with self._write_lock:
             note = self._require_active(note_id)
@@ -747,6 +784,7 @@ class WikiService:
                 ) from exc
             now = _now_iso()
             meta = note.meta
+            merged_sources, sources_added = _merge_sources(meta.sources, provided)
             try:
                 updated = self.store.save_note(
                     body=content,
@@ -763,7 +801,7 @@ class WikiService:
                     observed_at=meta.observed_at,
                     reviewed_at=now,
                     trace_id=meta.trace_id,
-                    sources=list(meta.sources),
+                    sources=merged_sources,
                     extra=_append_update_reason(meta.extra, reason_text, now),
                     created=meta.created,
                 )
@@ -784,9 +822,17 @@ class WikiService:
             "backup": backup,
             "indexed": index_error is None,
             "path": _relative_path(updated.path, self.root),
+            "evidence": "provided" if provided else "none",
+            "sources_added": sources_added,
             "message": (
                 f"已修订记忆 {updated.id}（原因追加记入 update_reasons，"
                 f"原稿备份于 {backup['dir']}）"
+                + (
+                    f"；本次追加来源 {sources_added} 条"
+                    f"（按 (url, content_hash) 去重，现有 {len(merged_sources)} 条）"
+                    if provided
+                    else "；本次未提供来源（evidence=none，既有来源原样保留）"
+                )
             ),
         }
         if index_error is not None:
@@ -794,13 +840,37 @@ class WikiService:
         return payload
 
     @_structured_errors
-    def supersede_memory(self, note_id: str, new_content: str, reason: str) -> dict[str, Any]:
+    def supersede_memory(
+        self,
+        note_id: str,
+        new_content: str,
+        reason: str,
+        *,
+        source_urls: Sequence[SourceInput] | None = None,
+    ) -> dict[str, Any]:
         """用新内容替代旧记忆：先写新笔记，再把旧笔记标 superseded_by=新 ID。
 
-        新笔记继承旧笔记的 entities/kind/confidence/volatility/importance
-        （身份连续性），正文与标题来自 new_content。返回新旧两个 ID；
-        旧笔记沿 superseded_by 链可达新笔记（active），reason 记入
-        extra 的 ``supersede_reason``。
+        不带 ``source_urls`` 时（原 P1-A 行为，逐字段不变）：新笔记继承旧笔记的
+        entities/kind/confidence/volatility/importance（身份连续性），**不继承
+        sources**，正文与标题来自 new_content；旧笔记沿 superseded_by 链可达新
+        笔记（active），reason 记入 extra 的 ``supersede_reason``。
+
+        证据链（carried 项④）
+        --------------------
+        ``source_urls`` 是可选的新证据入口，元素为 URL 字符串或
+        ``{"url": ..., "content_hash": ...}`` 映射（hash 可省/可为空串；同一
+        ``(url, content_hash)`` 只保留一条，去重口径与 memory_update 一致）：
+
+        - **提供了来源**：新笔记的 sources = 提供值，而不是旧笔记的来源（旧证据
+          不该被伪装成新结论的证据）；并且 **confidence 不再继承旧值**，一律
+          重置为 ``"medium"``——旧记忆的 high 是给旧证据的 high，把新证据接到
+          这个 high 上等于凭空背书。本工具不提供 confidence 参数（避免"有参数
+          但语义可疑"），要标更高级别请走 memory_store / wiki_write 重新沉淀。
+        - **未提供来源**：sources 保持为空（不继承旧来源），其余字段照旧继承，
+          同时在返回体标注 ``evidence: "none"``——调用方能看出自己造了一条
+          没有证据链的替代记忆，而不是静默以为证据跟着过来了。
+
+        返回体的 ``evidence``：提供了来源为 ``"provided"``，未提供为 ``"none"``。
         """
         if not isinstance(new_content, str) or not new_content.strip():
             raise WikiToolError(
@@ -810,6 +880,16 @@ class WikiService:
             raise WikiToolError(
                 "validation_failed", "reason 不能为空：取代必须留下原因（审计留痕）"
             )
+        # 证据链参数在锁外、在任何写入（含新笔记落盘与旧笔记标记）之前校验：
+        # 非法参数不会留下半成品（既无新笔记也无备份）。
+        provided = _evidence_sources(source_urls)
+        # 去重口径与 update 一致（(url, content_hash) 只留一条），保证新笔记的
+        # sources 恰好等于"去重后的提供值"；回传给 write() 的是映射形态，
+        # 与 _normalize_sources 的归一结果等价（url 已 strip、hash 已归一）。
+        deduped, _ = _merge_sources([], provided)
+        evidence_input = [
+            {"url": ref.url, "content_hash": ref.content_hash} for ref in deduped
+        ]
         reason_text = reason.strip()
         with self._write_lock:
             old = self._require_active(note_id)
@@ -820,10 +900,13 @@ class WikiService:
                 new_content,
                 title=derive_title(new_content, fallback=old.title or "替代笔记"),
                 entities=list(old.meta.entities),
-                confidence=old.meta.confidence,
+                # 给了新证据 → 置信度回到缺省 medium（不继承旧证据的 high）；
+                # 没给来源 → 维持原行为，继承旧笔记的 confidence。
+                confidence="medium" if provided else old.meta.confidence,
                 volatility=old.meta.volatility,
                 kind=old.meta.kind,
                 importance=old.meta.importance,
+                sources=evidence_input or None,
             )
             if not written.get("ok"):
                 return written
@@ -838,9 +921,18 @@ class WikiService:
             "reason": reason_text,
             "backup": written.get("backup"),
             "path": _relative_path(marked.path, self.root),
+            "evidence": "provided" if provided else "none",
             "message": (
                 f"旧记忆 {old.id} 已被 {new_id} 取代（status=superseded，"
                 f"沿 superseded_by 可达；原因记入 supersede_reason）"
+                + (
+                    f"；新笔记来源=本次提供的 {len(deduped)} 条"
+                    "（按 (url, content_hash) 去重），"
+                    "confidence 重置为 medium（不继承旧证据的置信度）"
+                    if provided
+                    else "；本次未提供来源（evidence=none）：新笔记没有证据链，"
+                    "confidence 沿用旧值——若要挂新来源请重来一次并带上 source_urls"
+                )
             ),
         }
         if written.get("warnings"):
@@ -1278,7 +1370,7 @@ def _validate_write_inputs(
     entities: Sequence[str] | None,
     confidence: str,
     volatility: str,
-    sources: Sequence[str] | None,
+    sources: Sequence[SourceInput] | None,
     kind: str = "knowledge",
     importance: float | None = None,
 ) -> dict[str, Any]:
@@ -1352,32 +1444,12 @@ def _validate_write_inputs(
         else:
             normalized_importance = float(importance)
 
-    normalized_sources: list[SourceRef] = []
+    normalized_sources = _normalize_sources(sources, errors)
     if sources is None:
         warnings.append(
             "未提供 sources：笔记缺少来源 URL，检索与引用会失去证据链（建议补上）"
         )
-    elif isinstance(sources, str):
-        errors.append('sources 必须是 URL 字符串列表（如 ["https://example.com/a"]）')
-    elif isinstance(sources, Sequence):
-        for item in sources:
-            if isinstance(item, Mapping):
-                url = str(item.get("url") or "").strip()
-                if not url:
-                    errors.append(f"sources 里的映射缺少 url 字段：{dict(item)!r}")
-                    continue
-                normalized_sources.append(
-                    SourceRef(url=url, content_hash=str(item.get("content_hash") or ""))
-                )
-                continue
-            if not isinstance(item, str) or not item.strip():
-                errors.append(f"sources 的元素必须是非空 URL 字符串，得到 {item!r}")
-                continue
-            normalized_sources.append(SourceRef(url=item.strip(), content_hash=""))
-    else:
-        errors.append(f"sources 必须是 URL 字符串列表，得到 {type(sources).__name__}")
-
-    if not normalized_sources and sources is not None:
+    elif not normalized_sources:
         warnings.append("sources 解析后为空：笔记没有可用来源 URL")
     if errors:
         raise WikiToolError(
@@ -1395,6 +1467,94 @@ def _validate_write_inputs(
         "sources": normalized_sources,
         "warnings": warnings,
     }
+
+
+def _normalize_sources(
+    sources: Sequence[SourceInput] | str | None, errors: list[str], *, label: str = "sources"
+) -> list[SourceRef]:
+    """把客户端给的来源归一成 ``SourceRef`` 列表（write 与 memory 证据链参数共用）。
+
+    接受两种形态（同一列表里可混用）：
+
+    - URL 字符串：``"https://example.com/a"`` → ``SourceRef(url, content_hash="")``；
+    - 映射：``{"url": "https://example.com/a", "content_hash": "sha1:..."}``，
+      ``content_hash`` 缺省 / None / 空串统一归一为 ``""``（表示"未提供哈希"）。
+
+    url 两侧空白去掉；空 URL、空字符串元素、非字符串非映射元素一律往 ``errors``
+    追加一条可读中文错误（调用方决定是整体拒绝还是仅告警）。
+    ``sources is None`` 返回空列表且不记错误（= 调用方没提供来源）。
+    """
+    normalized: list[SourceRef] = []
+    if sources is None:
+        return normalized
+    if isinstance(sources, str):
+        errors.append(f'{label} 必须是 URL 字符串列表（如 ["https://example.com/a"]）')
+        return normalized
+    if not isinstance(sources, Sequence):
+        errors.append(f"{label} 必须是 URL 字符串列表，得到 {type(sources).__name__}")
+        return normalized
+    for item in sources:
+        if isinstance(item, Mapping):
+            url = str(item.get("url") or "").strip()
+            if not url:
+                errors.append(f"{label} 里的映射缺少 url 字段：{dict(item)!r}")
+                continue
+            normalized.append(SourceRef(url=url, content_hash=str(item.get("content_hash") or "")))
+            continue
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"{label} 的元素必须是非空 URL 字符串，得到 {item!r}")
+            continue
+        normalized.append(SourceRef(url=item.strip(), content_hash=""))
+    return normalized
+
+
+def _evidence_sources(source_urls: Sequence[SourceInput] | str | None) -> list[SourceRef]:
+    """memory_supersede / memory_update 的 ``source_urls`` 校验（写前完成，零落盘）。
+
+    与 ``write()`` 走同一套 ``SourceRef`` 归一（``_normalize_sources``），所以
+    URL 非空、hash 可为空串但会归一等约定完全一致；差别只有一处：显式给了
+    **空列表** 视为参数错误（"要么给至少一个来源，要么省略该参数"），因为
+    "我带了证据"与"我没带证据"是两种不同的语义，空列表让调用方意图不可辨。
+
+    任何非法输入抛 ``validation_failed``（复用既有错误码），调用方在创建备份 /
+    落盘之前调用本函数即可保证"非法参数不写盘"。
+    """
+    if source_urls is None:
+        return []
+    errors: list[str] = []
+    normalized = _normalize_sources(source_urls, errors, label="source_urls")
+    if not normalized and not errors:
+        errors.append(
+            "source_urls 是空列表：请给出至少一个来源 URL，或省略该参数"
+            "（省略=不提供证据，返回体 evidence=none）"
+        )
+    if errors:
+        raise WikiToolError(
+            "validation_failed",
+            "来源校验未通过：" + "；".join(errors),
+            errors=errors,
+        )
+    return normalized
+
+
+def _merge_sources(
+    existing: Sequence[SourceRef], provided: Sequence[SourceRef]
+) -> tuple[list[SourceRef], int]:
+    """追加式合并来源（update 语义）：按 ``(url, content_hash)`` 去重，旧来源在前。
+
+    返回 ``(合并后的列表, 本次新增条数)``；已存在的 (url, hash) 不重复追加。
+    """
+    merged = list(existing)
+    seen = {(ref.url, ref.content_hash) for ref in merged}
+    added = 0
+    for ref in provided:
+        key = (ref.url, ref.content_hash)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(ref)
+        added += 1
+    return merged, added
 
 
 def _change_time(note: Note) -> datetime | None:

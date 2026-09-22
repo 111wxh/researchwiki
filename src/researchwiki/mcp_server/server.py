@@ -16,8 +16,8 @@
   - memory_store      显式写入一条记忆（带 kind/importance）
   - memory_search     语义检索记忆（可按 kind 过滤）
   - memory_recall     动态召回入口（结果带 status/observed_at/kind 标注）
-  - memory_update     修订既有记忆正文（必须留 reason，自动备份）
-  - memory_supersede  用新内容替代旧记忆（新旧 ID 沿链可达）
+  - memory_update     修订既有记忆正文（必须留 reason，自动备份；可追加 source_urls）
+  - memory_supersede  用新内容替代旧记忆（新旧 ID 沿链可达；可带 source_urls 挂证据）
   - memory_invalidate 判定记忆失效（自动生成墓碑笔记，保持链可达）
   - memory_timeline   单条记忆的版本史
   - memory_conflicts  冲突台账查询
@@ -40,7 +40,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from researchwiki import __version__
-from researchwiki.mcp_server.service import WikiService, error_payload
+from researchwiki.mcp_server.service import SourceInput, WikiService, error_payload
 
 logger = logging.getLogger("researchwiki.mcp_server")
 
@@ -63,6 +63,11 @@ SERVER_INSTRUCTIONS = (
     "- 修正已有记忆：小修正文用 memory_update（必须留 reason，自动备份原稿）；"
     "内容已过时且有新结论用 memory_supersede（新笔记替代，旧 ID 沿链可达新 ID）；"
     "判定失效且没有替代内容用 memory_invalidate（自动生成墓碑笔记，旧记忆沿链可达墓碑）。\n"
+    "- 替代/修订要挂证据：两者都接受 source_urls（元素为 URL 字符串或"
+    ' {"url": ..., "content_hash": ...} 映射）。memory_supersede 给了来源 → 新记忆'
+    "的 sources=提供值且 confidence 重置为 medium（不继承旧证据的置信度）；"
+    "没给 → 新记忆没有来源，返回体 evidence=none 会明确告诉你。memory_update 的来源"
+    "是追加去重（修订是补证据，不替换旧证据）。\n"
     "- 别直接改写或忽视过时记忆：修订/取代/失效都会留 reason 与备份，"
     "这是记忆系统的审计底线。\n"
     "- 查单条记忆的版本史用 memory_timeline；查冲突台账用 memory_conflicts；"
@@ -190,26 +195,37 @@ _DESC_MEMORY_UPDATE = (
     "什么时候用：记忆内容基本正确但需要补充/修正细节时。如果旧记忆已整体过时、"
     "应改用 memory_supersede 或 memory_invalidate，而不是硬改。\n"
     "参数：note_id 记忆 ID（形如 N-0001，必须是 active 状态）；content 修订后的完整正文"
-    "（覆盖原正文）；reason 修订原因（必填）。\n"
+    "（覆盖原正文）；reason 修订原因（必填）；source_urls 本次用到的新来源（可选，"
+    '元素为 URL 字符串或 {"url": ..., "content_hash": ...} 映射），'
+    "**追加**到既有 sources 并按 (url, content_hash) 去重（修订是补充证据，不替换旧证据）。\n"
     "安全保障：写前自动备份原稿到 wiki-data/.backups/；reason 追加进 frontmatter 的"
     " update_reasons 列表（按修订顺序保留全部原因，含时间戳）并刷新 reviewed_at"
-    "——禁止静默覆盖，审计留痕是硬要求。\n"
-    "返回：{ok, note_id, reason, reviewed_at, backup, indexed, path}。"
-    "失败：code='not_found'（记忆不存在）/ 'invalid_argument'（非 active，先跟随重定向）/"
-    "'validation_failed'（content 或 reason 为空）。"
+    "——禁止静默覆盖，审计留痕是硬要求。confidence 不因本工具改变。\n"
+    "返回：{ok, note_id, reason, reviewed_at, backup, indexed, path, evidence, sources_added}"
+    "——evidence 为 provided（带 source_urls）/ none（没带，既有来源原样保留），"
+    "sources_added 是去重后新增的来源条数。\n"
+    "失败：code='not_found'（记忆不存在）/ 'invalid_argument'（非 active，先跟随重定向）/ "
+    "'validation_failed'（content 或 reason 为空，或 source_urls 非法：空列表、空 URL、"
+    "非字符串元素）。"
 )
 
 _DESC_MEMORY_SUPERSEDE = (
     "用新内容替代一条旧记忆：先写入新记忆，再把旧记忆标记为 superseded 并链到新 ID。\n"
     "什么时候用：旧记忆的结论已过时/被发现错误，你有了新的正确内容时"
-    "（如「X 支持 128k」→「X 支持 200k」）。\n"
+    "（如「X 支持 128k」→「X 支持 200k」）。替代时若有新来源请带上 source_urls："
+    "不带也能替代，但返回体会标注 evidence=none（提醒你这条新记忆没有证据链）。\n"
     "参数：note_id 旧记忆 ID（必须是 active）；new_content 新内容正文（必填）；"
-    "reason 替代原因（必填）。\n"
-    "语义：新记忆继承旧记忆的 entities/kind/confidence/volatility/importance；"
-    "旧记忆 status=superseded、superseded_by=新 ID，之后读旧 ID 会自动跟随到新记忆；"
-    "reason 记入旧记忆的 supersede_reason。\n"
-    "返回：{ok, old_note_id, new_note_id, superseded_by, reason, backup, path}。"
-    "失败：code='not_found' / 'invalid_argument' / 'validation_failed'。"
+    "reason 替代原因（必填）；source_urls 新记忆的来源（可选，元素为 URL 字符串或"
+    ' {"url": ..., "content_hash": ...} 映射；hash 可省）。\n'
+    "语义：新记忆继承旧记忆的 entities/kind/volatility/importance；sources **不继承**"
+    "旧记忆的来源（避免把旧证据伪装成新结论的证据）——给了 source_urls 就用提供值，"
+    "同时 confidence 重置为 medium（不把旧证据的 high 接到新证据上）；没给则 sources 为空"
+    "且 confidence 沿用旧值。旧记忆 status=superseded、superseded_by=新 ID，"
+    "之后读旧 ID 会自动跟随到新记忆；reason 记入旧记忆的 supersede_reason。\n"
+    "返回：{ok, old_note_id, new_note_id, superseded_by, reason, backup, path, evidence}"
+    "——evidence 为 provided（新记忆有来源）/ none（无来源的替代记忆）。\n"
+    "失败：code='not_found' / 'invalid_argument' / 'validation_failed'（含 source_urls "
+    "非法：空列表、空 URL、非字符串元素）。"
 )
 
 _DESC_MEMORY_INVALIDATE = (
@@ -422,9 +438,11 @@ def build_server(
             "openWorldHint": False,
         },
     )
-    def memory_update(note_id: str, content: str, reason: str) -> dict[str, Any]:
-        """修订既有记忆正文：写前备份 + reason 落盘，禁止静默覆盖。"""
-        return _call(service.update_memory, note_id, content, reason)
+    def memory_update(
+        note_id: str, content: str, reason: str, *, source_urls: list[SourceInput] | None = None
+    ) -> dict[str, Any]:
+        """修订既有记忆正文：写前备份 + reason 落盘；source_urls 追加新证据。"""
+        return _call(service.update_memory, note_id, content, reason, source_urls=source_urls)
 
     @mcp.tool(
         name="memory_supersede",
@@ -436,9 +454,21 @@ def build_server(
             "openWorldHint": False,
         },
     )
-    def memory_supersede(note_id: str, new_content: str, reason: str) -> dict[str, Any]:
+    def memory_supersede(
+        note_id: str,
+        new_content: str,
+        reason: str,
+        *,
+        source_urls: list[SourceInput] | None = None,
+    ) -> dict[str, Any]:
         """用新内容替代旧记忆：新笔记 + 旧笔记 superseded_by 链到新 ID。"""
-        return _call(service.supersede_memory, note_id, new_content, reason)
+        return _call(
+            service.supersede_memory,
+            note_id,
+            new_content,
+            reason,
+            source_urls=source_urls,
+        )
 
     @mcp.tool(
         name="memory_invalidate",

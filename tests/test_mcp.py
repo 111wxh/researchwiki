@@ -147,6 +147,34 @@ class TestProtocolLayer:
         }
         assert store_schema["required"] == ["content"]
 
+        # 证据链参数（P2 carried 项④）：新增可选 source_urls，必填参数不变（向后兼容）
+        update_schema = tools["memory_update"].input_schema
+        assert update_schema["required"] == ["note_id", "content", "reason"]
+        assert set(update_schema["properties"]) == {
+            "note_id",
+            "content",
+            "reason",
+            "source_urls",
+        }
+        supersede_schema = tools["memory_supersede"].input_schema
+        assert supersede_schema["required"] == ["note_id", "new_content", "reason"]
+        assert set(supersede_schema["properties"]) == {
+            "note_id",
+            "new_content",
+            "reason",
+            "source_urls",
+        }
+        # source_urls 的元素形态在 schema 里可读：URL 字符串 或 {url, content_hash} 映射
+        for schema in (update_schema, supersede_schema):
+            assert schema["properties"]["source_urls"]["default"] is None
+            items = schema["properties"]["source_urls"]["anyOf"][0]["items"]
+            assert [option.get("type") for option in items["anyOf"]] == ["string", "object"]
+        # 描述必须交代 evidence 语义（调用方要知道自己有没有挂上来源）
+        for name in ("memory_update", "memory_supersede"):
+            description = tools[name].description or ""
+            assert "source_urls" in description, name
+            assert "evidence" in description, name
+
     def test_write_read_search_roundtrip(self, server: FastMCP) -> None:
         written = _tool_call(
             server,
@@ -1070,6 +1098,272 @@ class TestMemoryTools:
             "validation_failed"
         )
 
+    # ---- 证据链（P2 carried 项④）：supersede / update 携带来源 -----------------
+
+    def test_supersede_with_sources_replaces_evidence_and_resets_confidence(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """带来源的取代：sources=提供值（不含旧来源）、confidence 不继承旧的 high。"""
+        _write_note(
+            service,
+            "GLM-5.3 支持 128k 上下文。",
+            title="上下文长度",
+            entities=["glm-5-3"],
+            confidence="high",
+            sources=["https://old.example.com/v1"],
+        )
+        payload = service.supersede_memory(
+            "N-0001",
+            "GLM-5.3 支持 200k 上下文。",
+            "官方文档更新为 200k",
+            source_urls=["https://new.example.com/v2"],
+        )
+        assert payload["ok"] is True
+        assert payload["evidence"] == "provided"
+        assert payload["new_note_id"] == "N-0002"
+
+        new_meta, new_body = parse(
+            (wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8")
+        )
+        # 新笔记来源 = 本次提供值；旧来源绝不能出现在新笔记里（防"旧证据伪装成新证据"）
+        assert new_meta["sources"] == [
+            {"url": "https://new.example.com/v2", "content_hash": ""}
+        ]
+        assert "https://old.example.com/v1" not in str(new_meta["sources"])
+        # 新证据不继承旧证据的置信度：high → medium（缺省）
+        assert new_meta["confidence"] == "medium"
+        # 身份连续性字段照旧继承
+        assert new_meta["entities"] == ["glm-5-3"]
+        assert "200k" in new_body and "128k" not in new_body
+
+        # 旧笔记自身的证据与置信度不被改写（历史仍可追溯）
+        old_meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        assert old_meta["status"] == "superseded"
+        assert old_meta["confidence"] == "high"
+        assert old_meta["sources"] == [
+            {"url": "https://old.example.com/v1", "content_hash": ""}
+        ]
+        # 沿链可达，且 read 能看到新笔记的来源
+        read = service.read("N-0001")
+        assert read["note"]["note_id"] == "N-0002"
+        assert read["note"]["sources"] == [
+            {"url": "https://new.example.com/v2", "content_hash": ""}
+        ]
+        assert "confidence 重置为 medium" in payload["message"]
+
+    def test_supersede_sources_accept_url_and_hash_mapping_mixed(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """source_urls 元素两种形态可混用：URL 字符串 / {url, content_hash} 映射。"""
+        _write_note(service, "某结论 v1。", title="结论", confidence="high")
+        payload = service.supersede_memory(
+            "N-0001",
+            "某结论 v2。",
+            "补上新来源",
+            source_urls=[
+                {"url": "https://a.example.com/x", "content_hash": "sha1:abc"},
+                "  https://b.example.com/y  ",  # URL 两侧空白归一
+                {"url": "https://c.example.com/z", "content_hash": None},  # hash 归一为空串
+                "https://b.example.com/y",  # 与上面同一条（去重后只留一条）
+            ],
+        )
+        assert payload["ok"] is True
+        assert "本次提供的 3 条" in payload["message"]  # 去重后计数
+        meta, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta["sources"] == [
+            {"url": "https://a.example.com/x", "content_hash": "sha1:abc"},
+            {"url": "https://b.example.com/y", "content_hash": ""},
+            {"url": "https://c.example.com/z", "content_hash": ""},
+        ]
+        assert meta["confidence"] == "medium"
+
+    def test_supersede_without_sources_keeps_p1a_behavior(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """不带来源：逐字段维持 P1-A 行为 + 返回体多出 evidence='none' 标注。"""
+        _write_note(
+            service,
+            "GLM-5.3 支持 128k。",
+            title="上下文长度",
+            entities=["glm-5-3"],
+            confidence="high",
+            volatility="drifting",
+            importance=0.7,
+            kind="experience",
+            sources=["https://old.example.com/v1"],
+        )
+        payload = service.supersede_memory("N-0001", "GLM-5.3 支持 200k。", "官方文档更新")
+        assert payload["ok"] is True
+        assert payload["evidence"] == "none"
+        assert set(payload) == {
+            "ok",
+            "old_note_id",
+            "new_note_id",
+            "superseded_by",
+            "reason",
+            "backup",
+            "path",
+            "evidence",
+            "message",
+            "warnings",
+        }, "相对 P1-A 只应多出 evidence"
+        assert payload["superseded_by"] == "N-0002"
+        assert "evidence=none" in payload["message"]
+        # 旧的"未提供 sources"告警保留（调用方仍被提醒证据链缺口）
+        assert "未提供 sources" in payload["warnings"][0]
+
+        meta, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta["confidence"] == "high"  # 未提供证据 → 沿用旧置信度（P1-A 行为）
+        assert meta["volatility"] == "drifting"
+        assert meta["kind"] == "experience"
+        assert meta["importance"] == 0.7
+        assert meta["entities"] == ["glm-5-3"]
+        assert meta["sources"] == []  # 不继承旧来源（P1-A 行为）
+
+    def test_update_appends_sources_deduped_by_url_and_hash(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """update 是修订语义：来源按 (url, content_hash) 去重后**追加**，旧证据不丢。"""
+        _write_note(
+            service,
+            "GLM-5.3 支持 128k。",
+            title="上下文长度",
+            confidence="high",
+            sources=["https://a.example.com/v1", "https://b.example.com/v1"],
+        )
+        payload = service.update_memory(
+            "N-0001",
+            "GLM-5.3 支持 200k。",
+            "官方文档更新",
+            source_urls=[
+                "https://a.example.com/v1",  # 完全重复（hash 同为空串）→ 不追加
+                # 同 url 不同 hash → 追加（判重键是 (url, content_hash)）
+                {"url": "https://a.example.com/v1", "content_hash": "sha1:x"},
+                # 新来源 → 追加；同一列表内重复 → 不追加
+                {"url": "https://c.example.com/v2", "content_hash": "sha1:new"},
+                {"url": "https://c.example.com/v2", "content_hash": "sha1:new"},
+            ],
+        )
+        assert payload["ok"] is True
+        assert payload["evidence"] == "provided"
+        assert payload["sources_added"] == 2
+        path = wiki_root / "notes" / "N-0001.md"
+        meta, body = parse(path.read_text(encoding="utf-8"))
+        assert meta["sources"] == [
+            {"url": "https://a.example.com/v1", "content_hash": ""},
+            {"url": "https://b.example.com/v1", "content_hash": ""},
+            {"url": "https://a.example.com/v1", "content_hash": "sha1:x"},
+            {"url": "https://c.example.com/v2", "content_hash": "sha1:new"},
+        ]
+        assert "200k" in body
+        assert meta["confidence"] == "high"  # 修订不改置信度
+        assert [r["reason"] for r in meta["update_reasons"]] == ["官方文档更新"]
+
+        # 再来一次同样的来源：零新增、sources 不变（幂等追加）
+        again = service.update_memory(
+            "N-0001",
+            "GLM-5.3 支持 256k。",
+            "又一次更新",
+            source_urls=[
+                "https://a.example.com/v1",
+                {"url": "https://c.example.com/v2", "content_hash": "sha1:new"},
+            ],
+        )
+        assert again["sources_added"] == 0
+        meta2, body2 = parse(path.read_text(encoding="utf-8"))
+        assert meta2["sources"] == meta["sources"]
+        assert "256k" in body2
+        assert [r["reason"] for r in meta2["update_reasons"]] == ["官方文档更新", "又一次更新"]
+
+    def test_update_without_sources_keeps_existing_sources(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """不带来源的修订：sources 原样保留，返回体 evidence='none'。"""
+        _write_note(service, "v1 正文", title="标题", sources=["https://a.example.com/v1"])
+        payload = service.update_memory("N-0001", "v2 正文", "原因")
+        assert payload["ok"] is True
+        assert payload["evidence"] == "none"
+        assert payload["sources_added"] == 0
+        meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        assert meta["sources"] == [{"url": "https://a.example.com/v1", "content_hash": ""}]
+
+        # 原本无来源的笔记也不会凭空长出 sources
+        _write_note(service, "无来源正文", title="无来源")
+        bare = service.update_memory("N-0002", "无来源正文 v2", "原因")
+        assert bare["evidence"] == "none" and bare["sources_added"] == 0
+        meta_bare, _ = parse((wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8"))
+        assert meta_bare["sources"] == []
+
+    @pytest.mark.parametrize(
+        "bad_sources",
+        [
+            pytest.param([], id="empty-list"),
+            pytest.param([""], id="empty-url"),
+            pytest.param(["   "], id="blank-url"),
+            pytest.param([{"content_hash": "sha1:x"}], id="mapping-without-url"),
+            pytest.param([{"url": ""}], id="mapping-with-empty-url"),
+            pytest.param([123], id="non-string-element"),
+            pytest.param("https://example.com/a", id="bare-string-not-list"),
+        ],
+    )
+    def test_evidence_source_validation_failures_leave_no_trace(
+        self, service: WikiService, wiki_root: Path, bad_sources: Any
+    ) -> None:
+        """非法来源参数走既有 validation_failed，且在备份 / 落盘之前就被拒绝。"""
+        _write_note(service, "原正文", title="标题", sources=["https://old.example.com/v1"])
+        path = wiki_root / "notes" / "N-0001.md"
+        before = path.read_text(encoding="utf-8")
+        backups_before = sorted(p.name for p in (wiki_root / ".backups").iterdir())
+
+        for payload in (
+            service.update_memory("N-0001", "新正文", "原因", source_urls=bad_sources),
+            service.supersede_memory("N-0001", "新内容", "原因", source_urls=bad_sources),
+        ):
+            assert payload["ok"] is False, bad_sources
+            assert payload["error"]["code"] == "validation_failed", bad_sources
+            assert payload["error"]["details"]["errors"]
+
+        assert path.read_text(encoding="utf-8") == before  # 原笔记零改写
+        assert not (wiki_root / "notes" / "N-0002.md").exists()  # supersede 未写出新笔记
+        assert sorted(p.name for p in (wiki_root / ".backups").iterdir()) == backups_before
+
+    def test_evidence_sources_stay_visible_after_index_sync(
+        self, service: WikiService
+    ) -> None:
+        """回归：带来源的修订 / 取代仍走既有索引同步通道（read 可见、search 命中）。"""
+        service.store_memory("GLM-5.3 支持 128k 上下文。")
+        updated = service.update_memory(
+            "N-0001",
+            "GLM-5.3 支持 200k 上下文。",
+            "官方文档更新",
+            source_urls=["https://example.com/glm"],
+        )
+        assert updated["evidence"] == "provided"
+        assert updated["indexed"] is True
+        assert service.read("N-0001")["note"]["sources"] == [
+            {"url": "https://example.com/glm", "content_hash": ""}
+        ]
+        assert service.search("200k")["count"] == 1
+
+        superseded = service.supersede_memory(
+            "N-0001",
+            "GLM-5.3 支持 256k 上下文。",
+            "再次更新",
+            source_urls=[{"url": "https://example.com/glm-v2", "content_hash": "sha1:v2"}],
+        )
+        assert superseded["evidence"] == "provided"
+        assert service.read("N-0002")["note"]["sources"] == [
+            {"url": "https://example.com/glm-v2", "content_hash": "sha1:v2"}
+        ]
+        assert service.search("256k")["count"] == 1
+        assert service.health()["index"]["stale"] is False
+        assert service.health()["notes"] == {
+            "total": 2,
+            "active": 1,
+            "merged": 0,
+            "superseded": 1,
+        }
+
     def test_invalidate_creates_reachable_tombstone(
         self, service: WikiService, wiki_root: Path
     ) -> None:
@@ -1307,6 +1601,82 @@ class TestMemoryProtocol:
         )
         assert payload["ok"] is False
         assert payload["error"]["code"] == "not_found"
+
+    def test_memory_evidence_sources_over_wire(self, server: FastMCP) -> None:
+        """端到端：source_urls 两种形态经 MCP 报文往返后落到 frontmatter 与返回体。"""
+        stored = _tool_call(
+            server,
+            "memory_store",
+            {"content": "GLM-5.3 支持 128k 上下文。", "source_urls": ["https://old.example.com"]},
+        )
+        assert stored["ok"] is True
+
+        # 不带来源的取代：evidence=none（新记忆无证据链，调用方看得见）
+        bare = _tool_call(
+            server,
+            "memory_supersede",
+            {"note_id": "N-0001", "new_content": "GLM-5.3 支持 200k。", "reason": "更新"},
+        )
+        assert bare["evidence"] == "none"
+
+        # 带来源的取代（混合形态） + 追加式修订
+        superseded = _tool_call(
+            server,
+            "memory_supersede",
+            {
+                "note_id": "N-0002",
+                "new_content": "GLM-5.3 支持 256k 上下文。",
+                "reason": "官方文档更新",
+                "source_urls": [
+                    "https://new.example.com/v2",
+                    {"url": "https://another.example.com", "content_hash": "sha1:h"},
+                ],
+            },
+        )
+        assert superseded["ok"] is True
+        assert superseded["evidence"] == "provided"
+        assert superseded["new_note_id"] == "N-0003"
+        read = _tool_call(server, "wiki_read", {"note_id": "N-0002"})
+        assert read["note"]["note_id"] == "N-0003"
+        assert read["note"]["sources"] == [
+            {"url": "https://new.example.com/v2", "content_hash": ""},
+            {"url": "https://another.example.com", "content_hash": "sha1:h"},
+        ]
+        assert read["note"]["confidence"] == "medium"  # 不继承旧证据的置信度
+
+        updated = _tool_call(
+            server,
+            "memory_update",
+            {
+                "note_id": "N-0003",
+                "content": "GLM-5.3 支持 256k 上下文（官方 v3）。",
+                "reason": "补一条来源",
+                "source_urls": ["https://third.example.com"],
+            },
+        )
+        assert updated["ok"] is True
+        assert updated["evidence"] == "provided"
+        assert updated["sources_added"] == 1
+        read_again = _tool_call(server, "wiki_read", {"note_id": "N-0003"})
+        assert [s["url"] for s in read_again["note"]["sources"]] == [
+            "https://new.example.com/v2",
+            "https://another.example.com",
+            "https://third.example.com",
+        ]
+
+        # 非法来源参数也走结构化错误（is_error=False 的普通结果）
+        bad = _tool_call(
+            server,
+            "memory_update",
+            {
+                "note_id": "N-0003",
+                "content": "正文",
+                "reason": "原因",
+                "source_urls": [{"content_hash": "sha1:x"}],
+            },
+        )
+        assert bad["ok"] is False
+        assert bad["error"]["code"] == "validation_failed"
 
 
 # ---- 健康检查 ---------------------------------------------------------------
