@@ -434,8 +434,8 @@ class TestStore:
         assert marked.meta.source_changed_at == "2026-06-01T00:00:00+00:00"
         # 只记"何时发现变化"：sources 里的 hash 不动（换版要等复核后由 supersede 决定）
         assert marked.meta.sources[0].content_hash == "a" * 64
-        # 去重记账：被检测到的哈希进 extra（同一次变化下次调用即 no-op）
-        assert marked.meta.extra["source_changed_hash"] == new_hash
+        # 去重记账：被检测到的哈希按 URL 分槽进 extra（同一次变化下次调用即 no-op）
+        assert marked.meta.extra["source_changed_hash"] == {url: new_hash}
         # 其余字段原样保留（正文 / 有效期 / 复核时间 / 既有 extra 键）
         assert marked.body == "记录了旧哈希的断言"
         assert marked.meta.reviewed_at == "2026-01-01T00:00:00+00:00"
@@ -481,7 +481,7 @@ class TestStore:
             assert unchanged is not None
             assert unchanged.meta.source_changed_at == "2026-06-01T00:00:00+00:00"
             assert unchanged.meta.reviewed_at == "2026-06-02T00:00:00+00:00"
-            assert unchanged.meta.extra["source_changed_hash"] == hash_b
+            assert unchanged.meta.extra["source_changed_hash"] == {url: hash_b}
 
     def test_mark_source_changed_new_hash_advances_timestamp(self, store: WikiStore):
         """哈希确实再次变化（hashB → hashC）→ 正常标记并推后时间戳。"""
@@ -498,12 +498,12 @@ class TestStore:
         marked = store.get_note("N-0001")
         assert marked is not None
         assert marked.meta.source_changed_at == "2026-06-05T00:00:00+00:00"
-        assert marked.meta.extra["source_changed_hash"] == "c" * 64
-        # 回到更早见过的 hashB（与最近记账的 hashC 不同）→ 仍算一次新变化
+        assert marked.meta.extra["source_changed_hash"] == {url: "c" * 64}
+        # 回到更早见过的 hashB（与该 URL 最近记账的 hashC 不同）→ 仍算一次新变化
         reverted = store.mark_source_changed(url, "b" * 64, now="2026-06-06T00:00:00+00:00")
         assert reverted == ["N-0001"]
         back = store.get_note("N-0001")
-        assert back is not None and back.meta.extra["source_changed_hash"] == "b" * 64
+        assert back is not None and back.meta.extra["source_changed_hash"] == {url: "b" * 64}
 
     def test_mark_source_changed_record_loss_remark(self, store: WikiStore):
         """退化情形：去重记录被外部重写清掉时，同一变化会被再标记一次（宁多标不漏标）。"""
@@ -521,7 +521,99 @@ class TestStore:
         again = store.get_note("N-0001")
         assert again is not None
         assert again.meta.source_changed_at == "2026-06-02T00:00:00+00:00"
-        assert again.meta.extra["source_changed_hash"] == hash_b
+        assert again.meta.extra["source_changed_hash"] == {url: hash_b}
+
+    def test_mark_source_changed_slots_are_per_url(self, store: WikiStore):
+        """多来源笔记（评审修复轮 2/5）：去重槽按 URL 分，互不覆盖。
+
+        单槽实现下 mark(url1,h1) 记 h1 → mark(url2,h2) 覆盖成 h2 → 下一周期
+        mark(url1,h1) 又被判"新变化"再推时间戳，已复核笔记被永久钉在 review_due。
+        """
+        url1 = "https://example.com/one"
+        url2 = "https://example.com/two"
+        hash_a, hash_b = "a" * 64, "b" * 64
+        store.save_note(
+            "两个来源的断言",
+            note_id="N-0001",
+            reviewed_at="2026-01-01T00:00:00+00:00",
+            sources=[
+                SourceRef(url=url1, content_hash="1" * 64),
+                SourceRef(url=url2, content_hash="2" * 64),
+            ],
+        )
+        # 调用方按 URL 循环标记两个来源各自的"变化后"哈希
+        marked_one = store.mark_source_changed(url1, hash_a, now="2026-06-01T00:00:00+00:00")
+        marked_two = store.mark_source_changed(url2, hash_b, now="2026-06-01T00:01:00+00:00")
+        assert marked_one == ["N-0001"] and marked_two == ["N-0001"]
+        marked = store.get_note("N-0001")
+        assert marked is not None
+        # 两个槽都在（单槽实现此时只剩 url2 的 h2）
+        assert marked.meta.extra["source_changed_hash"] == {url1: hash_a, url2: hash_b}
+        # 复核：reviewed_at 晚于最后一次标记的 source_changed_at
+        store.save_note(
+            marked.body,
+            note_id=marked.id,
+            title=marked.title,
+            reviewed_at="2026-06-02T00:00:00+00:00",
+            source_changed_at=marked.meta.source_changed_at,
+            sources=list(marked.meta.sources),
+            extra=dict(marked.meta.extra),
+            created=marked.meta.created,
+        )
+        # 下一周期照原顺序重放同一对 (url1,hA) / (url2,hB)：都是 no-op，
+        # 时间戳与复核时间都不动（"已复核笔记不被重新拉回 review_due"对多来源笔记成立）
+        for stamp in ("2026-06-10T00:00:00+00:00", "2026-06-20T00:00:00+00:00"):
+            assert store.mark_source_changed(url1, hash_a, now=stamp) == []
+            assert store.mark_source_changed(url2, hash_b, now=stamp) == []
+        unchanged = store.get_note("N-0001")
+        assert unchanged is not None
+        assert unchanged.meta.source_changed_at == "2026-06-01T00:01:00+00:00"
+        assert unchanged.meta.reviewed_at == "2026-06-02T00:00:00+00:00"
+        assert unchanged.meta.extra["source_changed_hash"] == {url1: hash_a, url2: hash_b}
+        # 其中一条来源（url1）哈希真的再变 → 正常标记并推后时间戳；url2 的槽不动
+        changed = store.mark_source_changed(url1, "c" * 64, now="2026-06-21T00:00:00+00:00")
+        assert changed == ["N-0001"]
+        advanced = store.get_note("N-0001")
+        assert advanced is not None
+        assert advanced.meta.source_changed_at == "2026-06-21T00:00:00+00:00"
+        assert advanced.meta.extra["source_changed_hash"] == {url1: "c" * 64, url2: hash_b}
+        # 这条来源回到 hashA（≠ 最近记账的 c）→ 仍算新变化（与单 URL 语义一致）
+        reverted = store.mark_source_changed(url1, hash_a, now="2026-06-22T00:00:00+00:00")
+        assert reverted == ["N-0001"]
+
+    def test_mark_source_changed_legacy_single_slot_is_ignored(self, store: WikiStore):
+        """兼容语义：旧单槽（字符串）记账无法归属 URL，读取时忽略、写入时归一为映射。
+
+        代价是升级后首次标记会重推一次时间戳（宁可多标一次也不漏标）。
+        """
+        url = "https://example.com/x"
+        hash_b = "b" * 64
+        store.save_note(
+            "来自旧快照的断言",
+            note_id="N-0001",
+            sources=[SourceRef(url=url, content_hash="a" * 64)],
+            # 旧版本（P2-B 首版）的记账形态：裸字符串
+            extra={"source_changed_hash": hash_b},
+        )
+        # 旧值不被当作该 URL 的去重依据 → 重新标记一次
+        first = store.mark_source_changed(url, hash_b, now="2026-06-01T00:00:00+00:00")
+        assert first == ["N-0001"]
+        migrated = store.get_note("N-0001")
+        assert migrated is not None
+        assert migrated.meta.extra["source_changed_hash"] == {url: hash_b}  # 归一为新形态
+        # 归一之后同哈希调用即 no-op
+        assert store.mark_source_changed(url, hash_b, now="2026-06-02T00:00:00+00:00") == []
+        assert store.get_note("N-0001").meta.source_changed_at == "2026-06-01T00:00:00+00:00"
+        # 畸形记账（非映射非字符串）同样按忽略处理，不抛异常
+        store.save_note(
+            "来自旧快照的断言",
+            note_id="N-0001",
+            sources=[SourceRef(url=url, content_hash="a" * 64)],
+            extra={"source_changed_hash": [hash_b]},
+        )
+        assert store.mark_source_changed(url, hash_b, now="2026-06-03T00:00:00+00:00") == ["N-0001"]
+        fixed = store.get_note("N-0001")
+        assert fixed is not None and fixed.meta.extra["source_changed_hash"] == {url: hash_b}
 
     def test_pages(self, store: WikiStore):
         page = store.save_page("context-compression", "上下文压缩", "第一版")

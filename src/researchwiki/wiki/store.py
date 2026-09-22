@@ -30,9 +30,11 @@ from researchwiki.wiki.frontmatter import NoteMeta, SourceRef, dump, parse
 
 CONFLICT_ID_RE = re.compile(r"^C-(\d+)$")
 
-# mark_source_changed 的去重记账键：最近一次"为该新哈希标记过来源变化"的哈希值。
+# mark_source_changed 的去重记账键：``{url: 最近一次为该 URL 标记过的 new_content_hash}``。
 # 存在 note extra 里（不新增类型化 frontmatter 字段，与 formation_reason /
-# update_reasons 同处 extra，round-trip 不丢）；用途见该方法的 docstring。
+# update_reasons 同处 extra，round-trip 不丢）；**按 URL 分槽**——笔记常引用多个
+# 来源，单槽会被不同 URL 的标记互相覆盖，导致下一周期把已记过的变化判成"新变化"
+# 再推时间戳（详见该方法的 docstring）。用途与兼容语义见 mark_source_changed。
 SOURCE_CHANGED_HASH_KEY = "source_changed_hash"
 
 
@@ -323,27 +325,39 @@ class WikiStore:
 
         - 只处理 **active** 笔记（merged/superseded 已退役，复核无意义）；
         - 命中条件：引用了该 URL **且** 记录里的 content_hash ≠ ``new_content_hash``
-          **且** 该笔记还没有为这个新哈希标记过（去重见下）；
+          **且** 该笔记还没有为这个 URL 的这个新哈希标记过（去重见下）；
         - 写入 ``source_changed_at = now``（缺省当前 UTC 秒级 ISO），**只记"何时
           发现变化"**，不改 sources 里的 content_hash——证据换版要等复核后由
           supersede / memory_update 决定（下一包），这样来源变化的检测与证据的
           修订是两个可分别审计的动作；
-        - 同时把被检测到的 ``new_content_hash`` 记进 ``extra["source_changed_hash"]``
-          （不新增类型化 frontmatter 字段，与 formation_reason / update_reasons
-          同处 extra，round-trip 不丢）；
+        - 同时把被检测到的 ``new_content_hash`` 记进
+          ``extra["source_changed_hash"]``（不新增类型化 frontmatter 字段，与
+          formation_reason / update_reasons 同处 extra，round-trip 不丢），
+          形态是 ``{url: hash}`` 的映射；
         - 笔记的其余字段（含 reviewed_at / valid_* / 其余 extra 键）原样保留，
           只这两个写入项变化；返回值按 note_id 升序，便于调用方直接展示。
 
-        **去重（幂等）**：同一次变化反复检测是 no-op —— 若
-        ``extra["source_changed_hash"] == new_content_hash``，直接跳过（返回空列表、
-        时间戳不动）。没有这条记账时，例行检测（P4 refresh 每周期调用）会把
-        ``source_changed_at`` 一路往后推，于是"标记 → 复核（reviewed_at 晚于
-        source_changed_at → 恢复 fresh）→ 下一周期又被标记推后"，
-        已复核的笔记被永久钉在 review_due；记账后的行为：同一变化只标记一次，
-        **哈希确实再次变化时**（新的 new_content_hash）正常标记并推后时间戳。
-        退化情形：若 ``source_changed_hash`` 记录被外部清掉（含经
-        ``save_note`` 不带 extra 的重写），同一变化会被再标记一次——可接受，
-        宁可多标一次也不漏标。
+        **去重（幂等，按 URL 分槽）**：同一次变化反复检测是 no-op —— 若
+        ``extra["source_changed_hash"][url] == new_content_hash``，直接跳过
+        （返回空列表、时间戳不动）。没有这条记账时，例行检测（P4 refresh 每周期
+        调用）会把 ``source_changed_at`` 一路往后推，于是"标记 → 复核（reviewed_at
+        晚于 source_changed_at → 恢复 fresh）→ 下一周期又被标记推后"，
+        已复核的笔记被永久钉在 review_due；记账后的行为：同一 URL 的同一次变化
+        只标记一次，**哈希确实再次变化时**（该 URL 的新 new_content_hash）正常
+        标记并推后时间戳。
+
+        为什么按 URL 分槽而不是只记一个哈希：笔记引用多个来源是成熟 wiki 的常态，
+        调用方按 URL 循环标记时，单槽会被不同 URL 互相覆盖（mark(url1,h1) 记 h1 →
+        mark(url2,h2) 覆盖成 h2 → 下一周期 mark(url1,h1) 又被判成"新变化"），
+        对这类多来源笔记，"永久 review_due"照旧发生。分槽后每条 URL 的记账互不
+        干扰，槽位数上界 = 该笔记引用过的 URL 数（不随检测次数增长）。
+
+        **兼容语义**：旧版本（P2-B 首版）记的是单值字符串，无法归属到具体 URL，
+        读取时**一律忽略**（不当作任何 URL 的去重依据——宁可多标一次也不漏标），
+        写入时用 ``{url: hash}`` 映射覆盖它（frontmatter 归一为新形态，旧值不再
+        保留）。因此升级后首次标记某 URL 会重新推后一次时间戳，此后即按 URL 去重。
+        退化情形：若整个记账键被外部清掉（含经 ``save_note`` 不带 extra 的重写），
+        同一变化会被再标记一次——可接受，宁可多标一次也不漏标。
         """
         stamp = now or datetime.now(UTC).isoformat(timespec="seconds")
         affected: list[str] = []
@@ -358,9 +372,15 @@ class WikiStore:
                 continue  # 记录哈希与新哈希一致：证据未变
             meta = note.meta
             extra = dict(meta.extra)
-            if str(extra.get(SOURCE_CHANGED_HASH_KEY) or "") == new_content_hash:
-                continue  # 同一次变化已标记过：no-op，不刷新时间戳（防"永久钉在 review_due"）
-            extra[SOURCE_CHANGED_HASH_KEY] = new_content_hash
+            recorded = extra.get(SOURCE_CHANGED_HASH_KEY)
+            if isinstance(recorded, Mapping) and recorded.get(url) == new_content_hash:
+                continue  # 该 URL 的同一次变化已标记过：no-op（防"永久钉在 review_due"）
+            # 旧形态（单值字符串）或其它非映射值：忽略，只保留可归属的映射槽
+            slots: dict[str, str] = {}
+            if isinstance(recorded, Mapping):
+                slots = {str(k): str(v) for k, v in recorded.items()}
+            slots[url] = new_content_hash
+            extra[SOURCE_CHANGED_HASH_KEY] = slots
             self.save_note(
                 body=note.body,
                 note_id=note.id,
