@@ -3,7 +3,7 @@
 question    : Agent 长期记忆的主流方案（Letta、Mem0 等）如何做记忆固化与检索？
 provider    : config
 model       : strong=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）  cheap=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）
-wiki_root   : D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T072837Z
+wiki_root   : D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T074549Z
 out         : smoke_out\cold_warm_real.jsonl
 ----------------------------------------------------------------------------
 [cold] run 开始（空 Wiki 冷启动）
@@ -11,11 +11,34 @@ out         : smoke_out\cold_warm_real.jsonl
   [note] N-0002 conf=high
   [note] N-0003 conf=high
   [note] N-0004 conf=high
-  [note] N-0005 conf=medium
-  [note] N-0006 conf=medium
+  [note] N-0005 conf=high
+  [note] N-0006 conf=high
   [note] N-0007 conf=high
-  [note] N-0008 conf=medium
-[cold] trace_id=c13d72fd36be  prior_hit=0  notes(created/merged)=8/0  sources=6  in/out=63273/5252  latency=120879ms
+  [note] N-0008 conf=high
+[cold] trace_id=9daad1cb9289  prior_hit=0  notes(created/merged)=8/0  sources=5  in/out=71831/5309  latency=107719ms
 [warm] run 开始（同一 wiki 根目录二次研究）
-✗ 运行异常：OperationalError: database is locked
-（config 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）
+  [note] N-0009 conf=high
+  [note] N-0010 conf=high
+  [note] N-0011 conf=high
+  [note] N-0012 conf=high
+  [note] N-0013 conf=high
+  [note] N-0014 conf=high
+  [note] N-0015 conf=high
+  [note] N-0016 conf=high
+[warm] trace_id=e52c8eee737a  prior_hit=5  notes(created/merged)=8/0  sources=5  in/out=53719/4557  latency=74465ms
+----------------------------------------------------------------------------
+── cold vs warm 对照（差值 = warm − cold）──
+指标                          cold          warm            差值
+prior_hit_count                0             5            +5
+fresh_search_count            13             7            -6
+fresh_fetch_count              3             2            -1
+source_count                   5             5            +0
+notes_created                  8             8            +0
+input_tokens               71831         53719        -18112
+output_tokens               5309          4557          -752
+latency_ms                107719         74465        -33254
+citation_coverage         1.0000        0.8000       -0.2000
+注：小样本冒烟，不构成收益结论（PLAN §11.1）。
+----------------------------------------------------------------------------
+✓ 断言通过：cold 空 Wiki 冷启动（prior_hit_count=0，沉淀 8 条 active note）；warm run prior_hit_count=5 > 0；两次 run 的 input/output tokens 与 sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致（可复算）。
+JSONL 已写入 smoke_out\cold_warm_real.jsonl
