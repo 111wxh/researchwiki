@@ -1,0 +1,915 @@
+"""旧记忆与新证据的结构化比较测试（P2-C / RQ2 判定侧）。
+
+覆盖 task-10 简报的验收清单：
+
+- 五类 verdict 各至少一例（judge=None 下全部可达）+ verdict → suggested_action 映射；
+- 来源变化两分支（无冲突 → newer；有冲突 → conflicting）与"来源未变 → consistent"；
+- 时间相等/更早不判 newer；基准时间 observed_at → created 且与 P2-A freshness 同口径；
+- 相似度地板生效（低于地板 → uncertain/none，且不调用 judge）；
+- judge 只在 uncertain 被调用（计数 stub 断言）、返回 None/非法值/抛异常都保持
+  uncertain，judge=None 全绿；
+- 规则优先级（冲突门 > 来源变化 > 时间；一致 > 时间；时间 > 具体度）；
+- 冲突槽位识别纯函数（同量词上下文、单侧多值跳过、裸数字不比较、归一化）；
+- from_config 宽容回退与开关；
+- 理由行引用具体值（hash 前 8 位、数值、时间戳），to_dict 可序列化；
+- 不写盘、不写台账、不改笔记（"不静默覆盖"）。
+
+全部零网络、零模型调用；固定时间戳，断言精确到数值。
+"""
+
+import json
+
+import pytest
+
+from researchwiki.wiki import verification as vf
+from researchwiki.wiki.embeddings import MockEmbeddingProvider
+from researchwiki.wiki.freshness import evaluate_freshness
+from researchwiki.wiki.frontmatter import NoteMeta, SourceRef
+from researchwiki.wiki.store import Note, WikiStore
+
+NOW = "2026-06-01T00:00:00+00:00"
+LATER = "2026-09-01T00:00:00+00:00"
+EARLIER = "2026-01-01T00:00:00+00:00"
+MID = "2026-03-01T00:00:00+00:00"
+URL = "https://example.test/doc"
+MODEL_BODY = "模型 A 的上下文窗口是 128k。"
+MODEL_EVIDENCE = "模型 A 的上下文窗口是 128k，另有 256k 可选。"
+HASH_OLD = "1a2b3c4d5e6f7788"
+HASH_NEW = "9f8e7d6c5b4a3928"
+
+
+# ---- 构造工具 ---------------------------------------------------------------
+
+
+def make_note(
+    *,
+    body: str = "项目使用 uv 管理依赖。",
+    note_id: str = "N-0001",
+    observed_at: str | None = NOW,
+    created: str = NOW,
+    sources: list[SourceRef] | None = None,
+    source_changed_at: str | None = None,
+    reviewed_at: str | None = None,
+    entities: list[str] | None = None,
+) -> Note:
+    """构造一条测试旧记忆（时间基准与来源均可显式覆盖）。"""
+    meta = NoteMeta(
+        id=note_id,
+        title="判定测试",
+        observed_at=observed_at,
+        created=created,
+        sources=list(sources or []),
+        source_changed_at=source_changed_at,
+        reviewed_at=reviewed_at,
+        entities=list(entities or []),
+    )
+    return Note(id=note_id, title=meta.title, body=body, meta=meta, path=None)
+
+
+def evi(
+    text: str,
+    *,
+    observed_at: str | None = None,
+    source_url: str = "",
+    content_hash: str = "",
+    entities: list[str] | None = None,
+) -> vf.EvidenceItem:
+    """构造一条新证据。"""
+    return vf.EvidenceItem(
+        text=text,
+        observed_at=observed_at,
+        source_url=source_url,
+        content_hash=content_hash,
+        entities=list(entities or []),
+    )
+
+
+def counting_judge(verdict: str | None = None, *, error: Exception | None = None):
+    """计数判官桩：记录调用参数，按需返回 verdict / None / 抛异常。"""
+    calls: list[tuple[str, str]] = []
+
+    def judge(prior: Note, evidence: vf.EvidenceItem) -> str | None:
+        calls.append((prior.id, evidence.text))
+        if error is not None:
+            raise error
+        return verdict
+
+    return judge, calls
+
+
+def source_url_note(**kwargs) -> Note:
+    """带一条来源快照（hash = HASH_OLD）的旧记忆。"""
+    kwargs.setdefault("body", "模型 A 的上下文窗口是 128k。")
+    kwargs.setdefault("sources", [SourceRef(url=URL, content_hash=HASH_OLD)])
+    return make_note(**kwargs)
+
+
+# ---- 五类 verdict -----------------------------------------------------------
+
+
+def test_consistent_when_evidence_restates_prior() -> None:
+    note = make_note(body="项目使用 uv 管理依赖，Python 3.12。")
+    result = vf.compare_prior_and_evidence(note, evi("项目使用 uv 管理依赖，Python 3.12。"))
+    assert result.verdict == vf.VERDICT_CONSISTENT
+    assert result.suggested_action == vf.ACTION_REFRESH_REVIEWED_AT
+    assert result.prior_note_id == "N-0001"
+    assert result.evidence_index == 0
+    assert any("一致：相似度" in reason for reason in result.reasons)
+
+
+def test_newer_when_evidence_is_later_and_reworded() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert result.suggested_action == vf.ACTION_SUPERSEDE
+    assert NOW in result.reasons[2] and LATER in result.reasons[2]
+
+
+def test_newer_when_source_content_changed() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note,
+        evi(
+            "模型 A 的上下文窗口是 128k，另有 256k 可选。",
+            source_url=URL,
+            content_hash=HASH_NEW,
+        ),
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert result.suggested_action == vf.ACTION_SUPERSEDE
+    assert "来源变化" in result.reasons[2]
+    assert "1a2b3c4d" in result.reasons[2] and "9f8e7d6c" in result.reasons[2]
+
+
+def test_more_specific_when_evidence_carries_more_facts() -> None:
+    note = make_note(body="该系列有 3 个版本。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("该系列有 3 个版本，其中 Pro 版本参数 70B，发布于 2026-09。")
+    )
+    assert result.verdict == vf.VERDICT_MORE_SPECIFIC
+    assert result.suggested_action == vf.ACTION_MERGE
+    assert any("更具体" in reason for reason in result.reasons)
+    assert any("number:70" in reason and "date:2026-09" in reason for reason in result.reasons)
+
+
+def test_conflicting_when_slot_values_differ() -> None:
+    note = make_note(body="GLM-5.3 的上下文窗口是 128k。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-4.5 的上下文窗口是 64k。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert result.suggested_action == vf.ACTION_OPEN_CONFLICT
+    joined = "\n".join(result.reasons)
+    assert "旧=128" in joined and "新=64" in joined
+    assert "旧=5.3" in joined and "新=4.5" in joined
+    assert len(result.conflicts) == 2
+    assert [c.to_dict()["slot"] for c in result.conflicts] == [
+        "number:k:上下文窗口是",
+        "version:GLM",
+    ]
+
+
+def test_uncertain_when_no_deterministic_signal() -> None:
+    note = make_note(body="用户偏好中文回答。")
+    result = vf.compare_prior_and_evidence(note, evi("用户喜欢用中文交流。"))
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.judge_used is False
+    assert any("无确定性判据" in reason for reason in result.reasons)
+
+
+def test_all_five_verdicts_reachable_without_judge() -> None:
+    """judge=None 下五类判定全部可达（本包零模型调用也能工作）。"""
+    cases = [
+        (
+            vf.VERDICT_CONSISTENT,
+            make_note(body="项目使用 uv 管理依赖。"),
+            evi("项目使用 uv 管理依赖。"),
+        ),
+        (
+            vf.VERDICT_NEWER,
+            make_note(body="GLM-5.3 支持工具调用。"),
+            evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER),
+        ),
+        (
+            vf.VERDICT_MORE_SPECIFIC,
+            make_note(body="该系列有 3 个版本。"),
+            evi("该系列有 3 个版本，Pro 版本参数 70B。"),
+        ),
+        (
+            vf.VERDICT_CONFLICTING,
+            make_note(body="GLM-5.3 的上下文窗口是 128k。"),
+            evi("GLM-4.5 的上下文窗口是 64k。"),
+        ),
+        (
+            vf.VERDICT_UNCERTAIN,
+            make_note(body="用户偏好中文回答。"),
+            evi("用户喜欢用中文交流。"),
+        ),
+    ]
+    for expected, note, evidence in cases:
+        assert vf.compare_prior_and_evidence(note, evidence).verdict == expected
+
+
+def test_verdict_action_table_is_total() -> None:
+    assert set(vf.VERDICT_ACTIONS) == set(vf.VERDICTS)
+    assert vf.VERDICT_ACTIONS == {
+        "consistent": "refresh_reviewed_at",
+        "newer": "supersede",
+        "more_specific": "merge",
+        "conflicting": "open_conflict",
+        "uncertain": "none",
+    }
+
+
+# ---- 来源变化两分支与"来源未变" --------------------------------------------
+
+
+def test_source_change_without_conflict_is_newer() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note, evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW)
+    )
+    joined = "\n".join(result.reasons)
+    assert result.verdict == vf.VERDICT_NEWER
+    assert "source_changed_at=2026-08-01T00:00:00+00:00" in joined
+    assert "另：证据新增事实令牌 number:256" in joined  # 供 P2-D supersede 时保留
+
+
+def test_source_change_with_conflict_is_conflicting() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note, evi("模型 A 的上下文窗口是 256k。", source_url=URL, content_hash=HASH_NEW)
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert result.suggested_action == vf.ACTION_OPEN_CONFLICT
+
+
+def test_unchanged_source_hash_is_not_newer() -> None:
+    note = source_url_note(body="模型 A 上下文 128k。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("模型 A 上下文 128k。", source_url=URL, content_hash=HASH_OLD)
+    )
+    assert result.verdict == vf.VERDICT_CONSISTENT
+    joined = "\n".join(result.reasons)
+    assert "来源未变" in joined and "1a2b3c4d" in joined
+
+
+def test_source_url_hit_without_hash_is_not_newer() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note, evi(MODEL_EVIDENCE, source_url=URL)
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+    assert result.verdict == vf.VERDICT_MORE_SPECIFIC
+    assert any("未给 content_hash" in reason for reason in result.reasons)
+
+
+def test_hash_differs_without_source_changed_at_is_not_newer() -> None:
+    note = source_url_note()  # 没有 source_changed_at 标记
+    result = vf.compare_prior_and_evidence(
+        note, evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW)
+    )
+    assert result.verdict == vf.VERDICT_MORE_SPECIFIC
+    joined = "\n".join(result.reasons)
+    assert "未声明 source_changed_at" in joined
+    assert "旧=1a2b3c4d" in joined and "新=9f8e7d6c" in joined
+
+
+def test_unparseable_source_changed_at_is_treated_as_undeclared() -> None:
+    note = source_url_note(source_changed_at="昨天")
+    result = vf.compare_prior_and_evidence(
+        note, evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW)
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+    joined = "\n".join(result.reasons)
+    assert "source_changed_at=昨天 不是合法 ISO 时间" in joined
+    assert "未声明 source_changed_at" in joined
+
+
+def test_source_url_not_matching_prior_refs_is_ignored() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note,
+        evi(MODEL_EVIDENCE, source_url="https://other.test/doc", content_hash=HASH_NEW),
+    )
+    joined = "\n".join(result.reasons)
+    assert result.verdict != vf.VERDICT_NEWER
+    assert "来源变化" not in joined
+
+
+# ---- 时间规则 ---------------------------------------------------------------
+
+
+def test_later_evidence_time_makes_newer() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert f"晚于旧记忆 observed_at={NOW}" in result.reasons[2]
+
+
+def test_equal_timestamp_is_not_newer() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。", observed_at=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=NOW)
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+    assert any("（相等或更早）→ 不因时间判更新" in reason for reason in result.reasons)
+
+
+def test_earlier_timestamp_is_not_newer() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。", observed_at=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=EARLIER)
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+
+
+def test_unparseable_evidence_time_is_ignored() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at="不是时间")
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+    joined = "\n".join(result.reasons)
+    assert "observed_at=不是时间 不是合法 ISO 时间" in joined
+    assert "证据未提供可解析的 observed_at" in joined
+
+
+def test_prior_without_base_time_is_not_newer() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。", observed_at=None, created="")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER)
+    )
+    assert result.verdict != vf.VERDICT_NEWER
+    assert any("旧记忆无时间基准" in reason for reason in result.reasons)
+
+
+def test_base_time_falls_back_to_created() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。", observed_at=None, created=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert f"旧记忆 created={NOW}" in result.reasons[2]
+
+
+def test_base_time_prefers_observed_at_over_created() -> None:
+    """证据时间落在 created 与 observed_at 之间：只有用 observed_at 做基准才不判 newer。"""
+    note = make_note(body="用户偏好中文回答。", observed_at=NOW, created=EARLIER)
+    result = vf.compare_prior_and_evidence(note, evi("用户喜欢用中文交流。", observed_at=MID))
+    assert result.verdict != vf.VERDICT_NEWER
+    assert any(f"旧记忆 observed_at={NOW}" in reason for reason in result.reasons)
+
+
+def test_base_time_agrees_with_freshness() -> None:
+    """基准时间口径与 P2-A freshness 一致（同一 note、同一字段、同一时间戳）。"""
+    note = make_note(body="GLM-5.3 支持工具调用。", observed_at=None, created=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER)
+    )
+    freshness = evaluate_freshness(note)
+    assert f"时间基准 created（{NOW}）" in freshness.reasons[0]
+    assert f"旧记忆 created={NOW}" in result.reasons[2]
+
+    with_observed = make_note(body="用户偏好中文回答。", observed_at=NOW, created=EARLIER)
+    observed_result = vf.compare_prior_and_evidence(
+        with_observed, evi("用户喜欢用中文交流。", observed_at=MID)
+    )
+    assert any(f"旧记忆 observed_at={NOW}" in reason for reason in observed_result.reasons)
+    assert f"时间基准 observed_at（{NOW}）" in evaluate_freshness(with_observed).reasons[0]
+
+
+def test_missing_evidence_time_is_not_newer() -> None:
+    note = make_note(body="GLM-5.3 支持工具调用。")
+    result = vf.compare_prior_and_evidence(note, evi("GLM-5.3 现在支持工具调用与函数并行。"))
+    assert result.verdict != vf.VERDICT_NEWER
+    assert any("证据未提供可解析的 observed_at" in reason for reason in result.reasons)
+
+
+# ---- 相似度地板 -------------------------------------------------------------
+
+
+def test_similarity_floor_short_circuits_to_uncertain() -> None:
+    note = make_note(body="项目使用 uv 管理依赖。")
+    result = vf.compare_prior_and_evidence(note, evi("今天天气不错，适合出门散步。"))
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    joined = "\n".join(result.reasons)
+    assert f"相似度 {result.similarity:.3f} 低于地板 0.30" in joined
+    assert "不进入确定性比较" in joined
+
+
+def test_similarity_floor_does_not_call_judge() -> None:
+    """地板短路路径不调用 judge：地板的意义就是不让无关证据消耗比较器。"""
+    judge, calls = counting_judge(vf.VERDICT_NEWER)
+    note = make_note(body="项目使用 uv 管理依赖。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("今天天气不错，适合出门散步。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.judge_used is False
+    assert calls == []
+
+
+def test_similarity_dimension_is_configurable_and_quoted() -> None:
+    settings = vf.VerificationSettings(similarity_dim=64)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="项目使用 uv 管理依赖。"),
+        evi("项目使用 uv 管理依赖。"),
+        settings=settings,
+    )
+    assert "dim=64" in result.reasons[0]
+    assert result.verdict == vf.VERDICT_CONSISTENT
+
+
+def test_empty_evidence_text_is_uncertain() -> None:
+    result = vf.compare_prior_and_evidence(make_note(), evi(""))
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.similarity == 0.0
+    assert "相似度 0.000 低于地板 0.30" in "\n".join(result.reasons)
+
+
+def test_similarity_is_symmetric_and_bounded() -> None:
+    assert vf.token_similarity("项目使用 uv 管理依赖。", "项目使用 uv 管理依赖。") == 1.0
+    forward = vf.token_similarity("项目使用 uv 管理依赖。", "Python 版本为 3.12。")
+    backward = vf.token_similarity("Python 版本为 3.12。", "项目使用 uv 管理依赖。")
+    assert forward == backward
+    assert 0.0 <= forward <= 1.0
+    assert vf.token_similarity("", "项目使用 uv 管理依赖。") == 0.0
+
+
+# ---- judge 注入 -------------------------------------------------------------
+
+
+def test_judge_only_called_for_uncertain() -> None:
+    """已确定的判定绝不调用 judge（五类里的四个确定态各一例，来源变化含内）。"""
+    judge, calls = counting_judge(vf.VERDICT_CONFLICTING)
+    determined = [
+        (make_note(body="项目使用 uv 管理依赖。"), evi("项目使用 uv 管理依赖。")),
+        (
+            make_note(body="GLM-5.3 支持工具调用。"),
+            evi("GLM-5.3 现在支持工具调用与函数并行。", observed_at=LATER),
+        ),
+        (make_note(body="该系列有 3 个版本。"), evi("该系列有 3 个版本，Pro 版本参数 70B。")),
+        (make_note(body="GLM-5.3 的上下文窗口是 128k。"), evi("GLM-4.5 的上下文窗口是 64k。")),
+        (
+            source_url_note(source_changed_at=NOW),
+            evi("模型 A 上下文 128k。", source_url=URL, content_hash=HASH_NEW),
+        ),
+    ]
+    verdicts = [
+        vf.compare_prior_and_evidence(note, evidence, judge=judge).verdict
+        for note, evidence in determined
+    ]
+    assert calls == []
+    assert verdicts == [
+        vf.VERDICT_CONSISTENT,
+        vf.VERDICT_NEWER,
+        vf.VERDICT_MORE_SPECIFIC,
+        vf.VERDICT_CONFLICTING,
+        vf.VERDICT_NEWER,
+    ]
+
+
+def test_judge_verdict_is_applied_when_uncertain() -> None:
+    judge, calls = counting_judge(vf.VERDICT_CONFLICTING)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert len(calls) == 1 and calls[0][0] == "N-0001"
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert result.suggested_action == vf.ACTION_OPEN_CONFLICT
+    assert result.judge_used is True
+    assert any("语义判官判定 conflicting" in reason for reason in result.reasons)
+
+
+def test_judge_returning_none_keeps_uncertain() -> None:
+    judge, calls = counting_judge(None)
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert len(calls) == 1
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.judge_used is True
+    assert any("未给出判定（返回 None）" in reason for reason in result.reasons)
+
+
+def test_judge_returning_illegal_value_keeps_uncertain() -> None:
+    judge, _ = counting_judge("probably-newer")
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert any("不是合法判定" in reason for reason in result.reasons)
+
+
+def test_judge_verdict_is_normalized() -> None:
+    judge, _ = counting_judge("  NEWER ")
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert result.suggested_action == vf.ACTION_SUPERSEDE
+
+
+def test_judge_exception_keeps_uncertain_without_raising() -> None:
+    judge, _ = counting_judge(error=ValueError("boom"))
+    result = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。"), judge=judge
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert any("语义判官调用失败（ValueError: boom）" in reason for reason in result.reasons)
+
+
+def test_judge_none_still_covers_every_uncertain_case() -> None:
+    """judge=None 时"信息不足"与"地板"两条 uncertain 路径都完整可用。"""
+    fallback = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("用户喜欢用中文交流。")
+    )
+    floored = vf.compare_prior_and_evidence(
+        make_note(body="用户偏好中文回答。"), evi("今天天气不错。")
+    )
+    assert fallback.verdict == floored.verdict == vf.VERDICT_UNCERTAIN
+    assert fallback.suggested_action == floored.suggested_action == vf.ACTION_NONE
+    assert fallback.judge_used is False and floored.judge_used is False
+
+
+# ---- 规则优先级 -------------------------------------------------------------
+
+
+def test_source_change_beats_time() -> None:
+    """证据时间更晚 + 来源换版（无冲突）→ 走来源分支（理由里出现 hash 前 8 位）。"""
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    result = vf.compare_prior_and_evidence(
+        note,
+        evi(MODEL_EVIDENCE, observed_at=LATER, source_url=URL, content_hash=HASH_NEW),
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+    assert any("来源变化" in reason for reason in result.reasons)
+    assert not any("晚于旧记忆" in reason for reason in result.reasons)
+
+
+def test_conflict_beats_time_and_specificity() -> None:
+    """更晚且事实更多的证据，只要同槽位取值不同 → 冲突台账，不 supersede 掩盖。"""
+    note = make_note(body="GLM-5.3 的上下文窗口是 128k。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("GLM-4.5 的上下文窗口是 64k，参数量 70B。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    joined = "\n".join(result.reasons)
+    assert "优先级高于来源变化与时间规则" in joined
+    assert "时间：" not in joined
+
+
+def test_consistency_beats_time() -> None:
+    """时间更晚但断言未变（高相似、无新增令牌）→ consistent，只刷新 reviewed_at。"""
+    note = make_note(body="项目使用 uv 管理依赖，Python 3.12。", observed_at=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("项目使用 uv 管理依赖，Python 3.12。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_CONSISTENT
+    assert not any("时间：" in reason for reason in result.reasons)
+
+
+def test_time_beats_specificity() -> None:
+    """证据更晚且事实更多 → newer（时间规则优先于具体度，具体度只在时间不更新时生效）。"""
+    note = make_note(body="该系列有 3 个版本。")
+    result = vf.compare_prior_and_evidence(
+        note, evi("该系列有 3 个版本，Pro 版本参数 70B。", observed_at=LATER)
+    )
+    assert result.verdict == vf.VERDICT_NEWER
+
+
+def test_specificity_applies_when_time_not_later() -> None:
+    note = make_note(body="该系列有 3 个版本。", observed_at=NOW)
+    result = vf.compare_prior_and_evidence(
+        note, evi("该系列有 3 个版本，Pro 版本参数 70B。", observed_at=NOW)
+    )
+    assert result.verdict == vf.VERDICT_MORE_SPECIFIC
+    assert result.suggested_action == vf.ACTION_MERGE
+
+
+def test_entity_disjoint_blocks_specificity() -> None:
+    note = make_note(body="该系列有 3 个版本。", entities=["GLM-5.3"])
+    result = vf.compare_prior_and_evidence(
+        note, evi("该系列有 3 个版本，Pro 版本参数 70B。", entities=["Qwen-3"])
+    )
+    assert result.verdict != vf.VERDICT_MORE_SPECIFIC
+    assert any("两侧实体不交" in reason for reason in result.reasons)
+
+
+def test_entity_overlap_allows_specificity() -> None:
+    note = make_note(body="该系列有 3 个版本。", entities=["GLM-5.3"])
+    result = vf.compare_prior_and_evidence(
+        note, evi("该系列有 3 个版本，Pro 版本参数 70B。", entities=["glm-5-3"])
+    )
+    assert result.verdict == vf.VERDICT_MORE_SPECIFIC
+
+
+# ---- 冲突槽位识别（纯函数）-------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("prior_text", "evidence_text", "prior_value", "evidence_value"),
+    [
+        ("共 3 个模型", "共 5 个模型", "3", "5"),
+        ("上下文窗口 128k", "上下文窗口 256k", "128", "256"),
+        ("支持 30% 的折扣", "支持 20% 的折扣", "30%", "20%"),
+        ("第 3 章讲了并发模型", "第 4 章讲了并发模型", "3章", "4章"),
+        ("Chapter 3 covers retries", "Chapter 4 covers retries", "3章", "4章"),
+        ("v1.2.3 修复了问题", "v1.2.4 修复了问题", "1.2.3", "1.2.4"),
+        ("模型发布于 2026-08", "模型发布于 2026-09", "2026-08", "2026-09"),
+        ("模型发布于 2026年8月", "模型发布于 2026年9月", "2026-08", "2026-09"),
+    ],
+)
+def test_slot_conflicts_by_kind(prior_text, evidence_text, prior_value, evidence_value) -> None:
+    conflicts = vf.detect_slot_conflicts(prior_text, evidence_text)
+    assert len(conflicts) == 1
+    assert conflicts[0].prior_value == prior_value
+    assert conflicts[0].evidence_value == evidence_value
+    assert f"旧={prior_value}" in conflicts[0].describe()
+    assert f"新={evidence_value}" in conflicts[0].describe()
+
+
+def test_slot_conflict_reports_kind_and_anchor() -> None:
+    conflicts = vf.detect_slot_conflicts("上下文窗口 128k", "上下文窗口 256k")
+    conflict = conflicts[0]
+    assert conflict.kind == "number"
+    assert conflict.context == "上下文窗口"
+    assert conflict.slot == "number:k:上下文窗口"
+    assert conflict.to_dict() == {
+        "slot": "number:k:上下文窗口",
+        "kind": "number",
+        "context": "上下文窗口",
+        "prior_value": "128",
+        "evidence_value": "256",
+    }
+
+
+def test_different_anchors_are_different_slots() -> None:
+    """锚点不同 = 不同槽位（参数量与上下文窗口不是同一个事实）→ 不判冲突。"""
+    assert vf.detect_slot_conflicts("参数量 128k", "上下文窗口 256k") == []
+
+
+def test_bare_number_without_unit_or_context_is_not_comparable() -> None:
+    assert vf.detect_slot_conflicts("3", "4") == []
+    assert vf.detect_slot_conflicts("共 3 个", "共 4 个") != []
+
+
+def test_same_value_different_units_is_not_a_conflict() -> None:
+    assert vf.detect_slot_conflicts("共 3 个 共 3个", "共 3 个") == []
+
+
+def test_single_side_multi_value_is_skipped() -> None:
+    scan = vf.scan_slots("版本 3.5 版本 4.0 都支持", "版本 3.5 都支持")
+    assert scan.conflicts == []
+    assert len(scan.skipped) == 1
+    assert "在旧记忆有多个取值（旧=3.5、4.0；新=3.5）" in scan.skipped[0]
+
+
+def test_skipped_slot_reason_lands_in_comparison_reasons() -> None:
+    """被跳过的槽位会让"一致"退回 uncertain（可比性没走完，不宣称仍然成立）。"""
+    note = make_note(body="版本 3.5 版本 4.0 都支持。", observed_at=None, created="")
+    result = vf.compare_prior_and_evidence(note, evi("版本 3.5 都支持。"))
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.conflicts == []
+    assert any("跳过该槽位" in reason for reason in result.reasons)
+    assert any("一致判定被保留" in reason for reason in result.reasons)
+
+
+def test_tokens_are_ordered_and_deduplicated() -> None:
+    tokens = vf.extract_fact_tokens("共 3 个，共 3 个，另加 5 个。")
+    assert [t.label() for t in tokens] == ["number:3", "number:5"]
+    assert [t.raw for t in tokens] == ["3", "5"]
+
+
+def test_extract_fact_tokens_priority_and_values() -> None:
+    text = "GLM-5.3 的上下文窗口是 128k，发布于 2026-09，第 3 章讲了并发，提升 30%。"
+    tokens = vf.extract_fact_tokens(text)
+    assert [(t.kind, t.value) for t in tokens] == [
+        ("version", "5.3"),
+        ("number", "128"),
+        ("date", "2026-09"),
+        ("chapter", "3章"),
+        ("percent", "30%"),
+    ]
+    assert tokens[1].unit == "k"
+    assert tokens[0].slot == "version:GLM"
+    assert tokens[1].slot == "number:k:上下文窗口是"
+
+
+def test_no_tokens_means_no_conflict() -> None:
+    assert vf.detect_slot_conflicts("用户偏好中文回答。", "用户喜欢用中文交流。") == []
+    assert vf.scan_slots("用户偏好中文回答。", "用户喜欢用中文交流。").new_tokens == []
+
+
+def test_scan_slots_reports_new_tokens() -> None:
+    scan = vf.scan_slots("该系列有 3 个版本。", "该系列有 3 个版本，Pro 版本参数 70B。")
+    assert [t.label() for t in scan.new_tokens] == ["number:70"]
+    assert len(scan.prior_tokens) == 1 and len(scan.evidence_tokens) == 2
+
+
+# ---- 配置（from_config 宽容回退）-------------------------------------------
+
+
+def test_default_settings_values_and_dim_lock() -> None:
+    settings = vf.VerificationSettings()
+    assert settings.similarity_floor == 0.3
+    assert settings.consistent_similarity == 0.8
+    assert settings.context_chars == 6
+    assert settings.similarity_dim == vf.DEFAULT_SIMILARITY_DIM
+    # 与复用嵌入器的默认维度同值（防单侧漂移）
+    assert settings.similarity_dim == MockEmbeddingProvider().dim
+
+
+def test_from_config_accepts_full_config_and_section() -> None:
+    section = {
+        "similarity_floor": 0.4,
+        "consistent_similarity": 0.9,
+        "similarity_dim": 256,
+        "context_chars": 8,
+    }
+    from_full = vf.VerificationSettings.from_config({"wiki": {}, "verification": section})
+    from_section = vf.VerificationSettings.from_config(section)
+    assert from_full == from_section
+    assert from_full.similarity_floor == 0.4
+    assert from_full.consistent_similarity == 0.9
+    assert from_full.similarity_dim == 256
+    assert from_full.context_chars == 8
+
+
+def test_from_config_defaults_on_missing_or_junk() -> None:
+    default = vf.VerificationSettings()
+    assert vf.VerificationSettings.from_config() == default
+    assert vf.VerificationSettings.from_config(None) == default
+    assert vf.VerificationSettings.from_config({"verification": "junk"}) == default
+    assert vf.VerificationSettings.from_config([]) == default
+    assert vf.VerificationSettings.from_config(
+        {"verification": {"similarity_floor": "abc", "similarity_dim": "big", "nope": 1}}
+    ) == default
+
+
+def test_from_config_clamps_out_of_range_values() -> None:
+    settings = vf.VerificationSettings.from_config(
+        {"verification": {"similarity_floor": 2.0, "similarity_dim": -5, "context_chars": 999}}
+    )
+    assert settings.similarity_floor == 1.0
+    assert settings.similarity_dim == 8
+    assert settings.context_chars == 24
+
+
+def test_consistent_similarity_never_below_floor() -> None:
+    settings = vf.VerificationSettings(similarity_floor=0.6, consistent_similarity=0.4)
+    assert settings.consistent_similarity == 0.6
+
+
+def test_settings_tolerate_bad_bool_values() -> None:
+    settings = vf.VerificationSettings(
+        extract_dates="yes",  # type: ignore[arg-type]
+        extract_versions="off",  # type: ignore[arg-type]
+    )
+    assert settings.extract_dates is True
+    assert settings.extract_versions is False
+
+
+def test_from_config_switches_off_extraction() -> None:
+    settings = vf.VerificationSettings.from_config(
+        {"verification": {"extract_dates": False, "extract_chapters": "no"}}
+    )
+    tokens = vf.extract_fact_tokens("发布于 2026-09，第 3 章，共 3 个。", settings=settings)
+    kinds = {t.kind for t in tokens}
+    assert "date" not in kinds and "chapter" not in kinds
+    assert {"number", "percent"} & kinds  # 数值开关未关，仍抽取
+    assert vf.detect_slot_conflicts("发布于 2026-08", "发布于 2026-09", settings=settings) == []
+
+
+def test_from_config_switches_off_versions() -> None:
+    settings = vf.VerificationSettings.from_config({"verification": {"extract_versions": False}})
+    kinds = {t.kind for t in vf.extract_fact_tokens("v1.2.3 修复了问题", settings=settings)}
+    assert "version" not in kinds
+    assert vf.extract_fact_tokens("v1.2.3 修复了问题")[0].kind == "version"
+
+
+def test_settings_flow_through_batch() -> None:
+    settings = vf.VerificationSettings(similarity_floor=0.99)
+    results = vf.compare_batch(
+        make_note(body="项目使用 uv 管理依赖。"),
+        [evi("项目使用 uv 管理依赖，Python 3.12。")],
+        settings=settings,
+    )
+    assert results[0].verdict == vf.VERDICT_UNCERTAIN
+    assert "地板 0.99" in results[0].reasons[0]
+    assert "低于地板 0.99" in results[0].reasons[1]
+
+
+# ---- 留痕、可审计、无副作用 -------------------------------------------------
+
+
+def test_reasons_quote_concrete_values() -> None:
+    conflict = vf.compare_prior_and_evidence(
+        source_url_note(source_changed_at="2026-08-01T00:00:00+00:00"),
+        evi("模型 A 的上下文窗口是 256k。", source_url=URL, content_hash=HASH_NEW),
+    )
+    joined = "\n".join(conflict.reasons)
+    assert "旧=128" in joined and "新=256" in joined  # 冲突槽位的两侧取值
+    assert f"{conflict.similarity:.3f}" in joined  # 相似度数值
+    assert "地板 0.30" in joined and "一致阈值 0.80" in joined  # 阈值具体值
+
+    changed = vf.compare_prior_and_evidence(
+        source_url_note(source_changed_at="2026-08-01T00:00:00+00:00"),
+        evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW),
+    )
+    changed_joined = "\n".join(changed.reasons)
+    assert "旧=1a2b3c4d" in changed_joined and "新=9f8e7d6c" in changed_joined  # hash 前 8 位
+    assert "source_changed_at=2026-08-01T00:00:00+00:00" in changed_joined
+
+
+def test_comparison_to_dict_is_json_serializable() -> None:
+    note = make_note(body="GLM-5.3 的上下文窗口是 128k。")
+    result = vf.compare_prior_and_evidence(note, evi("GLM-4.5 的上下文窗口是 64k。"))
+    payload = json.loads(json.dumps(result.to_dict(), ensure_ascii=False))
+    assert payload["verdict"] == vf.VERDICT_CONFLICTING
+    assert payload["suggested_action"] == vf.ACTION_OPEN_CONFLICT
+    assert payload["prior_note_id"] == "N-0001"
+    assert payload["evidence_index"] == 0
+    assert payload["judge_used"] is False
+    assert [c["prior_value"] for c in payload["conflicts"]] == ["128", "5.3"]
+    assert [c["evidence_value"] for c in payload["conflicts"]] == ["64", "4.5"]
+    assert payload["reasons"] == result.reasons
+
+
+def test_comparison_is_deterministic() -> None:
+    note = source_url_note(source_changed_at="2026-08-01T00:00:00+00:00")
+    evidence = evi(MODEL_EVIDENCE, source_url=URL, content_hash=HASH_NEW)
+    first = vf.compare_prior_and_evidence(note, evidence)
+    second = vf.compare_prior_and_evidence(note, evidence)
+    assert first == second
+
+
+def test_comparison_does_not_write_notes_or_conflicts(tmp_path) -> None:
+    """不静默覆盖：判定只产出建议与留痕数据，笔记与冲突台账都不被写。"""
+    store = WikiStore(tmp_path)
+    note = store.save_note(
+        "GLM-5.3 的上下文窗口是 128k。",
+        note_id="N-0001",
+        observed_at=NOW,
+        created=NOW,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+        source_changed_at="2026-08-01T00:00:00+00:00",
+    )
+    path = tmp_path / "notes" / "N-0001.md"
+    before = path.read_text(encoding="utf-8")
+    result = vf.compare_prior_and_evidence(
+        note,
+        evi("GLM-4.5 的上下文窗口是 64k。", observed_at=LATER, source_url=URL,
+            content_hash=HASH_NEW),
+    )
+    assert result.verdict == vf.VERDICT_CONFLICTING
+    assert path.read_text(encoding="utf-8") == before
+    assert store.list_conflicts() == []
+    reloaded = store.get_note("N-0001")
+    assert reloaded is not None
+    assert reloaded.meta.status == "active"
+    assert reloaded.meta.reviewed_at is None
+
+
+def test_compare_batch_keeps_index_alignment() -> None:
+    note = make_note(body="用户偏好中文回答。")
+    evidence = [
+        evi("用户偏好中文回答。"),
+        evi("用户喜欢用中文交流。"),
+        evi(""),  # 空正文不跳过：下标必须能回填到输入列表
+    ]
+    results = vf.compare_batch(note, evidence)
+    assert [r.evidence_index for r in results] == [0, 1, 2]
+    assert [r.verdict for r in results] == [
+        vf.VERDICT_CONSISTENT,
+        vf.VERDICT_UNCERTAIN,
+        vf.VERDICT_UNCERTAIN,
+    ]
+    assert all(r.prior_note_id == "N-0001" for r in results)
+    assert vf.compare_batch(note, []) == []
+
+
+def test_compare_batch_judge_call_count_matches_uncertain_items() -> None:
+    judge, calls = counting_judge(vf.VERDICT_NEWER)
+    note = make_note(body="用户偏好中文回答。")
+    results = vf.compare_batch(
+        note,
+        [evi("用户偏好中文回答。"), evi("用户喜欢用中文交流。"), evi("今天天气不错。")],
+        judge=judge,
+    )
+    assert len(calls) == 1  # 第 2 条（信息不足）才需要判官；第 3 条被相似度地板挡下
+    assert calls[0][1] == "用户喜欢用中文交流。"
+    assert [r.verdict for r in results] == [
+        vf.VERDICT_CONSISTENT,
+        vf.VERDICT_NEWER,
+        vf.VERDICT_UNCERTAIN,
+    ]
+    assert [r.judge_used for r in results] == [False, True, False]

@@ -1,4 +1,4 @@
-"""wiki 子系统：frontmatter / 实体注册表 / 存储层 / 嵌入 / 检索索引 / 时效计算。"""
+"""wiki 子系统：frontmatter / 实体注册表 / 存储层 / 嵌入 / 检索索引 / 时效计算 / 判定。"""
 
 from researchwiki.wiki.embeddings import (
     CachedEmbeddingProvider,
@@ -39,14 +39,42 @@ from researchwiki.wiki.prior import (
     retrieve_priors,
 )
 from researchwiki.wiki.store import Conflict, Note, Page, WikiStore
+from researchwiki.wiki.verification import (
+    ACTION_MERGE,
+    ACTION_NONE,
+    ACTION_OPEN_CONFLICT,
+    ACTION_REFRESH_REVIEWED_AT,
+    ACTION_SUPERSEDE,
+    VERDICT_ACTIONS,
+    VERDICT_CONFLICTING,
+    VERDICT_CONSISTENT,
+    VERDICT_MORE_SPECIFIC,
+    VERDICT_NEWER,
+    VERDICT_UNCERTAIN,
+    VERDICTS,
+    EvidenceComparison,
+    EvidenceItem,
+    VerificationSettings,
+    compare_batch,
+    compare_prior_and_evidence,
+    detect_slot_conflicts,
+    token_similarity,
+)
 
 __all__ = [
+    "ACTION_MERGE",
+    "ACTION_NONE",
+    "ACTION_OPEN_CONFLICT",
+    "ACTION_REFRESH_REVIEWED_AT",
+    "ACTION_SUPERSEDE",
     "CachedEmbeddingProvider",
     "Conflict",
     "EmbeddingError",
     "EmbeddingProvider",
     "Entity",
     "EntityRegistry",
+    "EvidenceComparison",
+    "EvidenceItem",
     "FRESHNESS_FRESH",
     "FRESHNESS_REVIEW_DUE",
     "FRESHNESS_STALE",
@@ -63,8 +91,19 @@ __all__ = [
     "SearchIndex",
     "SearchMatch",
     "SourceRef",
+    "VERDICT_ACTIONS",
+    "VERDICT_CONFLICTING",
+    "VERDICT_CONSISTENT",
+    "VERDICT_MORE_SPECIFIC",
+    "VERDICT_NEWER",
+    "VERDICT_UNCERTAIN",
+    "VERDICTS",
+    "VerificationSettings",
     "WikiSettings",
     "WikiStore",
+    "compare_batch",
+    "compare_prior_and_evidence",
+    "detect_slot_conflicts",
     "dump",
     "ensure_index_fresh",
     "evaluate_freshness",
@@ -80,6 +119,7 @@ __all__ = [
     "retrieve_priors",
     "rrf_fuse",
     "slugify",
+    "token_similarity",
     "wiki_search",
     "wiki_settings",
 ]
