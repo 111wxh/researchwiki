@@ -1892,6 +1892,27 @@ class TestMemoryProtocol:
         assert bad["ok"] is False
         assert bad["error"]["code"] == "validation_failed"
 
+    def test_tombstone_visibility_over_wire(self, server: FastMCP) -> None:
+        """include_tombstones 透传到协议层（参数 schema + 默认排除语义都过线）。"""
+        stored = _tool_call(server, "memory_store", {"content": "传闻：某模型下周发布。"})
+        assert stored["ok"] is True
+        invalidated = _tool_call(
+            server, "memory_invalidate", {"note_id": "N-0001", "reason": "官方辟谣"}
+        )
+        tombstone_id = str(invalidated["tombstone_id"])
+
+        default = _tool_call(server, "memory_search", {"query": "辟谣"})
+        assert default["count"] == 0
+        assert _tool_call(server, "memory_recall", {"query": "辟谣"})["count"] == 0
+        included = _tool_call(
+            server, "memory_search", {"query": "辟谣", "include_tombstones": True}
+        )
+        assert [r["note_id"] for r in included["results"]] == [tombstone_id]
+        # 墓碑全文照常可读（read 带 tombstone 标记）
+        read = _tool_call(server, "wiki_read", {"note_id": tombstone_id})
+        assert read["note"]["tombstone"] is True
+        assert "官方辟谣" in read["body"]
+
 
 # ---- 健康检查 ---------------------------------------------------------------
 

@@ -63,7 +63,9 @@ SERVER_INSTRUCTIONS = (
     "（结果带 status/observed_at/kind 标注，方便按记忆状态取舍）。\n"
     "- 修正已有记忆：小修正文用 memory_update（必须留 reason，自动备份原稿）；"
     "内容已过时且有新结论用 memory_supersede（新笔记替代，旧 ID 沿链可达新 ID）；"
-    "判定失效且没有替代内容用 memory_invalidate（自动生成墓碑笔记，旧记忆沿链可达墓碑）。\n"
+    "判定失效且没有替代内容用 memory_invalidate（自动生成墓碑笔记，旧记忆沿链可达墓碑；"
+    "墓碑是审计记录，默认不进检索/召回结果，要审计时用 wiki_read 或"
+    " include_tombstones=true）。\n"
     "- 替代/修订要挂证据：两者都接受 source_urls（元素为 URL 字符串或"
     ' {"url": ..., "content_hash": ...} 映射；给空列表会被拒，不提供即表示本次无证据）。'
     "memory_supersede 给了来源 → 新记忆的 sources=提供值（不继承旧来源）；"
@@ -109,8 +111,9 @@ _DESC_READ = (
     "superseded_by 跟到最终笔记，响应里 redirected=true、source_note 给出原始 ID、"
     "redirect_chain 给出完整来源链——引用时请引用最终 note_id，并可以提一句它由哪条合并而来。\n"
     "返回：{ok, requested_id, redirected, note:{note_id, title, status, confidence, volatility,"
-    " entities, created, observed_at, reviewed_at, trace_id, sources, redirect_to,"
-    " superseded_by, extra}, body, path}。\n"
+    " kind, importance, tombstone, entities, created, observed_at, reviewed_at, trace_id, sources,"
+    " redirect_to, superseded_by, extra}, body, path}。tombstone=true 表示这条是"
+    "「已失效」的墓碑笔记（审计记录，检索默认不返回它，但读全文/查版本史照常可用）。\n"
     "失败：笔记不存在返回 {ok:false, error:{code:'not_found'}}（不是异常），"
     "ID 形态非法或越界返回 code='path_rejected'。"
 )
@@ -155,7 +158,9 @@ _DESC_HEALTH = (
     "什么时候用：确认服务指向的 wiki 目录对不对、排查「检索不到刚写的笔记」这类问题、"
     "或汇报当前知识库规模时。\n"
     "返回：{ok, root, notes:{total, active, merged, superseded}, pages, entities,"
-    " conflicts:{total, open, resolved}, index:{...}}。"
+    " conflicts:{total, open, resolved}, index:{...}}。index.stale 为 true 时"
+    " index.stale_reason 会点名具体的落后原因（哪条笔记新增/字段变化/status 变化）；"
+    "判据与 run 的 Prior 索引一致性检查完全同一份，两处结论不会互相打架。"
 )
 
 _DESC_MEMORY_STORE = (
@@ -178,7 +183,12 @@ _DESC_MEMORY_SEARCH = (
     "什么时候用：回答问题前查相关记忆；需要按类型取记忆时（如只看 user 偏好、"
     "只看 experience 教训）。\n"
     "参数：query 检索词（必填）；k 返回条数（1..50，默认 5）；"
-    "kind 可选过滤 knowledge/user/experience，不传则不过滤。\n"
+    "kind 可选过滤 knowledge/user/experience，不传则不过滤；"
+    "include_tombstones 是否把墓碑（memory_invalidate 生成的「已失效」裁定记录）"
+    "也算命中，默认 false。\n"
+    "墓碑语义：墓碑是审计记录，不是当前知识，所以**默认不出现在结果里**"
+    "（否则「已失效的记忆」会被当成 active 知识召回）；要审计失效史时传"
+    " include_tombstones=true，或直接用 wiki_read / memory_timeline 读它。\n"
     "返回：{ok, query, k, count, results:[{note_id, title, snippet, score, match_type,"
     " redirected_from, redirect_note}]}。kind 非法返回 code='invalid_kind'。\n"
     "命中后建议用 wiki_read 或 memory_recall 读全文与记忆状态，不要只凭 snippet 下结论。"
@@ -188,7 +198,9 @@ _DESC_MEMORY_RECALL = (
     "动态召回入口：检索一批与 query 相关的记忆，并为每条标注记忆状态。\n"
     "什么时候用：会话开始恢复上下文、回答前召回相关记忆、需要根据记忆的"
     "时效（observed_at/status）与类型（kind）取舍内容时。\n"
-    "参数：query 检索词（必填）；k 返回条数（默认 5）；kind 可选过滤。\n"
+    "参数：query 检索词（必填）；k 返回条数（默认 5）；kind 可选过滤；"
+    "include_tombstones 是否把墓碑（失效裁定记录）也召回，默认 false"
+    "——墓碑只是审计记录，默认不当当前知识召回。\n"
     "返回：{ok, mode:'passthrough', results:[{note_id, title, snippet, score, ...,"
     " status, observed_at, kind, importance}]}——status/observed_at/kind 告诉你这条记忆"
     "是否现役、何时观察到、属于哪类；merged/superseded 记忆自动跟随重定向到当前版本。\n"
@@ -249,10 +261,13 @@ _DESC_MEMORY_INVALIDATE = (
     "什么时候用：发现某条记忆错了或失效、但又没有新内容可以替代时"
     "（例如「待确认」的传闻被证伪）。有替代内容请用 memory_supersede。\n"
     "参数：note_id 记忆 ID（必须是 active）；reason 失效原因（必填）。\n"
-    "语义：自动生成一条墓碑笔记（kind=knowledge，正文=失效原因+时间戳，active 状态），"
-    "旧记忆 status=superseded 且 superseded_by 指向墓碑——读旧 ID 会沿链到达墓碑，"
-    "审计与「superseded 必须沿链可达 active」的不变量同时保住；"
-    "reason 同时记入旧记忆的 invalidate_reason。\n"
+    "语义：自动生成一条墓碑笔记（kind=knowledge，正文=失效原因+时间戳，active 状态，"
+    "带 tombstone 标记），旧记忆 status=superseded 且 superseded_by 指向墓碑"
+    "——读旧 ID 会沿链到达墓碑，审计与「superseded 必须沿链可达 active」的不变量"
+    "同时保住；reason 同时记入旧记忆的 invalidate_reason。\n"
+    "墓碑是**审计记录，不是当前知识**：memory_search / memory_recall 默认不返回它"
+    "（否则「已失效的记忆」会被当成 active 知识召回）；要看它用 wiki_read 或"
+    " memory_timeline，或给检索工具传 include_tombstones=true。\n"
     "返回：{ok, old_note_id, tombstone_id, superseded_by, reason, backup, path}。"
     "失败：code='not_found' / 'invalid_argument' / 'validation_failed'。"
 )
@@ -431,18 +446,22 @@ def build_server(
         description=_DESC_MEMORY_SEARCH,
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
-    def memory_search(query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
-        """语义检索记忆，可按 kind 过滤（knowledge/user/experience）。"""
-        return _call(service.search, query, k, kind)
+    def memory_search(
+        query: str, k: int = 5, kind: str | None = None, include_tombstones: bool = False
+    ) -> dict[str, Any]:
+        """语义检索记忆，可按 kind 过滤（knowledge/user/experience）；默认不含墓碑。"""
+        return _call(service.search, query, k, kind, include_tombstones)
 
     @mcp.tool(
         name="memory_recall",
         description=_DESC_MEMORY_RECALL,
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
-    def memory_recall(query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
-        """动态召回入口：检索 + 每条记忆标注 status/observed_at/kind。"""
-        return _call(service.recall, query, k, kind)
+    def memory_recall(
+        query: str, k: int = 5, kind: str | None = None, include_tombstones: bool = False
+    ) -> dict[str, Any]:
+        """动态召回入口：检索 + 每条记忆标注 status/observed_at/kind；默认不含墓碑。"""
+        return _call(service.recall, query, k, kind, include_tombstones)
 
     @mcp.tool(
         name="memory_update",
