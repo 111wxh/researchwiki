@@ -8,12 +8,12 @@
   所以逻辑测试可以直接打服务层，协议层（参数 schema / 序列化）另用 in-process
   Client 覆盖，见 tests/test_mcp.py 的说明。
 
-写保护三件套（wiki_write）
---------------------------
-1. frontmatter schema 校验：confidence / volatility 白名单、title 非空、
-   entities 必须是字符串列表……非法输入一律拒绝，并给出可读的中文原因
-   （``NoteMeta.from_dict`` 是"宽容归一"语义，会把非法值静默改成默认值，
-   所以这里必须显式校验，不能靠它兜底）。
+写保护三件套（wiki_write / memory_store）
+------------------------------------------
+1. frontmatter schema 校验：confidence / volatility / kind 白名单、title 非空、
+   entities 必须是字符串列表、importance 必须落在 0.0–1.0……非法输入一律拒绝，
+   并给出可读的中文原因（``NoteMeta.from_dict`` 是"宽容归一"语义，会把非法值
+   静默改成默认值，所以这里必须显式校验，不能靠它兜底）。
 2. 路径限制：笔记路径一律由 ``tools/fs`` 的沙箱函数读写（safe_read / safe_write），
    客户端传入的 note_id 先过白名单正则再拼路径；写入用的 id 由
    ``WikiStore.next_note_id()`` 机器生成，形态固定为 N-XXXX。
@@ -27,9 +27,19 @@
 或索引条数与笔记数不符（外部进程改过 wiki），自动全量重建一次。
 每次调用新建 SearchIndex（sqlite 连接不跨线程；FastMCP 默认在线程池里跑同步工具）。
 
+memory_* 记忆接口（P1-A）
+------------------------
+九个 memory_* 工具是"面向 Agent 的外置记忆"语义层：store（显式写入）/ search
+（kind 过滤检索）/ recall（动态召回钩子位，MVP 为结构化透传）/ update（原地修订，
+必须留 reason + 备份）/ supersede（新内容替代旧记忆，新旧 ID 沿链可达）/
+invalidate（判定失效，自动生成墓碑笔记而非新增状态——"superseded 必须沿链可达
+active"的不变量与状态机都留给 P2）/ timeline（版本史）/ conflicts（冲突台账）/
+profile（User Memory 视图）。wiki_* 五工具保持原样作为兼容层。
+
 错误码词汇表（错误结构里的 ``error.code``）
 ------------------------------------------
-invalid_argument 参数非法｜validation_failed frontmatter 校验未过｜not_found 笔记不存在｜
+invalid_argument 参数非法｜invalid_kind kind 不在 knowledge/user/experience 白名单｜
+validation_failed frontmatter 校验未过｜not_found 笔记不存在｜
 redirect_cycle redirect 成环｜broken_redirect redirect 断裂｜path_rejected 路径越界｜
 backup_failed 写前备份失败（已拒绝写入）｜write_failed 落盘失败｜io_error 文件读写失败｜
 internal 服务内部异常。
@@ -37,8 +47,10 @@ internal 服务内部异常。
 
 from __future__ import annotations
 
+import bisect
 import functools
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -53,6 +65,9 @@ from researchwiki.wiki.embeddings import get_embedding_provider
 from researchwiki.wiki.entities import EntityRegistry
 from researchwiki.wiki.frontmatter import (
     CONFIDENCE_LEVELS,
+    IMPORTANCE_MAX,
+    IMPORTANCE_MIN,
+    KIND_LEVELS,
     VOLATILITY_LEVELS,
     NoteMeta,
     SourceRef,
@@ -66,6 +81,8 @@ MAX_K = 50
 MAX_LIMIT = 200
 MAX_BODY_CHARS = 200_000
 BACKUP_DIR_NAME = ".backups"
+
+logger = logging.getLogger(__name__)
 
 # 客户端可传入的 note_id 白名单：字母开头，只含字母数字下划线连字符。
 # 直接把 ".."、"a/b"、"a\\b"、绝对路径、".md" 之外的点号全部挡在拼路径之前。
@@ -168,6 +185,35 @@ def _is_inside(path: Path, root: Path) -> bool:
         return Path(path).resolve().is_relative_to(Path(root).resolve())
     except OSError:  # pragma: no cover - resolve 失败（循环链接等）一律视为越界
         return False
+
+
+def validate_kind(kind: Any) -> str | None:
+    """kind 参数归一：None 原样透传（检索时表示不过滤）；非法值抛 invalid_kind。"""
+    if kind is None:
+        return None
+    if not isinstance(kind, str):
+        raise WikiToolError("invalid_kind", f"kind 必须是字符串，得到 {type(kind).__name__}")
+    normalized = kind.strip().lower()
+    if normalized not in KIND_LEVELS:
+        raise WikiToolError(
+            "invalid_kind",
+            f"kind 非法：{kind!r}，只能是 {' / '.join(KIND_LEVELS)}"
+            "（knowledge 世界知识 / user 用户画像与偏好 / experience 经验教训）",
+        )
+    return normalized
+
+
+def derive_title(content: str, fallback: str = "未命名记忆") -> str:
+    """从正文派生标题：首个非空行去掉 Markdown 行首记号后截 60 字符。
+
+    memory_store / memory_supersede / 墓碑笔记的写入都不带 title 参数，
+    由正文派生即可保证检索可命中；要精确控制标题请走 wiki_write。
+    """
+    for line in content.splitlines():
+        text = line.strip().lstrip("#>*- ").strip()
+        if text:
+            return text[:60]
+    return fallback
 
 
 # ---- 写前备份 ---------------------------------------------------------------
@@ -380,17 +426,22 @@ class WikiService:
         return _IndexSync(rebuilt=True, notes_indexed=count)
 
     @_structured_errors
-    def search(self, query: str, k: int = 5) -> dict[str, Any]:
-        """双通道检索（FTS5 + 向量 + RRF），返回 active 笔记；跟随 redirect 并标注来源。"""
+    def search(self, query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+        """双通道检索（FTS5 + 向量 + RRF），返回 active 笔记；跟随 redirect 并标注来源。
+
+        ``kind`` 给定时（knowledge/user/experience）只返回该类型笔记；
+        非法取值抛 invalid_kind。
+        """
         text = (query or "").strip()
         if not text:
             raise WikiToolError("invalid_argument", "query 不能为空")
         if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= MAX_K:
             raise WikiToolError("invalid_argument", f"k 必须是 1..{MAX_K} 的整数，得到 {k!r}")
+        normalized_kind = validate_kind(kind)
         stale = self._index_is_stale()
         with self._open_index() as index:
             sync = self._sync_index(index, stale=stale)
-            matches = index.search(text, k=k)
+            matches = index.search(text, k=k, kind=normalized_kind)
         results = [
             {
                 "note_id": m.note_id,
@@ -444,6 +495,8 @@ class WikiService:
                 "note_id": note.id,
                 "title": note.title,
                 "status": note.meta.status,
+                "kind": note.meta.kind,
+                "importance": note.meta.importance,
                 "confidence": note.meta.confidence,
                 "volatility": note.meta.volatility,
                 "entities": list(note.meta.entities),
@@ -492,8 +545,14 @@ class WikiService:
         confidence: str = "medium",
         volatility: str = "stable",
         sources: Sequence[str] | None = None,
+        kind: str = "knowledge",
+        importance: float | None = None,
     ) -> dict[str, Any]:
-        """新增一条原子笔记：校验 → 备份 → 落盘 → 同步索引。"""
+        """新增一条原子笔记：校验 → 备份 → 落盘 → 同步索引。
+
+        ``kind``/``importance`` 是记忆载体字段（P1-A）：wiki_write 不暴露它们
+        （工具签名不变，走默认值），memory_store 经此通道透传。
+        """
         fields = _validate_write_inputs(
             body=body,
             title=title,
@@ -501,6 +560,8 @@ class WikiService:
             confidence=confidence,
             volatility=volatility,
             sources=sources,
+            kind=kind,
+            importance=importance,
         )
         warnings = list(fields.pop("warnings", []))
         with self._write_lock:
@@ -537,6 +598,8 @@ class WikiService:
             "note_id": note.id,
             "title": note.title,
             "status": note.meta.status,
+            "kind": note.meta.kind,
+            "importance": note.meta.importance,
             "created": note.meta.created,
             "path": _relative_path(note.path, self.root),
             "backup": backup,
@@ -557,6 +620,432 @@ class WikiService:
         except Exception as exc:  # noqa: BLE001 -- 索引失败不能推翻已成功的写入
             return f"{type(exc).__name__}: {exc}"
         return None
+
+    # ---- memory_*：面向 Agent 的外置记忆接口（P1-A）----------------------------
+    #
+    # 九个方法对应 server.py 的九个 memory_* 工具。写路径全部复用 write() 的
+    # "校验 → 备份 → 落盘 → 索引"通道并持有 _write_lock；修订/取代/失效都强制
+    # 留 reason 与备份，禁止静默覆盖。
+
+    @_structured_errors
+    def store_memory(
+        self,
+        content: str,
+        *,
+        kind: str = "knowledge",
+        entities: Sequence[str] | None = None,
+        importance: float | None = None,
+        source_urls: Sequence[str] | None = None,
+        confidence: str = "medium",
+        volatility: str = "stable",
+    ) -> dict[str, Any]:
+        """显式写入一条记忆（Agent/用户主动存）：复用 write() 通道，透传 kind/importance。
+
+        title 不作为参数：由正文首个非空行派生（见 derive_title）；
+        需要精确控制标题的写入走 wiki_write。
+        """
+        if not isinstance(content, str) or not content.strip():
+            raise WikiToolError("validation_failed", "content 不能为空：请写入记忆正文")
+        normalized_kind = validate_kind(kind)
+        return self.write(
+            content,
+            title=derive_title(content),
+            entities=entities,
+            confidence=confidence,
+            volatility=volatility,
+            sources=source_urls,
+            kind=normalized_kind or "knowledge",
+            importance=importance,
+        )
+
+    @_structured_errors
+    def recall(self, query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+        """动态召回入口（P3 的钩子位）：MVP = search + 重定向跟随 + 结构化透传。
+
+        P3 将升级为 budget-aware 动态召回（按 token 预算与 importance 挑选记忆），
+        当前为结构化透传：在 search 结果上为每条记忆标注 status / observed_at /
+        kind（附 importance），让调用方按记忆状态自行取舍，不做预算裁剪。
+        """
+        payload = self.search(query, k=k, kind=kind)
+        if not payload.get("ok"):
+            return payload
+        for item in payload["results"]:
+            note = self._load(item["note_id"])
+            if note is None:  # pragma: no cover - 结果刚被外部删除的竞态，标注缺省
+                continue
+            item["status"] = note.meta.status
+            item["observed_at"] = note.meta.observed_at
+            item["kind"] = note.meta.kind
+            item["importance"] = note.meta.importance
+        payload["mode"] = "passthrough"
+        return payload
+
+    @_structured_errors
+    def update_memory(self, note_id: str, content: str, reason: str) -> dict[str, Any]:
+        """修订既有记忆正文（不新增 ID）：写前备份 + reason 落盘，禁止静默覆盖。
+
+        - 备份：create_backup(existed=True)，原稿进 wiki-data/.backups/；
+        - reason：写进 frontmatter extra 的 ``update_reason``（附 ``update_reason_at``），
+          同时刷新 ``reviewed_at``（list_changes 里表现为 reviewed 变更）；
+        - 只允许修订 active 笔记：merged/superseded 的内容归属最终版本，
+          应先 wiki_read 跟随重定向，再用 memory_supersede 取代。
+        """
+        if not isinstance(content, str) or not content.strip():
+            raise WikiToolError("validation_failed", "content 不能为空：请提供修订后的记忆正文")
+        if not isinstance(reason, str) or not reason.strip():
+            raise WikiToolError(
+                "validation_failed", "reason 不能为空：修订必须留下原因（审计留痕）"
+            )
+        reason_text = reason.strip()
+        with self._write_lock:
+            note = self._require_active(note_id)
+            try:
+                backup = create_backup(
+                    self.root,
+                    note_id=note.id,
+                    title=note.title,
+                    source_path=note.path,
+                    existed=True,
+                )
+            except (OSError, SandboxError) as exc:
+                raise WikiToolError(
+                    "backup_failed",
+                    f"写前备份失败，已拒绝修订：{type(exc).__name__}: {exc}",
+                    note_id=note.id,
+                ) from exc
+            now = _now_iso()
+            meta = note.meta
+            try:
+                updated = self.store.save_note(
+                    body=content,
+                    note_id=note.id,
+                    title=meta.title,
+                    entities=list(meta.entities),
+                    confidence=meta.confidence,
+                    status=meta.status,
+                    redirect_to=meta.redirect_to,
+                    superseded_by=meta.superseded_by,
+                    volatility=meta.volatility,
+                    kind=meta.kind,
+                    importance=meta.importance,
+                    observed_at=meta.observed_at,
+                    reviewed_at=now,
+                    trace_id=meta.trace_id,
+                    sources=list(meta.sources),
+                    extra={**meta.extra, "update_reason": reason_text, "update_reason_at": now},
+                    created=meta.created,
+                )
+            except (OSError, ValueError) as exc:
+                raise WikiToolError(
+                    "write_failed",
+                    f"修订落盘失败：{type(exc).__name__}: {exc}",
+                    note_id=note.id,
+                ) from exc
+            index_error = self._index_note(updated)
+        payload: dict[str, Any] = {
+            "ok": True,
+            "note_id": updated.id,
+            "title": updated.title,
+            "reason": reason_text,
+            "reviewed_at": now,
+            "backup": backup,
+            "indexed": index_error is None,
+            "path": _relative_path(updated.path, self.root),
+            "message": (
+                f"已修订记忆 {updated.id}（原因记入 update_reason，原稿备份于 {backup['dir']}）"
+            ),
+        }
+        if index_error is not None:
+            payload["index_warning"] = f"索引同步失败，检索暂不可见：{index_error}"
+        return payload
+
+    @_structured_errors
+    def supersede_memory(self, note_id: str, new_content: str, reason: str) -> dict[str, Any]:
+        """用新内容替代旧记忆：先写新笔记，再把旧笔记标 superseded_by=新 ID。
+
+        新笔记继承旧笔记的 entities/kind/confidence/volatility/importance
+        （身份连续性），正文与标题来自 new_content。返回新旧两个 ID；
+        旧笔记沿 superseded_by 链可达新笔记（active），reason 记入
+        extra 的 ``supersede_reason``。
+        """
+        if not isinstance(new_content, str) or not new_content.strip():
+            raise WikiToolError(
+                "validation_failed", "new_content 不能为空：请提供替代旧记忆的新内容"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise WikiToolError(
+                "validation_failed", "reason 不能为空：取代必须留下原因（审计留痕）"
+            )
+        reason_text = reason.strip()
+        with self._write_lock:
+            old = self._require_active(note_id)
+            now = _now_iso()
+            # 第一步：新笔记走完整写保护通道（校验/备份/落盘/索引）。
+            # 备份失败会在这里整体失败，旧笔记尚未动——无半成品状态。
+            written = self.write(
+                new_content,
+                title=derive_title(new_content, fallback=old.title or "替代笔记"),
+                entities=list(old.meta.entities),
+                confidence=old.meta.confidence,
+                volatility=old.meta.volatility,
+                kind=old.meta.kind,
+                importance=old.meta.importance,
+            )
+            if not written.get("ok"):
+                return written
+            new_id = str(written["note_id"])
+            # 第二步：旧笔记 → superseded，链到新笔记。
+            marked = self._mark_superseded(old, superseded_by=new_id, now=now, reason=reason_text)
+        payload: dict[str, Any] = {
+            "ok": True,
+            "old_note_id": old.id,
+            "new_note_id": new_id,
+            "superseded_by": new_id,
+            "reason": reason_text,
+            "backup": written.get("backup"),
+            "path": _relative_path(marked.path, self.root),
+            "message": (
+                f"旧记忆 {old.id} 已被 {new_id} 取代（status=superseded，"
+                f"沿 superseded_by 可达；原因记入 supersede_reason）"
+            ),
+        }
+        if written.get("warnings"):
+            payload["warnings"] = written["warnings"]
+        return payload
+
+    @_structured_errors
+    def invalidate_memory(self, note_id: str, reason: str) -> dict[str, Any]:
+        """判定记忆失效（无替代内容）：自动生成墓碑笔记，旧笔记沿链可达 active。
+
+        裁定语义（不新增 invalidated 状态，状态机变更留给 P2）：墓碑是一条
+        kind=knowledge 的 active 笔记（正文 = 失效原因 + 时间戳），旧笔记
+        status=superseded 且 superseded_by 指向墓碑——"superseded 必须沿链
+        可达 active"的不变量与审计留痕同时保住。
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise WikiToolError(
+                "validation_failed", "reason 不能为空：失效裁定必须留下原因（审计留痕）"
+            )
+        reason_text = reason.strip()
+        with self._write_lock:
+            old = self._require_active(note_id)
+            now = _now_iso()
+            tombstone_body = (
+                f"记忆 {old.id}（{old.title or '无标题'}）已被裁定失效。\n"
+                f"失效原因：{reason_text}\n"
+                f"失效时间：{now}"
+            )
+            written = self.write(
+                tombstone_body,
+                title=derive_title(f"[已失效] {old.title}" if old.title else "[已失效] 记忆"),
+                entities=list(old.meta.entities),
+                kind="knowledge",
+            )
+            if not written.get("ok"):
+                return written
+            tombstone_id = str(written["note_id"])
+            marked = self._mark_superseded(
+                old, superseded_by=tombstone_id, now=now, reason=reason_text, prefix="invalidate"
+            )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "old_note_id": old.id,
+            "tombstone_id": tombstone_id,
+            "superseded_by": tombstone_id,
+            "reason": reason_text,
+            "backup": written.get("backup"),
+            "path": _relative_path(marked.path, self.root),
+            "message": (
+                f"记忆 {old.id} 已失效：生成墓碑笔记 {tombstone_id}（active），"
+                f"旧笔记沿 superseded_by 可达墓碑，原因记入 invalidate_reason"
+            ),
+        }
+        if written.get("warnings"):
+            payload["warnings"] = written["warnings"]
+        return payload
+
+    @_structured_errors
+    def timeline(self, note_id: str) -> dict[str, Any]:
+        """单条记忆的版本史：redirect 链 + 各版本变更记录，输出有序事件列表。
+
+        方向约定：**旧 → 新**（oldest_first）。链的构造：从请求的笔记沿
+        redirect_to/superseded_by 走到最终 active 版本，同时反向收集指向链上
+        节点的更早版本——无论查询的是链首、链中还是最新版本，都能拿到完整
+        历史（分支按拓扑序、同刻按 note_id 兜底排序）。
+        """
+        origin = normalize_note_id(note_id)
+        final, aliases = self._walk_redirects(origin)
+        if final is None:
+            raise WikiToolError(
+                "not_found",
+                f"笔记 {note_id!r} 不存在（wiki 根目录：{self.root}）",
+                note_id=note_id,
+            )
+        lineage: dict[str, Note] = {}
+        for nid in [*aliases, final.id]:
+            note = self._load(nid)
+            if note is not None:
+                lineage[nid] = note
+        # 反向收集更早版本：redirect_to / superseded_by 指向链上节点的笔记
+        all_notes = self.store.list_notes(status=None)
+        frontier = [*aliases, final.id]
+        while frontier:
+            current = frontier.pop()
+            for note in all_notes:
+                if note.id in lineage:
+                    continue
+                if current in (note.meta.redirect_to, note.meta.superseded_by):
+                    lineage[note.id] = note
+                    frontier.append(note.id)
+        events = [self._timeline_event(lineage[nid]) for nid in _topo_order(lineage)]
+        return {
+            "ok": True,
+            "note_id": origin,
+            "requested_id": note_id,
+            "current": final.id,
+            "direction": "oldest_first",
+            "count": len(events),
+            "events": events,
+        }
+
+    @_structured_errors
+    def conflicts(self, status: str = "open") -> dict[str, Any]:
+        """冲突台账查询：透传 WikiStore.list_conflicts。status 取 open/resolved/all。"""
+        if not isinstance(status, str):
+            raise WikiToolError(
+                "invalid_argument", f"status 必须是字符串，得到 {type(status).__name__}"
+            )
+        normalized = status.strip().lower()
+        if normalized == "all":
+            store_status = None
+        elif normalized in ("open", "resolved"):
+            store_status = normalized
+        else:
+            raise WikiToolError(
+                "invalid_argument", f"status 非法：{status!r}，只能是 open / resolved / all"
+            )
+        rows = self.store.list_conflicts(status=store_status)
+        return {
+            "ok": True,
+            "status": normalized,
+            "count": len(rows),
+            "conflicts": [
+                {
+                    "conflict_id": c.id,
+                    "question": c.question,
+                    "status": c.status,
+                    "claim_a": dict(c.claim_a),
+                    "claim_b": dict(c.claim_b),
+                    "resolution": dict(c.resolution) or None,
+                    "created": c.created,
+                    "resolved_at": c.resolved_at or None,
+                }
+                for c in rows
+            ],
+        }
+
+    @_structured_errors
+    def profile(self) -> dict[str, Any]:
+        """User Memory 视图：平铺列出 kind=user 的 active 记忆（MVP 不做实体聚合）。"""
+        memories = []
+        for note in self.store.list_notes(status="active"):
+            if note.meta.kind != "user":
+                continue
+            memories.append(
+                {
+                    "note_id": note.id,
+                    "title": note.title,
+                    "entities": list(note.meta.entities),
+                    "confidence": note.meta.confidence,
+                    "importance": note.meta.importance,
+                    "created": note.meta.created,
+                    "observed_at": note.meta.observed_at,
+                    "snippet": note.body[:120] + ("…" if len(note.body) > 120 else ""),
+                    "path": _relative_path(note.path, self.root),
+                }
+            )
+        memories.sort(key=lambda m: str(m["note_id"]))
+        return {"ok": True, "count": len(memories), "memories": memories}
+
+    def _require_active(self, note_id: str) -> Note:
+        """读一条笔记并断言存在且 active；merged/superseded 指引用 supersede。"""
+        note = self._load(note_id)
+        if note is None:
+            raise WikiToolError(
+                "not_found",
+                f"笔记 {note_id!r} 不存在（wiki 根目录：{self.root}）",
+                note_id=note_id,
+            )
+        if note.meta.status != "active":
+            raise WikiToolError(
+                "invalid_argument",
+                f"笔记 {note.id} 状态为 {note.meta.status}，不能执行该操作；"
+                "请先 wiki_read 跟随重定向到当前版本，再对当前版本操作",
+                note_id=note.id,
+                status=note.meta.status,
+            )
+        return note
+
+    def _mark_superseded(
+        self, note: Note, *, superseded_by: str, now: str, reason: str, prefix: str = "supersede"
+    ) -> Note:
+        """把 active 笔记标记为 superseded 并链到目标（墓碑或新笔记）。"""
+        meta = note.meta
+        try:
+            marked = self.store.save_note(
+                body=note.body,
+                note_id=note.id,
+                title=meta.title,
+                entities=list(meta.entities),
+                confidence=meta.confidence,
+                status="superseded",
+                redirect_to=meta.redirect_to,
+                superseded_by=superseded_by,
+                volatility=meta.volatility,
+                kind=meta.kind,
+                importance=meta.importance,
+                observed_at=meta.observed_at,
+                reviewed_at=now,
+                trace_id=meta.trace_id,
+                sources=list(meta.sources),
+                extra={
+                    **meta.extra,
+                    f"{prefix}_reason": reason,
+                    f"{prefix}_reason_at": now,
+                },
+                created=meta.created,
+            )
+        except (OSError, ValueError) as exc:
+            raise WikiToolError(
+                "write_failed",
+                f"旧笔记状态更新失败（{note.id} → superseded）：{type(exc).__name__}: {exc}",
+                note_id=note.id,
+            ) from exc
+        index_error = self._index_note(marked)
+        if index_error is not None:
+            logger.warning("旧笔记索引同步失败（%s）：%s", note.id, index_error)
+        return marked
+
+    def _timeline_event(self, note: Note) -> dict[str, Any]:
+        """一个版本的变更事件（字段与 list_changes 条目对齐，另带 kind/importance）。"""
+        updated = _change_time(note)
+        return {
+            "note_id": note.id,
+            "title": note.title,
+            "kind": note.meta.kind,
+            "status": note.meta.status,
+            "change_kind": _change_kind(note),
+            "confidence": note.meta.confidence,
+            "importance": note.meta.importance,
+            "entities": list(note.meta.entities),
+            "created": note.meta.created,
+            "reviewed_at": note.meta.reviewed_at,
+            "observed_at": note.meta.observed_at,
+            "updated": updated.isoformat() if updated else (note.meta.created or ""),
+            "redirect_to": note.meta.redirect_to,
+            "superseded_by": note.meta.superseded_by,
+            "path": _relative_path(note.path, self.root),
+        }
 
     # ---- 增量列表 ----
 
@@ -688,10 +1177,13 @@ def _validate_write_inputs(
     confidence: str,
     volatility: str,
     sources: Sequence[str] | None,
+    kind: str = "knowledge",
+    importance: float | None = None,
 ) -> dict[str, Any]:
-    """wiki_write 的输入校验（写保护第 1 件）：返回可直接喂给 store.save_note 的字段。
+    """wiki_write / memory_store 的输入校验（写保护第 1 件）。
 
-    所有错误一次性收集，让客户端一次就能改对，而不是挤牙膏式报错。
+    返回可直接喂给 store.save_note 的字段。所有错误一次性收集，
+    让客户端一次就能改对，而不是挤牙膏式报错。
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -734,6 +1226,30 @@ def _validate_write_inputs(
             "（stable 不衰减 / drifting 90 天半衰 / volatile 30 天半衰）"
         )
 
+    # kind/importance：记忆载体字段（P1-A）。write 收集错误语义 → 不立即抛，
+    # 统一进 errors 让客户端一次改对（检索路径的 kind 校验见 validate_kind）。
+    normalized_kind = "knowledge"
+    if isinstance(kind, str):
+        normalized_kind = kind.strip().lower()
+        if normalized_kind not in KIND_LEVELS:
+            errors.append(
+                f"kind 非法：{kind!r}，只能是 {' / '.join(KIND_LEVELS)}"
+                "（knowledge 世界知识 / user 用户画像与偏好 / experience 经验教训）"
+            )
+    else:
+        errors.append(f"kind 必须是字符串，得到 {type(kind).__name__}")
+
+    normalized_importance: float | None = None
+    if importance is not None:
+        if isinstance(importance, bool) or not isinstance(importance, int | float):
+            errors.append(f"importance 必须是 0.0–1.0 之间的数值，得到 {importance!r}")
+        elif not IMPORTANCE_MIN <= float(importance) <= IMPORTANCE_MAX:
+            errors.append(
+                f"importance 越界：{importance!r}，必须落在 {IMPORTANCE_MIN}–{IMPORTANCE_MAX}"
+            )
+        else:
+            normalized_importance = float(importance)
+
     normalized_sources: list[SourceRef] = []
     if sources is None:
         warnings.append(
@@ -772,6 +1288,8 @@ def _validate_write_inputs(
         "entities": normalized_entities,
         "confidence": str(conf),
         "volatility": str(vol),
+        "kind": normalized_kind,
+        "importance": normalized_importance,
         "sources": normalized_sources,
         "warnings": warnings,
     }
@@ -781,6 +1299,34 @@ def _change_time(note: Note) -> datetime | None:
     """笔记的"最后变更时间" = max(created, reviewed_at)（均按 ISO 串解析，UTC 归一）。"""
     candidates = [t for t in (_parse_ts(note.meta.created), _parse_ts(note.meta.reviewed_at)) if t]
     return max(candidates) if candidates else None
+
+
+def _topo_order(lineage: Mapping[str, Note]) -> list[str]:
+    """版本谱系 → 旧 → 新的有序 id 列表（拓扑排序）。
+
+    边 A → B 表示" B 直接接替 A"（A 的 superseded_by / redirect_to 指向 B）；
+    同刻/无依赖时按 note_id 升序兜底。理论上谱系是无环 DAG（主链成环早已被
+    _walk_redirects 挡下），万一出现环则回退为 note_id 排序，绝不静默丢版本。
+    """
+    edges: dict[str, list[str]] = {nid: [] for nid in lineage}
+    indegree: dict[str, int] = {nid: 0 for nid in lineage}
+    for nid, note in lineage.items():
+        target = note.meta.superseded_by or note.meta.redirect_to
+        if target and target != nid and target in lineage:
+            edges[nid].append(target)
+            indegree[target] += 1
+    ready = sorted(nid for nid, deg in indegree.items() if deg == 0)
+    ordered: list[str] = []
+    while ready:
+        nid = ready.pop(0)
+        ordered.append(nid)
+        for nxt in edges[nid]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                bisect.insort(ready, nxt)
+    if len(ordered) != len(lineage):  # pragma: no cover - 防御：谱系意外成环
+        return sorted(lineage)
+    return ordered
 
 
 def _change_kind(note: Note) -> str:

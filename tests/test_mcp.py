@@ -109,6 +109,16 @@ class TestProtocolLayer:
             "wiki_write",
             "wiki_list_changes",
             "wiki_health",
+            # memory_*（P1-A 记忆接口，wiki_* 保留为兼容层）
+            "memory_store",
+            "memory_search",
+            "memory_recall",
+            "memory_update",
+            "memory_supersede",
+            "memory_invalidate",
+            "memory_timeline",
+            "memory_conflicts",
+            "memory_profile",
         }
         for tool in tools.values():
             # 描述是给模型看的：必须说清"什么时候该用"，且是中文
@@ -124,7 +134,18 @@ class TestProtocolLayer:
             "confidence",
             "volatility",
             "sources",
+        }, "wiki_* 兼容层签名不得改变"
+        store_schema = tools["memory_store"].input_schema
+        assert set(store_schema["properties"]) == {
+            "content",
+            "kind",
+            "entities",
+            "importance",
+            "source_urls",
+            "confidence",
+            "volatility",
         }
+        assert store_schema["required"] == ["content"]
 
     def test_write_read_search_roundtrip(self, server: FastMCP) -> None:
         written = _tool_call(
@@ -553,7 +574,7 @@ class TestRedirectRead:
             def __exit__(self, *exc: object) -> None:
                 return None
 
-            def search(self, query: str, k: int = 5) -> list[Any]:
+            def search(self, query: str, k: int = 5, kind: str | None = None) -> list[Any]:
                 from researchwiki.wiki.index import SearchMatch
 
                 return [
@@ -757,6 +778,371 @@ class TestListChanges:
         }
         assert entry["status"] == "merged" and entry["redirect_to"] == "N-0002"
         assert entry["path"] == "notes/N-0003.md"
+
+
+# ---- memory_*：面向 Agent 的外置记忆接口（P1-A）-----------------------------
+
+
+class TestMemoryTools:
+    """九个 memory_* 工具的服务层语义（协议层端到端见 TestMemoryProtocol）。"""
+
+    def test_store_then_search_with_kind_filter(self, service: WikiService) -> None:
+        stored = service.store_memory(
+            "用户偏好深色主题的界面", kind="user", importance=0.9, entities=["用户偏好"]
+        )
+        assert stored["ok"] is True
+        assert stored["note_id"] == "N-0001"
+        assert stored["kind"] == "user"
+        assert stored["importance"] == 0.9
+        # 标题从正文派生，检索可命中
+        raw = (service.root / "notes" / "N-0001.md").read_text(encoding="utf-8")
+        meta, _ = parse(raw)
+        assert meta["kind"] == "user" and meta["importance"] == 0.9
+        assert meta["title"] == "用户偏好深色主题的界面"
+
+        service.store_memory("上下文压缩技术降低长会话成本", kind="knowledge")
+        found = service.search("用户偏好", kind="user")
+        assert found["ok"] is True
+        assert {r["note_id"] for r in found["results"]} == {"N-0001"}
+        found_knowledge = service.search("上下文压缩", kind="knowledge")
+        assert {r["note_id"] for r in found_knowledge["results"]} == {"N-0002"}
+        # kind=None 不过滤
+        assert service.search("压缩成本", k=5, kind=None)["count"] >= 1
+
+    def test_store_defaults_and_derived_title(self, service: WikiService) -> None:
+        payload = service.store_memory("GLM-5.3 支持 200k 上下文窗口。")
+        assert payload["ok"] is True
+        assert payload["kind"] == "knowledge"
+        assert payload["importance"] is None
+        read = service.read(payload["note_id"])
+        assert read["note"]["kind"] == "knowledge"
+        assert read["note"]["importance"] is None
+
+    def test_store_empty_content_rejected(self, service: WikiService) -> None:
+        payload = service.store_memory("   ")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "validation_failed"
+        assert not (service.root / "notes").exists()
+
+    def test_store_invalid_kind_rejected(self, service: WikiService) -> None:
+        payload = service.store_memory("正文", kind="diary")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_kind"
+        assert "knowledge / user / experience" in payload["error"]["message"]
+
+    def test_store_invalid_importance_rejected(self, service: WikiService) -> None:
+        for bad in (1.5, "0.8", True):
+            payload = service.store_memory("正文", importance=bad)  # type: ignore[arg-type]
+            assert payload["ok"] is False, bad
+            assert payload["error"]["code"] == "validation_failed", bad
+            assert "importance" in payload["error"]["message"]
+
+    def test_recall_annotates_memory_state(self, service: WikiService) -> None:
+        service.store_memory(
+            "上下文压缩技术把历史对话压成摘要。", kind="knowledge", importance=0.6
+        )
+        payload = service.recall("上下文压缩")
+        assert payload["ok"] is True
+        assert payload["mode"] == "passthrough"
+        hit = payload["results"][0]
+        assert hit["note_id"] == "N-0001"
+        assert hit["status"] == "active"
+        assert hit["kind"] == "knowledge"
+        assert hit["importance"] == 0.6
+        assert hit["observed_at"] is None  # 未填 observed_at，透传 None
+
+    def test_recall_invalid_kind(self, service: WikiService) -> None:
+        payload = service.recall("查询", kind="diary")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_kind"
+
+    def test_search_invalid_kind(self, service: WikiService) -> None:
+        payload = service.search("查询", kind="diary")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_kind"
+
+    def test_update_rewrites_body_with_backup_and_reason(
+        self, service: WikiService, wiki_root: Path, store: WikiStore
+    ) -> None:
+        # created 给一个更早的时间戳：同秒内 updated 会让 reviewed==created，
+        # list_changes 的 change_kind 判据（reviewed > created）就分不出 reviewed 了
+        store.save_note(
+            "GLM-5.3 支持 128k 上下文。", note_id="N-0001", title="上下文长度",
+            created="2026-09-01T00:00:00+00:00",
+        )
+        old_reviewed = service.read("N-0001")["note"]["reviewed_at"]
+        payload = service.update_memory(
+            "N-0001", "GLM-5.3 支持 200k 上下文。", "官方文档更新为 200k"
+        )
+        assert payload["ok"] is True
+        assert payload["note_id"] == "N-0001"  # 不新增 ID
+        assert payload["backup"]["action"] == "overwrite"
+        assert payload["backup"]["backup_file"] is not None
+
+        # 正文已改、reason 落盘进 frontmatter extra、reviewed_at 刷新
+        raw = (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8")
+        meta, body = parse(raw)
+        assert "200k" in body and "128k" not in body
+        assert meta["update_reason"] == "官方文档更新为 200k"
+        assert str(meta["update_reason_at"]).startswith("20")
+        assert meta["reviewed_at"] != old_reviewed
+
+        # 原稿在备份里
+        backup_file = wiki_root / payload["backup"]["backup_file"]
+        assert "128k" in backup_file.read_text(encoding="utf-8")
+
+        # 索引同步：旧关键词不再命中、新关键词命中
+        assert service.search("128k")["count"] == 0
+        assert service.search("200k")["count"] == 1
+        # list_changes 里表现为 reviewed 变更
+        changes = service.list_changes()["changes"]
+        assert changes[0]["change_kind"] == "reviewed"
+
+    def test_update_validations(self, service: WikiService, store: WikiStore) -> None:
+        _write_note(service, "正文", title="标题")
+        assert service.update_memory("N-9999", "新正文", "原因")["error"]["code"] == "not_found"
+        assert service.update_memory("N-0001", "  ", "原因")["error"]["code"] == (
+            "validation_failed"
+        )
+        assert service.update_memory("N-0001", "新正文", "  ")["error"]["code"] == (
+            "validation_failed"
+        )
+        # 非 active 笔记不能原地修订
+        store.save_note("旧", note_id="N-0002", title="旧", status="superseded",
+                        superseded_by="N-0001")
+        payload = service.update_memory("N-0002", "新正文", "原因")
+        assert payload["error"]["code"] == "invalid_argument"
+        assert payload["error"]["details"]["status"] == "superseded"
+
+    def test_update_rejects_write_on_validation_failure(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """修订校验失败时不得产生备份或改动。"""
+        _write_note(service, "正文", title="标题")
+        before = (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8")
+        payload = service.update_memory("N-0001", "", "原因")
+        assert payload["ok"] is False
+        assert (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8") == before
+
+    def test_supersede_chains_old_to_new(self, service: WikiService, wiki_root: Path) -> None:
+        _write_note(
+            service, "GLM-5.3 支持 128k 上下文。", title="上下文长度",
+            entities=["glm-5-3"], confidence="high",
+        )
+        payload = service.supersede_memory("N-0001", "GLM-5.3 支持 200k 上下文。", "官方文档更新")
+        assert payload["ok"] is True
+        assert payload["old_note_id"] == "N-0001"
+        assert payload["new_note_id"] == "N-0002"
+        assert payload["superseded_by"] == "N-0002"
+
+        # 旧笔记 status=superseded、superseded_by 指向新 ID、reason 落盘
+        old_raw = (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8")
+        old_meta, _ = parse(old_raw)
+        assert old_meta["status"] == "superseded"
+        assert old_meta["superseded_by"] == "N-0002"
+        assert old_meta["supersede_reason"] == "官方文档更新"
+
+        # 沿链可达：读旧 ID 自动到新笔记；新笔记继承实体/kind
+        read = service.read("N-0001")
+        assert read["note"]["note_id"] == "N-0002"
+        assert read["redirected"] is True
+        assert read["note"]["entities"] == ["glm-5-3"]
+        assert "200k" in read["body"]
+        # 新笔记已入索引
+        assert service.search("200k")["count"] == 1
+
+    def test_supersede_validations(self, service: WikiService, store: WikiStore) -> None:
+        _write_note(service, "正文", title="标题")
+        assert service.supersede_memory("N-9999", "新内容", "原因")["error"]["code"] == (
+            "not_found"
+        )
+        assert service.supersede_memory("N-0001", "  ", "原因")["error"]["code"] == (
+            "validation_failed"
+        )
+        assert service.supersede_memory("N-0001", "新内容", "  ")["error"]["code"] == (
+            "validation_failed"
+        )
+
+    def test_invalidate_creates_reachable_tombstone(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        _write_note(service, "传闻：某模型下周发布。", title="某模型发布传闻")
+        payload = service.invalidate_memory("N-0001", "官方辟谣，传闻不实")
+        assert payload["ok"] is True
+        assert payload["old_note_id"] == "N-0001"
+        assert payload["tombstone_id"] == "N-0002"
+        assert payload["superseded_by"] == "N-0002"
+
+        # 墓碑是 kind=knowledge 的 active 笔记，正文含原因与时间戳
+        tomb_raw = (wiki_root / "notes" / "N-0002.md").read_text(encoding="utf-8")
+        tomb_meta, tomb_body = parse(tomb_raw)
+        assert tomb_meta["status"] == "active"
+        assert tomb_meta["kind"] == "knowledge"
+        assert "官方辟谣，传闻不实" in tomb_body
+
+        # 旧笔记沿链可达墓碑（不变量：superseded 必须沿链可达 active）
+        old_meta, _ = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        assert old_meta["status"] == "superseded"
+        assert old_meta["superseded_by"] == "N-0002"
+        assert old_meta["invalidate_reason"] == "官方辟谣，传闻不实"
+        read = service.read("N-0001")
+        assert read["note"]["note_id"] == "N-0002"
+        assert read["redirected"] is True
+
+    def test_invalidate_requires_reason(self, service: WikiService) -> None:
+        _write_note(service, "正文", title="标题")
+        payload = service.invalidate_memory("N-0001", "  ")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "validation_failed"
+
+    def test_timeline_ordered_oldest_first(self, service: WikiService) -> None:
+        _write_note(service, "GLM-5.3 支持 128k。", title="上下文长度")
+        service.supersede_memory("N-0001", "GLM-5.3 支持 200k。", "官方文档更新")
+        service.supersede_memory("N-0002", "GLM-5.3 支持大规模上下文。", "表述修正")
+
+        # 从最新版本查，也能拿到完整历史
+        payload = service.timeline("N-0003")
+        assert payload["ok"] is True
+        assert payload["current"] == "N-0003"
+        assert payload["direction"] == "oldest_first"
+        assert [e["note_id"] for e in payload["events"]] == ["N-0001", "N-0002", "N-0003"]
+        assert [e["status"] for e in payload["events"]] == [
+            "superseded",
+            "superseded",
+            "active",
+        ]
+        assert payload["events"][1]["superseded_by"] == "N-0003"
+
+        # 从链中/链首查，结果一致
+        assert service.timeline("N-0001")["events"] == payload["events"]
+        assert service.timeline("N-0002")["current"] == "N-0003"
+
+    def test_timeline_includes_predecessors_of_active_note(self, service: WikiService) -> None:
+        """对最新（active）版本查询时，反向收集到全部更早版本。"""
+        _write_note(service, "第一版结论。", title="结论")
+        service.supersede_memory("N-0001", "第二版结论。", "补充证据")
+        payload = service.timeline("N-0002")
+        assert [e["note_id"] for e in payload["events"]] == ["N-0001", "N-0002"]
+        assert payload["events"][0]["change_kind"] == "status"
+        assert payload["events"][1]["change_kind"] == "created"
+
+    def test_timeline_not_found(self, service: WikiService) -> None:
+        payload = service.timeline("N-9999")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
+
+    def test_conflicts_passthrough(self, service: WikiService, store: WikiStore) -> None:
+        assert service.conflicts()["count"] == 0
+        store.save_conflict(
+            "上下文窗口多大？", {"note_id": "N-0001", "excerpt": "128k"},
+            {"note_id": "N-0002", "excerpt": "200k"},
+        )
+        open_payload = service.conflicts()
+        assert open_payload["ok"] is True
+        assert open_payload["status"] == "open"
+        assert open_payload["count"] == 1
+        entry = open_payload["conflicts"][0]
+        assert entry["conflict_id"] == "C-0001"
+        assert entry["claim_a"]["excerpt"] == "128k"
+        assert entry["resolution"] is None
+
+        store.resolve_conflict("C-0001", verdict="以官方文档为准", resolved_with="N-0002")
+        assert service.conflicts()["count"] == 0
+        resolved = service.conflicts(status="resolved")
+        assert resolved["count"] == 1
+        assert resolved["conflicts"][0]["resolution"]["resolved_with"] == "N-0002"
+        assert service.conflicts(status="all")["count"] == 1
+
+    def test_conflicts_invalid_status(self, service: WikiService) -> None:
+        payload = service.conflicts(status="bogus")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_argument"
+
+    def test_profile_lists_user_memories_only(self, service: WikiService) -> None:
+        service.store_memory("用户偏好深色主题。", kind="user", importance=0.8)
+        service.store_memory("用户习惯早晨做研究。", kind="user")
+        service.store_memory("上下文压缩技术降低成本。", kind="knowledge")
+        payload = service.profile()
+        assert payload["ok"] is True
+        assert payload["count"] == 2
+        assert [m["note_id"] for m in payload["memories"]] == ["N-0001", "N-0002"]
+        entry = payload["memories"][0]
+        assert entry["title"] == "用户偏好深色主题。"
+        assert entry["importance"] == 0.8
+        assert entry["snippet"]
+
+
+class TestMemoryProtocol:
+    """memory_* 协议层端到端：in-process Client 走完整 MCP 报文往返。"""
+
+    def test_memory_lifecycle_over_wire(self, server: FastMCP) -> None:
+        stored = _tool_call(
+            server,
+            "memory_store",
+            {"content": "用户偏好简洁的中文回复。", "kind": "user", "importance": 0.7},
+        )
+        assert stored["ok"] is True
+        assert stored["note_id"] == "N-0001"
+        assert stored["kind"] == "user"
+
+        recalled = _tool_call(server, "memory_recall", {"query": "用户偏好", "kind": "user"})
+        assert recalled["ok"] is True
+        assert recalled["mode"] == "passthrough"
+        hit = recalled["results"][0]
+        assert hit["note_id"] == "N-0001"
+        assert hit["kind"] == "user" and hit["status"] == "active"
+
+        updated = _tool_call(
+            server,
+            "memory_update",
+            {
+                "note_id": "N-0001",
+                "content": "用户偏好简洁的中文回复，不要 emoji。",
+                "reason": "补充约束",
+            },
+        )
+        assert updated["ok"] is True
+
+        superseded = _tool_call(
+            server,
+            "memory_supersede",
+            {"note_id": "N-0001", "new_content": "用户偏好简体中文短回复。", "reason": "画像重构"},
+        )
+        assert superseded["ok"] is True
+        assert superseded["new_note_id"] == "N-0002"
+
+        profile = _tool_call(server, "memory_profile", {})
+        assert profile["ok"] is True
+        assert [m["note_id"] for m in profile["memories"]] == ["N-0002"]
+
+        timeline = _tool_call(server, "memory_timeline", {"note_id": "N-0002"})
+        assert [e["note_id"] for e in timeline["events"]] == ["N-0001", "N-0002"]
+
+        invalidated = _tool_call(
+            server,
+            "memory_invalidate",
+            {"note_id": "N-0002", "reason": "画像过期"},
+        )
+        assert invalidated["ok"] is True
+        assert invalidated["tombstone_id"] == "N-0003"
+        # 旧 ID 沿链可达墓碑
+        read = _tool_call(server, "wiki_read", {"note_id": "N-0002"})
+        assert read["note"]["note_id"] == "N-0003"
+
+        conflicts = _tool_call(server, "memory_conflicts", {})
+        assert conflicts == {"ok": True, "status": "open", "count": 0, "conflicts": []}
+
+    def test_memory_store_invalid_kind_over_wire(self, server: FastMCP) -> None:
+        payload = _tool_call(server, "memory_store", {"content": "正文", "kind": "diary"})
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_kind"
+
+    def test_memory_update_not_found_over_wire(self, server: FastMCP) -> None:
+        payload = _tool_call(
+            server, "memory_update", {"note_id": "N-9999", "content": "正文", "reason": "原因"}
+        )
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
 
 
 # ---- 健康检查 ---------------------------------------------------------------

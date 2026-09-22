@@ -6,11 +6,22 @@
     uv run python -m researchwiki.mcp_server --transport http --port 8765
 
 工具一览（描述里写清了"什么时候该用"，因为这是给模型看的）：
-- wiki_search       检索已沉淀的笔记（回答前先查，避免重复研究）
-- wiki_read         读一条笔记全文，merged/superseded 自动跟随重定向
-- wiki_write        新增一条原子笔记（schema 校验 + 沙箱路径 + 写前备份）
-- wiki_list_changes 最近变更列表，供客户端增量同步
-- wiki_health       wiki 自检（笔记/页面/冲突计数 + 索引状态）
+- wiki_*（兼容层，五个）：
+  - wiki_search       检索已沉淀的笔记（回答前先查，避免重复研究）
+  - wiki_read         读一条笔记全文，merged/superseded 自动跟随重定向
+  - wiki_write        新增一条原子笔记（schema 校验 + 沙箱路径 + 写前备份）
+  - wiki_list_changes 最近变更列表，供客户端增量同步
+  - wiki_health       wiki 自检（笔记/页面/冲突计数 + 索引状态）
+- memory_*（记忆接口，九个）：把 wiki 当作 Agent 的外置时间感知记忆使用
+  - memory_store      显式写入一条记忆（带 kind/importance）
+  - memory_search     语义检索记忆（可按 kind 过滤）
+  - memory_recall     动态召回入口（结果带 status/observed_at/kind 标注）
+  - memory_update     修订既有记忆正文（必须留 reason，自动备份）
+  - memory_supersede  用新内容替代旧记忆（新旧 ID 沿链可达）
+  - memory_invalidate 判定记忆失效（自动生成墓碑笔记，保持链可达）
+  - memory_timeline   单条记忆的版本史
+  - memory_conflicts  冲突台账查询
+  - memory_profile    User Memory 视图（kind=user 的 active 记忆）
 
 本模块只做"薄适配"：参数校验、写保护、索引进同步全在 service.WikiService，
 所以逻辑测试直接打服务层，协议层另用 FastMCP 的 in-process Client 覆盖。
@@ -36,12 +47,29 @@ logger = logging.getLogger("researchwiki.mcp_server")
 DEFAULT_WIKI_ROOT = "wiki-data"
 SERVER_NAME = "researchwiki"
 SERVER_INSTRUCTIONS = (
-    "研究 wiki 服务：一个跨会话累积的研究知识库。\n"
+    "研究 wiki 服务：一个跨会话累积的研究知识库，也是 Agent 的外置时间感知记忆。\n"
     "回答一个新问题前，先用 wiki_search 查一下 wiki 里是否已有沉淀的结论；"
     "命中后用 wiki_read 读全文（含来源 URL）。\n"
     "研究出新的、可复用的事实后，用 wiki_write 沉淀成原子笔记（一条笔记一个事实，"
     "尽量带 sources）。\n"
     "需要跟客户端本地缓存做增量同步时用 wiki_list_changes；想确认服务状态用 wiki_health。\n"
+    "\n"
+    "记忆接口 memory_*（推荐优先用）：\n"
+    "- 主动记住一条事实/用户偏好/经验教训：memory_store"
+    "（kind: knowledge 世界知识 / user 用户画像 / experience 经验教训，"
+    "可标 importance 0.0–1.0）。\n"
+    "- 检索记忆：memory_search（可按 kind 过滤）；或用 memory_recall 动态召回"
+    "（结果带 status/observed_at/kind 标注，方便按记忆状态取舍）。\n"
+    "- 修正已有记忆：小修正文用 memory_update（必须留 reason，自动备份原稿）；"
+    "内容已过时且有新结论用 memory_supersede（新笔记替代，旧 ID 沿链可达新 ID）；"
+    "判定失效且没有替代内容用 memory_invalidate（自动生成墓碑笔记，旧记忆沿链可达墓碑）。\n"
+    "- 别直接改写或忽视过时记忆：修订/取代/失效都会留 reason 与备份，"
+    "这是记忆系统的审计底线。\n"
+    "- 查单条记忆的版本史用 memory_timeline；查冲突台账用 memory_conflicts；"
+    "查用户画像（kind=user 的 active 记忆）用 memory_profile。\n"
+    "\n"
+    "何时仍用 wiki_*：通用的检索/读取/写入/增量同步/健康检查场景两者皆可；"
+    "wiki_* 是稳定兼容层（签名不变），需要 kind/importance 等记忆语义时用 memory_*。\n"
     "所有工具都返回 JSON：成功为 {\"ok\": true, ...}，失败为 "
     "{\"ok\": false, \"error\": {\"code\", \"message\", \"details\"?}}，"
     "不会抛协议异常——请检查 ok 字段而不是等报错。"
@@ -117,6 +145,116 @@ _DESC_HEALTH = (
     "或汇报当前知识库规模时。\n"
     "返回：{ok, root, notes:{total, active, merged, superseded}, pages, entities,"
     " conflicts:{total, open, resolved}, index:{...}}。"
+)
+
+_DESC_MEMORY_STORE = (
+    "显式写入一条记忆（Agent/用户主动存一条要跨会话记住的内容）。\n"
+    "什么时候用：用户告诉了你值得长期记住的信息（偏好、约束、背景、教训、新事实），"
+    "或你自己得出了可复用的结论时。写之前先 memory_search 查重，避免同一事实存多条。\n"
+    "参数：content 记忆正文（必填，一条记忆一个事实）；kind 记忆类型"
+    " knowledge（世界知识）/ user（用户画像与偏好）/ experience（经验教训），默认 knowledge；"
+    "importance 主观重要性 0.0–1.0（可选）；entities 相关实体 slug 列表；"
+    "source_urls 来源 URL 列表（事实类记忆强烈建议填）；confidence high/medium/low；"
+    "volatility stable/drifting/volatile（时效性）。\n"
+    "标题不需要传：从 content 首行派生；要精确控制标题走 wiki_write。\n"
+    "返回：{ok, note_id, kind, importance, title, path, backup, indexed, warnings?}。"
+    "失败：{ok:false, error:{code:'invalid_kind'|'validation_failed'|...}}，"
+    "message 是可读的中文原因，照它改参数重试即可。"
+)
+
+_DESC_MEMORY_SEARCH = (
+    "在记忆库里做混合检索（FTS5 + 向量 + RRF 融合），可按记忆类型过滤。\n"
+    "什么时候用：回答问题前查相关记忆；需要按类型取记忆时（如只看 user 偏好、"
+    "只看 experience 教训）。\n"
+    "参数：query 检索词（必填）；k 返回条数（1..50，默认 5）；"
+    "kind 可选过滤 knowledge/user/experience，不传则不过滤。\n"
+    "返回：{ok, query, k, count, results:[{note_id, title, snippet, score, match_type,"
+    " redirected_from, redirect_note}]}。kind 非法返回 code='invalid_kind'。\n"
+    "命中后建议用 wiki_read 或 memory_recall 读全文与记忆状态，不要只凭 snippet 下结论。"
+)
+
+_DESC_MEMORY_RECALL = (
+    "动态召回入口：检索一批与 query 相关的记忆，并为每条标注记忆状态。\n"
+    "什么时候用：会话开始恢复上下文、回答前召回相关记忆、需要根据记忆的"
+    "时效（observed_at/status）与类型（kind）取舍内容时。\n"
+    "参数：query 检索词（必填）；k 返回条数（默认 5）；kind 可选过滤。\n"
+    "返回：{ok, mode:'passthrough', results:[{note_id, title, snippet, score, ...,"
+    " status, observed_at, kind, importance}]}——status/observed_at/kind 告诉你这条记忆"
+    "是否现役、何时观察到、属于哪类；merged/superseded 记忆自动跟随重定向到当前版本。\n"
+    "注意：当前为结构化透传（P3 将升级为 budget-aware 动态召回，按 token 预算与"
+    "重要性挑选记忆），请自行根据标注裁剪。"
+)
+
+_DESC_MEMORY_UPDATE = (
+    "修订一条既有记忆的正文（不新增 ID，原地更新）。\n"
+    "什么时候用：记忆内容基本正确但需要补充/修正细节时。如果旧记忆已整体过时、"
+    "应改用 memory_supersede 或 memory_invalidate，而不是硬改。\n"
+    "参数：note_id 记忆 ID（形如 N-0001，必须是 active 状态）；content 修订后的完整正文"
+    "（覆盖原正文）；reason 修订原因（必填）。\n"
+    "安全保障：写前自动备份原稿到 wiki-data/.backups/；reason 记入 frontmatter 的"
+    " update_reason 并刷新 reviewed_at——禁止静默覆盖，审计留痕是硬要求。\n"
+    "返回：{ok, note_id, reason, reviewed_at, backup, indexed, path}。"
+    "失败：code='not_found'（记忆不存在）/ 'invalid_argument'（非 active，先跟随重定向）/"
+    "'validation_failed'（content 或 reason 为空）。"
+)
+
+_DESC_MEMORY_SUPERSEDE = (
+    "用新内容替代一条旧记忆：先写入新记忆，再把旧记忆标记为 superseded 并链到新 ID。\n"
+    "什么时候用：旧记忆的结论已过时/被发现错误，你有了新的正确内容时"
+    "（如「X 支持 128k」→「X 支持 200k」）。\n"
+    "参数：note_id 旧记忆 ID（必须是 active）；new_content 新内容正文（必填）；"
+    "reason 替代原因（必填）。\n"
+    "语义：新记忆继承旧记忆的 entities/kind/confidence/volatility/importance；"
+    "旧记忆 status=superseded、superseded_by=新 ID，之后读旧 ID 会自动跟随到新记忆；"
+    "reason 记入旧记忆的 supersede_reason。\n"
+    "返回：{ok, old_note_id, new_note_id, superseded_by, reason, backup, path}。"
+    "失败：code='not_found' / 'invalid_argument' / 'validation_failed'。"
+)
+
+_DESC_MEMORY_INVALIDATE = (
+    "判定一条记忆失效（没有替代内容，只是不再成立/不再适用）。\n"
+    "什么时候用：发现某条记忆错了或失效、但又没有新内容可以替代时"
+    "（例如「待确认」的传闻被证伪）。有替代内容请用 memory_supersede。\n"
+    "参数：note_id 记忆 ID（必须是 active）；reason 失效原因（必填）。\n"
+    "语义：自动生成一条墓碑笔记（kind=knowledge，正文=失效原因+时间戳，active 状态），"
+    "旧记忆 status=superseded 且 superseded_by 指向墓碑——读旧 ID 会沿链到达墓碑，"
+    "审计与「superseded 必须沿链可达 active」的不变量同时保住；"
+    "reason 同时记入旧记忆的 invalidate_reason。\n"
+    "返回：{ok, old_note_id, tombstone_id, superseded_by, reason, backup, path}。"
+    "失败：code='not_found' / 'invalid_argument' / 'validation_failed'。"
+)
+
+_DESC_MEMORY_TIMELINE = (
+    "查询单条记忆的完整版本史：沿 redirect 链收集所有版本（含更早被取代的版本），"
+    "按旧 → 新输出有序事件列表。\n"
+    "什么时候用：对某条记忆的演变有疑问时（它先后说过什么、何时被修订/取代/失效）；"
+    "引用前核实记忆的来龙去脉。\n"
+    "参数：note_id 记忆 ID（传链上任何一个版本的 ID 都行，会补齐整条链）。\n"
+    "返回：{ok, note_id, current（当前 active 版本 ID）, direction:'oldest_first',"
+    " count, events:[{note_id, title, kind, status, change_kind, created, reviewed_at,"
+    " updated, superseded_by, redirect_to, path}]}（events 旧 → 新）。"
+    "失败：code='not_found'（记忆不存在）/ 'redirect_cycle' / 'broken_redirect'。"
+)
+
+_DESC_MEMORY_CONFLICTS = (
+    "查询冲突台账：同一实体的矛盾断言双方证据与裁决记录。\n"
+    "什么时候用：回答前发现记忆之间可能矛盾、想看还有哪些未裁决的冲突、"
+    "或汇报知识库一致性状态时。\n"
+    "参数：status 过滤 open（默认，未裁决）/ resolved（已裁决）/ all（全部）。\n"
+    "返回：{ok, status, count, conflicts:[{conflict_id, question, status, claim_a,"
+    " claim_b, resolution, created, resolved_at}]}。\n"
+    "发现新的矛盾时，当前版本可先用 wiki_write 记下双方证据并手工登记冲突文件；"
+    "结构化的冲突登记工具在后续版本提供。"
+)
+
+_DESC_MEMORY_PROFILE = (
+    "User Memory 视图：平铺列出所有 kind=user 的 active 记忆（用户画像、偏好、约束）。\n"
+    "什么时候用：任务开始时快速了解用户是谁、有什么偏好与长期约束；"
+    "个性化回复前核对已知偏好。\n"
+    "参数：无。\n"
+    "返回：{ok, count, memories:[{note_id, title, entities, confidence, importance,"
+    " created, observed_at, snippet, path}]}（按 note_id 排序）。\n"
+    "想补充用户画像用 memory_store(kind='user')；想看某条画像的完整正文用 wiki_read。"
 )
 
 
@@ -222,6 +360,125 @@ def build_server(
     def wiki_health() -> dict[str, Any]:
         """wiki 自检：笔记/页面/实体/冲突计数 + 索引状态。"""
         return _call(service.health)
+
+    @mcp.tool(
+        name="memory_store",
+        description=_DESC_MEMORY_STORE,
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
+    def memory_store(
+        content: str,
+        *,
+        kind: str = "knowledge",
+        entities: list[str] | None = None,
+        importance: float | None = None,
+        source_urls: list[str] | None = None,
+        confidence: str = "medium",
+        volatility: str = "stable",
+    ) -> dict[str, Any]:
+        """显式写入一条记忆（kind/importance 可选），复用写保护三件套。"""
+        return _call(
+            service.store_memory,
+            content,
+            kind=kind,
+            entities=entities,
+            importance=importance,
+            source_urls=source_urls,
+            confidence=confidence,
+            volatility=volatility,
+        )
+
+    @mcp.tool(
+        name="memory_search",
+        description=_DESC_MEMORY_SEARCH,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def memory_search(query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+        """语义检索记忆，可按 kind 过滤（knowledge/user/experience）。"""
+        return _call(service.search, query, k, kind)
+
+    @mcp.tool(
+        name="memory_recall",
+        description=_DESC_MEMORY_RECALL,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def memory_recall(query: str, k: int = 5, kind: str | None = None) -> dict[str, Any]:
+        """动态召回入口：检索 + 每条记忆标注 status/observed_at/kind。"""
+        return _call(service.recall, query, k, kind)
+
+    @mcp.tool(
+        name="memory_update",
+        description=_DESC_MEMORY_UPDATE,
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
+    def memory_update(note_id: str, content: str, reason: str) -> dict[str, Any]:
+        """修订既有记忆正文：写前备份 + reason 落盘，禁止静默覆盖。"""
+        return _call(service.update_memory, note_id, content, reason)
+
+    @mcp.tool(
+        name="memory_supersede",
+        description=_DESC_MEMORY_SUPERSEDE,
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
+    def memory_supersede(note_id: str, new_content: str, reason: str) -> dict[str, Any]:
+        """用新内容替代旧记忆：新笔记 + 旧笔记 superseded_by 链到新 ID。"""
+        return _call(service.supersede_memory, note_id, new_content, reason)
+
+    @mcp.tool(
+        name="memory_invalidate",
+        description=_DESC_MEMORY_INVALIDATE,
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
+    def memory_invalidate(note_id: str, reason: str) -> dict[str, Any]:
+        """判定记忆失效：自动生成墓碑笔记，旧记忆沿链可达墓碑。"""
+        return _call(service.invalidate_memory, note_id, reason)
+
+    @mcp.tool(
+        name="memory_timeline",
+        description=_DESC_MEMORY_TIMELINE,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def memory_timeline(note_id: str) -> dict[str, Any]:
+        """单条记忆的版本史：redirect 链 + 变更记录，旧 → 新有序事件列表。"""
+        return _call(service.timeline, note_id)
+
+    @mcp.tool(
+        name="memory_conflicts",
+        description=_DESC_MEMORY_CONFLICTS,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def memory_conflicts(status: str = "open") -> dict[str, Any]:
+        """冲突台账查询：open/resolved/all 三种过滤。"""
+        return _call(service.conflicts, status)
+
+    @mcp.tool(
+        name="memory_profile",
+        description=_DESC_MEMORY_PROFILE,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def memory_profile() -> dict[str, Any]:
+        """User Memory 视图：列出 kind=user 的 active 记忆（平铺）。"""
+        return _call(service.profile)
 
     return mcp
 
