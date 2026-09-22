@@ -18,10 +18,15 @@
 一致性策略（MVP）：查询前【不】自动同步 md 文件与索引——由调用方决定
 rebuild(store)（全量重建）或 index_note(note)（增量 upsert）。索引存了
 body 快照（供向量命中出摘要与短查询 LIKE），md 改动后需重新 index_note。
+除正文快照外，note_meta 还存一列 ``body_hash``（``note_body_hash``：title+body
+的 sha256）作为"这条索引记录对应哪版正文"的指纹——``prior.ensure_index_fresh``
+靠它发现**同 id 原地改写正文**（memory_update / formation merge 等新入口），
+只比 status 会静默保留陈旧正文。
 """
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import struct
 from collections.abc import Callable, Iterable, Mapping
@@ -205,6 +210,19 @@ def _deserialize_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{len(blob) // 4}f", blob))
 
 
+def note_body_hash(title: str, body: str) -> str:
+    """笔记正文指纹：``sha256("{title}\\n{body}")`` 的 hex。
+
+    **指纹覆盖范围**：``index_note`` 实际写入索引的两处文本——``note_fts`` 的
+    ``title`` / ``body`` 列与 ``note_meta`` 的 ``title`` / ``body`` 列（title 与
+    body 都会进 FTS 参与打分、也会作为 snippet 来源，故改标题同样让索引失真）。
+    与嵌入输入 ``f"{title}\\n{body}"`` 同形，避免"改了参与检索的字段但指纹不动"。
+    注意：指纹**不含** frontmatter 的其它字段（status/kind/sources 等）——那些
+    由 ``ensure_index_fresh`` 的 status 维度与全文 rebuild 覆盖。
+    """
+    return hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()
+
+
 # ---- 索引主体 ---------------------------------------------------------------
 
 
@@ -300,7 +318,7 @@ class SearchIndex:
             "CREATE TABLE IF NOT EXISTS note_meta ("
             "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
             "volatility TEXT, kind TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
-            "observed_at TEXT, created TEXT)"
+            "observed_at TEXT, created TEXT, body_hash TEXT)"
         )
         self._migrate_note_meta(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -328,19 +346,28 @@ class SearchIndex:
         conn.commit()
 
     def _migrate_note_meta(self, conn: sqlite3.Connection) -> None:
-        """旧库 schema 迁移：note_meta 缺 kind 列时在线补列并回填默认值。
+        """旧库 schema 迁移：note_meta 缺列时在线补列（kind：回填；body_hash：留空）。
 
-        迁移路径（v1 → v2，P1-A 引入 kind 过滤时）：已存在的 index.db 是
+        迁移路径（P1-A 引入 kind 过滤时加的 v1 → v2）：已存在的 index.db 是
         ``CREATE TABLE IF NOT EXISTS`` 够不到的旧 schema，直接 SELECT kind 会
         OperationalError。这里用 ``PRAGMA table_info`` 探测列是否存在，缺列则
         ``ALTER TABLE ADD COLUMN kind TEXT`` 并把存量行回填为默认类型
         knowledge（旧行为下所有笔记都是知识笔记，语义无损）——老用户索引
         打开即自动升级，绝不报废重建。全量 rebuild() 会用笔记真实 kind 重写。
+
+        P2-B 增补 v2 → v3 的 body_hash 列（正文指纹，见 ``note_body_hash``）：
+        同样探测缺列即 ALTER，但**存量行不回填**（一律留 NULL）。理由：回填需要
+        逐条重算 md 正文的 sha256，而这里的迁移路径只有连接、没有 store；
+        不填的后果是首次 ``prior.ensure_index_fresh`` 把 NULL 视为"索引缺指纹"
+        并整体 rebuild——正确性优先的一次性代价（rebuild 后即恢复新鲜），
+        比"迁移时静默按旧值回填、漏掉已经变过的正文"安全得多。
         """
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(note_meta)")}
         if "kind" not in columns:
             conn.execute("ALTER TABLE note_meta ADD COLUMN kind TEXT")
             conn.execute("UPDATE note_meta SET kind = 'knowledge' WHERE kind IS NULL")
+        if "body_hash" not in columns:
+            conn.execute("ALTER TABLE note_meta ADD COLUMN body_hash TEXT")
 
     def _ensure_vec_table(self, dim: int) -> bool:
         """惰性建 vec0 表；sqlite-vec 不可用或建表失败返回 False（走暴力扫描）。"""
@@ -377,8 +404,8 @@ class SearchIndex:
         )
         conn.execute(
             "INSERT OR REPLACE INTO note_meta (note_id, title, body, confidence, volatility, "
-            "kind, status, redirect_to, superseded_by, observed_at, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "kind, status, redirect_to, superseded_by, observed_at, created, body_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 note.id,
                 note.title,
@@ -391,6 +418,7 @@ class SearchIndex:
                 note.meta.superseded_by,
                 note.meta.observed_at,
                 note.meta.created,
+                note_body_hash(note.title, note.body),
             ),
         )
         conn.execute(
@@ -429,9 +457,21 @@ class SearchIndex:
 
         仅供索引新鲜度检查（如 ``prior.ensure_index_fresh``）比对 store 全量
         状态用；不代表检索可用性，调用方不得据此写入或改判笔记状态。
+        **契约不变**（P1-A 的调用方与测试依赖），实现委托给 ``indexed_fingerprints``。
         """
-        rows = self._conn.execute("SELECT note_id, status FROM note_meta").fetchall()
-        return {str(r[0]): str(r[1] or "") for r in rows}
+        return {note_id: status for note_id, (status, _) in self.indexed_fingerprints().items()}
+
+    def indexed_fingerprints(self) -> dict[str, tuple[str, str]]:
+        """索引内 ``{note_id: (status, body_hash)}`` 的只读快照（一致性检查专用）。
+
+        ``body_hash`` 是 ``note_body_hash`` 的结果（覆盖写入索引的 title + body）；
+        旧库迁移（ALTER 补列）留下的行此列为 NULL，这里归一成**空字符串**——
+        空串不是合法 sha256，调用方据此即可判定"该行缺正文指纹"（``prior.
+        ensure_index_fresh`` 正是这么用的），无需关心底层是 NULL 还是 ``""``。
+        与 ``indexed_status`` 一样，只读、仅供比对，不代表检索可用性。
+        """
+        rows = self._conn.execute("SELECT note_id, status, body_hash FROM note_meta").fetchall()
+        return {str(r[0]): (str(r[1] or ""), str(r[2] or "")) for r in rows}
 
     # ---- 检索 ----
 

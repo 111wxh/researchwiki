@@ -2,7 +2,8 @@
 
 字段一次定齐（防后续迁移）：id / title / entities / confidence / status /
 redirect_to / superseded_by / volatility / observed_at / reviewed_at /
-valid_from / valid_until / created / trace_id / sources / kind / importance。
+valid_from / valid_until / source_changed_at / created / trace_id / sources /
+kind / importance。
 
 设计约定：
 - 未知字段一律收进 ``extra``，round-trip 不丢数据（向后兼容未来扩展）。
@@ -80,6 +81,11 @@ class NoteMeta:
       valid_until 为 None = 未声明显式失效时间，靠在 freshness.py 里按
       volatility 衰减判断；两者非 ISO 时不报错，原样保留、由计算侧按
       "不可解析"处理（见 wiki/freshness.py 规则 2）。
+    - source_changed_at: 最近一次"该笔记引用的来源内容已变化"的检测时间
+      （ISO 字符串，None = 未检测到变化）。由 ``WikiStore.mark_source_changed``
+      写入（detector 提供新 content_hash，本字段只记"何时发现"）；它**不改**
+      sources 里的 content_hash——证据的换版要等复核后由 supersede/update 决定。
+      freshness 计算侧据此把记忆降级为至少 review_due（见 freshness.py 规则 5）。
     - extra: 未知字段原样保留，round-trip 不丢。
     """
 
@@ -97,6 +103,7 @@ class NoteMeta:
     reviewed_at: str | None = None
     valid_from: str | None = None
     valid_until: str | None = None
+    source_changed_at: str | None = None
     created: str = ""
     trace_id: str = ""
     sources: list[SourceRef] = field(default_factory=list)
@@ -116,6 +123,7 @@ class NoteMeta:
                 "reviewed_at",
                 "valid_from",
                 "valid_until",
+                "source_changed_at",
                 "importance",
             )
             if value is None and f.name in optional:
@@ -161,6 +169,8 @@ class NoteMeta:
             # 有效期窗口：宽容透传（非 ISO 字符串原样保留，由 freshness 计算侧按不可解析处理）
             valid_from=_scalar_str(data.get("valid_from")),
             valid_until=_scalar_str(data.get("valid_until")),
+            # 来源变化检测时间：与有效期字段同口径（宽容透传，非 ISO 由计算侧按未声明处理）
+            source_changed_at=_scalar_str(data.get("source_changed_at")),
             created=_scalar_str(data.get("created")) or "",
             trace_id=_scalar_str(data.get("trace_id")) or "",
             sources=sources,

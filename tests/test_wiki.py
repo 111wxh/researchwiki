@@ -318,6 +318,139 @@ class TestStore:
         expected = store.sources_dir / _sha1("https://example.com/x") / ("b" * 64) / "content.md"
         assert paths[0] == expected
 
+    # ---- 来源溯源（P2-B）----
+
+    def test_notes_by_source_includes_retired_versions(self, store: WikiStore):
+        url = "https://example.com/b/a"
+        store.save_note(
+            "现役断言", note_id="N-0001", sources=[SourceRef(url=url, content_hash="a" * 64)]
+        )
+        store.save_note(
+            "已合并的历史断言",
+            note_id="N-0002",
+            status="merged",
+            redirect_to="N-0001",
+            sources=[SourceRef(url=url, content_hash="b" * 64)],
+        )
+        store.save_note(
+            "别的来源", note_id="N-0003",
+            sources=[SourceRef(url="https://example.com/b/a-copy", content_hash="a" * 64)],
+        )
+        # 含非 active：证据链审计要看得到"这条 URL 被谁用过"
+        assert [n.id for n in store.notes_by_source(url)] == ["N-0001", "N-0002"]
+        assert store.notes_by_source("https://example.com/nope") == []
+        # URL 精确匹配（不做归一/前缀匹配）
+        assert store.notes_by_source("https://example.com/b") == []
+
+    def test_notes_depending_on_exact_snapshot(self, store: WikiStore):
+        url = "https://example.com/x"
+        store.save_note(
+            "旧快照断言", note_id="N-0001", sources=[SourceRef(url=url, content_hash="a" * 64)]
+        )
+        store.save_note(
+            "新快照断言", note_id="N-0002", sources=[SourceRef(url=url, content_hash="b" * 64)]
+        )
+        assert [n.id for n in store.notes_depending_on(url, "a" * 64)] == ["N-0001"]
+        assert [n.id for n in store.notes_depending_on(url, "b" * 64)] == ["N-0002"]
+        assert store.notes_depending_on(url, "c" * 64) == []
+        assert store.notes_depending_on("https://example.com/other", "a" * 64) == []
+
+    def test_missing_snapshots_reports_dangling_evidence(self, store: WikiStore):
+        url = "https://example.com/x"
+        store.save_note(
+            "有快照的断言", note_id="N-0001", sources=[SourceRef(url=url, content_hash="a" * 64)]
+        )
+        store.save_note(
+            "悬空的断言", note_id="N-0002", sources=[SourceRef(url=url, content_hash="b" * 64)]
+        )
+        store.save_note(
+            "历史版本的悬空断言",
+            note_id="N-0003",
+            status="superseded",
+            superseded_by="N-0001",
+            sources=[SourceRef(url=url, content_hash="c" * 64)],
+        )
+        store.save_note(
+            "无哈希的断言", note_id="N-0004", sources=[SourceRef(url=url, content_hash="")]
+        )
+        # 只把 N-0001 引用的快照落盘（其余保持缺失）
+        snapshot = source_snapshot_path(store.sources_dir, url, "a" * 64)
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("快照正文", encoding="utf-8")
+
+        reported = store.missing_snapshots()
+        assert [(n.id, p) for n, p in reported] == [
+            ("N-0002", source_snapshot_path(store.sources_dir, url, "b" * 64)),
+            ("N-0004", source_snapshot_path(store.sources_dir, url, "")),
+        ]
+        # 默认只查 active（退役版本 N-0003 不在默认结果里）；status=None 全查
+        assert "N-0003" not in [n.id for n, _ in reported]
+        assert [n.id for n, _ in store.missing_snapshots(status=None)] == [
+            "N-0002",
+            "N-0003",
+            "N-0004",
+        ]
+        # 快照补齐后即不再是悬空证据
+        second = source_snapshot_path(store.sources_dir, url, "b" * 64)
+        second.parent.mkdir(parents=True, exist_ok=True)
+        second.write_text("补齐的快照", encoding="utf-8")
+        assert "N-0002" not in [n.id for n, _ in store.missing_snapshots()]
+
+    def test_mark_source_changed_marks_only_stale_hash_active_notes(self, store: WikiStore):
+        url = "https://example.com/x"
+        other = "https://example.com/other"
+        new_hash = "n" * 64
+        store.save_note(
+            "记录了旧哈希的断言",
+            note_id="N-0001",
+            volatility="volatile",
+            reviewed_at="2026-01-01T00:00:00+00:00",
+            valid_until="2030-01-01T00:00:00+00:00",
+            sources=[SourceRef(url=url, content_hash="a" * 64)],
+            extra={"keeper": "保留我"},
+        )
+        store.save_note(
+            "哈希已是最新的断言",
+            note_id="N-0002",
+            sources=[SourceRef(url=url, content_hash=new_hash)],
+        )
+        store.save_note(
+            "别的来源", note_id="N-0003", sources=[SourceRef(url=other, content_hash="a" * 64)]
+        )
+        store.save_note(
+            "已合并的历史版本",
+            note_id="N-0004",
+            status="merged",
+            redirect_to="N-0001",
+            sources=[SourceRef(url=url, content_hash="a" * 64)],
+        )
+
+        affected = store.mark_source_changed(url, new_hash, now="2026-06-01T00:00:00+00:00")
+        # 只有 N-0001：哈希一致的不动、别的 URL 不动、非 active 不动
+        assert affected == ["N-0001"]
+
+        marked = store.get_note("N-0001")
+        assert marked is not None
+        assert marked.meta.source_changed_at == "2026-06-01T00:00:00+00:00"
+        # 只记"何时发现变化"：sources 里的 hash 不动（换版要等复核后由 supersede 决定）
+        assert marked.meta.sources[0].content_hash == "a" * 64
+        # 其余字段原样保留（正文 / 有效期 / 复核时间 / extra）
+        assert marked.body == "记录了旧哈希的断言"
+        assert marked.meta.reviewed_at == "2026-01-01T00:00:00+00:00"
+        assert marked.meta.valid_until == "2030-01-01T00:00:00+00:00"
+        assert marked.meta.extra["keeper"] == "保留我"
+        for note_id in ("N-0002", "N-0003", "N-0004"):
+            untouched = store.get_note(note_id)
+            assert untouched is not None and untouched.meta.source_changed_at is None
+        # 再次检测到同一变化：刷新时间戳（幂等，不产生第二条记录）
+        again = store.mark_source_changed(url, new_hash, now="2026-06-02T00:00:00+00:00")
+        assert again == ["N-0001"]
+        assert store.get_note("N-0001").meta.source_changed_at == "2026-06-02T00:00:00+00:00"
+        # 另一个 URL 独立判定：只有引用它的 N-0003 受影响
+        assert store.mark_source_changed(other, "z" * 64, now="2026-06-03T00:00:00+00:00") == [
+            "N-0003"
+        ]
+
     def test_pages(self, store: WikiStore):
         page = store.save_page("context-compression", "上下文压缩", "第一版")
         assert page.created == page.updated

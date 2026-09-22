@@ -8,6 +8,11 @@
 
 所有写盘走 atomic_write_text（tmp + os.replace）；列表默认只返回 status=active
 的笔记；follow_redirect 链式跟随 merged/superseded 并防环。
+
+来源溯源（P2-B）：``notes_by_source`` / ``notes_depending_on`` / ``missing_snapshots``
+三个纯读查询回答"这条记忆的证据来自哪个快照、快照是否还在"；``mark_source_changed``
+是唯一的写侧动作——只给受影响的 active 笔记打 ``source_changed_at`` 时间戳（不改
+sources 里的哈希、不抓网络），复核判定交给 wiki/freshness.py。
 """
 
 from __future__ import annotations
@@ -33,6 +38,11 @@ def source_snapshot_path(sources_root: str | Path, url: str, content_hash: str) 
     """
     url_key = hashlib.sha1(url.encode("utf-8")).hexdigest()
     return Path(sources_root) / url_key / content_hash / "content.md"
+
+
+def _references_url(note: Note, url: str) -> bool:
+    """笔记的 sources 里是否记录了该 URL（精确字符串匹配，不做归一）。"""
+    return any(s.url == url for s in note.meta.sources)
 
 
 @dataclass
@@ -78,6 +88,10 @@ class Note:
     @property
     def valid_until(self) -> str | None:
         return self.meta.valid_until
+
+    @property
+    def source_changed_at(self) -> str | None:
+        return self.meta.source_changed_at
 
 
 @dataclass
@@ -149,6 +163,7 @@ class WikiStore:
         reviewed_at: str | None = None,
         valid_from: str | None = None,
         valid_until: str | None = None,
+        source_changed_at: str | None = None,
         trace_id: str = "",
         sources: list[SourceRef] | None = None,
         extra: Mapping[str, object] | None = None,
@@ -174,6 +189,7 @@ class WikiStore:
             reviewed_at=reviewed_at,
             valid_from=valid_from,
             valid_until=valid_until,
+            source_changed_at=source_changed_at,
             created=created or datetime.now(UTC).isoformat(timespec="seconds"),
             trace_id=trace_id,
             sources=list(sources or []),
@@ -242,6 +258,113 @@ class WikiStore:
         return [
             source_snapshot_path(self.sources_dir, s.url, s.content_hash) for s in note.meta.sources
         ]
+
+    # ---- 来源溯源（P2-B：证据来自哪个快照 / 那个快照是否还在）--------------
+    #
+    # 三个查询都是纯读、零副作用、不做 URL 归一（url 按字符串精确匹配，
+    # 与 frontmatter 里记录的写法逐字符一致——调用方要拿 fetch 时的原 URL）。
+    # 它们只回答"谁引用了什么"，不判断该不该复核（判定在 freshness.py）。
+
+    def notes_by_source(self, url: str) -> list[Note]:
+        """所有（含 merged/superseded）引用了该 URL 的笔记，按 note_id 升序。
+
+        status=None 全量扫描是刻意的：证据链审计要能看到已被合并/废止的历史
+        版本（它们同样引用过该来源），只看 active 会漏掉"这条 URL 被谁用过"。
+        """
+        return [n for n in self.list_notes(status=None) if _references_url(n, url)]
+
+    def notes_depending_on(self, url: str, content_hash: str) -> list[Note]:
+        """精确依赖某快照版本的笔记（url + content_hash 双匹配），按 note_id 升序。
+
+        与 ``notes_by_source`` 的差别：同一个 URL 的不同快照版本是不同证据，
+        换版后只有旧 ``content_hash`` 的那批笔记需要复核。
+        """
+        return [
+            n
+            for n in self.list_notes(status=None)
+            if any(s.url == url and s.content_hash == content_hash for s in n.meta.sources)
+        ]
+
+    def missing_snapshots(self, *, status: str | None = "active") -> list[tuple[Note, Path]]:
+        """笔记声明的快照文件不存在的证据（悬空证据），按 (note_id, path) 升序。
+
+        - ``status`` 默认只看 active（现役记忆的悬空证据才需要处理）；
+          ``status=None`` 检查全部（含历史版本）。
+        - 空 content_hash 也一并报出：没有哈希就根本无法定位快照，
+          与"快照文件已被清理"同属悬空（宁可多报，也不静默放过证据链断裂）。
+        - 同一 (note, path) 只出现一次（笔记里重复写同一来源时不重复计数）。
+        """
+        out: list[tuple[Note, Path]] = []
+        seen: set[tuple[str, Path]] = set()
+        for note in self.list_notes(status=status):
+            for path in self.note_snapshot_paths(note):
+                if path.is_file():
+                    continue
+                key = (note.id, path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((note, path))
+        out.sort(key=lambda pair: (pair[0].id, str(pair[1])))
+        return out
+
+    def mark_source_changed(
+        self, url: str, new_content_hash: str, *, now: str | None = None
+    ) -> list[str]:
+        """标记"引用了该 URL 的记忆，其来源内容已变化"；返回受影响的 note_id 列表。
+
+        语义（P2-B 的来源变化最小落地，**零网络**——新 hash 由调用方提供，
+        抓取属 P4 refresh 的职责）：
+
+        - 只处理 **active** 笔记（merged/superseded 已退役，复核无意义）；
+        - 命中条件：引用了该 URL **且** 记录里的 content_hash ≠ ``new_content_hash``
+          （记录哈希与新哈希相同的笔记 = 证据未变，不动）；
+        - 写入 ``source_changed_at = now``（缺省当前 UTC 秒级 ISO），**只记"何时
+          发现变化"**，不改 sources 里的 content_hash——证据换版要等复核后由
+          supersede / memory_update 决定（下一包），这样来源变化的检测与证据的
+          修订是两个可分别审计的动作；
+        - 笔记的其余字段（含 reviewed_at / valid_* / extra）原样保留，只这一
+          个字段变化；返回值按 note_id 升序，便于调用方直接展示。
+
+        重复调用是幂等的"刷新时间戳"：同一次变化被检测两次会把时间戳推后，
+        不会产生重复记录或状态漂移。
+        """
+        stamp = now or datetime.now(UTC).isoformat(timespec="seconds")
+        affected: list[str] = []
+        for note in self.list_notes(status="active"):
+            if not _references_url(note, url):
+                continue
+            if all(
+                s.content_hash == new_content_hash
+                for s in note.meta.sources
+                if s.url == url
+            ):
+                continue  # 记录哈希与新哈希一致：证据未变
+            meta = note.meta
+            self.save_note(
+                body=note.body,
+                note_id=note.id,
+                title=meta.title,
+                entities=list(meta.entities),
+                confidence=meta.confidence,
+                status=meta.status,
+                redirect_to=meta.redirect_to,
+                superseded_by=meta.superseded_by,
+                volatility=meta.volatility,
+                kind=meta.kind,
+                importance=meta.importance,
+                observed_at=meta.observed_at,
+                reviewed_at=meta.reviewed_at,
+                valid_from=meta.valid_from,
+                valid_until=meta.valid_until,
+                source_changed_at=stamp,
+                trace_id=meta.trace_id,
+                sources=list(meta.sources),
+                extra=dict(meta.extra),
+                created=meta.created,
+            )
+            affected.append(note.id)
+        return sorted(affected)
 
     # ---- pages ----------------------------------------------------------
 
