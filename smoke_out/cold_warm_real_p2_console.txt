@@ -1,0 +1,53 @@
+⚠ 成本警告：config 模式将用真实模型与真实搜索完整跑两次研究（cold + warm），会产生真实 API 费用；请确认 key 与配额后再继续。
+=== cold/warm 对照冒烟（Prior MVP 阶段验收证据）===
+question    : Agent 长期记忆的主流方案（Letta、Mem0 等）如何做记忆固化与检索？
+provider    : config
+model       : strong=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）  cheap=glm-4.5-air（https://open.bigmodel.cn/api/paas/v4）
+features    : formation=enabled=True  memory_update=enabled=True, dry_run=False  verification=已传（floor=0.3, consistent=0.8, supersede_min=0.6）
+wiki_root   : D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T141539Z
+out         : smoke_out\cold_warm_real_p2.jsonl
+----------------------------------------------------------------------------
+[cold] run 开始（空 Wiki 冷启动）
+  [note] N-0001 conf=medium
+  [note] N-0002 conf=medium
+  [note] N-0003 conf=medium
+  [note] N-0004 conf=medium
+  [note] N-0005 conf=medium
+  [note] N-0006 conf=medium
+  [note] N-0007 conf=low
+  [note] N-0008 conf=low
+[cold] trace_id=e2b520136fa7  prior_hit=0  notes(created/merged)=8/0  sources=5  in/out=65985/4951  latency=83937ms
+[cold] formation(candidates/persisted/rejected)=8/8/0  memory_update(0/0/0/0/0)  run_dir=D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T141539Z\runs\20260922T141539-e2b520136fa7
+[warm] run 开始（同一 wiki 根目录二次研究）
+  [note] N-0003 conf=high
+  [note] N-0010 conf=high
+  [note] N-0011 conf=high
+  [note] N-0012 conf=medium
+  [note] N-0013 conf=medium
+  [note] N-0014 conf=high
+  [note] N-0005 conf=high
+[warm] trace_id=bef3ed583fd6  prior_hit=5  notes(created/merged)=5/2  sources=5  in/out=32641/6368  latency=97254ms
+[warm] formation(candidates/persisted/rejected)=8/7/1  memory_update(2/0/2/0/31)  run_dir=D:\WorkSpace\Project\自进化研究Wiki智能体\wiki-data\smoke\cold_warm-20260922T141539Z\runs\20260922T141703-bef3ed583fd6
+----------------------------------------------------------------------------
+── cold vs warm 对照（差值 = warm − cold）──
+指标                          cold          warm            差值
+prior_hit_count                0             5            +5
+fresh_search_count            13             4            -9
+fresh_fetch_count              3             2            -1
+source_count                   5             5            +0
+notes_created                  8             5            -3
+input_tokens               65985         32641        -33344
+output_tokens               4951          6368         +1417
+latency_ms                 83937         97254        +13317
+citation_coverage         0.8000        0.4000       -0.4000
+注：小样本冒烟，不构成收益结论（PLAN §11.1）。
+
+── 记忆形成 / 记忆更新（本轮计数；formation=candidates/persisted/rejected，memory_update=reviewed/superseded/merged/conflicts/skipped）──
+  run   formation                 memory_update
+  cold  8/8/0                     0/0/0/0/0
+  warm  8/7/1                     2/0/2/0/31
+----------------------------------------------------------------------------
+✓ 断言通过：cold 空 Wiki 冷启动（prior_hit_count=0，沉淀 8 条 active note）；warm run prior_hit_count=5 > 0；两次 run 的 input/output tokens 与 sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致（可复算）。
+  记忆演化三段已接线：formation=enabled=True  memory_update=enabled=True, dry_run=False  verification=已传（floor=0.3, consistent=0.8, supersede_min=0.6）（formation 计数与 memory-update.json 见 JSONL 的 formation / memory_update 键）
+JSONL 已写入 smoke_out\cold_warm_real_p2.jsonl
+EXIT=0

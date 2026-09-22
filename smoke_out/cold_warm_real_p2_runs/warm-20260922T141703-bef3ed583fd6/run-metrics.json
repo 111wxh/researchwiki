@@ -1,0 +1,22 @@
+{
+  "trace_id": "bef3ed583fd6",
+  "prior_hit_count": 5,
+  "prior_note_ids": [
+    "N-0003",
+    "N-0001",
+    "N-0002",
+    "N-0006",
+    "N-0005"
+  ],
+  "prior_context_chars": 1204,
+  "fresh_search_count": 4,
+  "fresh_fetch_count": 2,
+  "source_count": 5,
+  "notes_created": 5,
+  "notes_merged": 2,
+  "notes_superseded": 0,
+  "input_tokens": 32641,
+  "output_tokens": 6368,
+  "latency_ms": 97254,
+  "citation_coverage": 0.4
+}

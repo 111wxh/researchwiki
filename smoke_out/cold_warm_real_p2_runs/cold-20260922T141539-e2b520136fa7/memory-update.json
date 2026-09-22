@@ -1,0 +1,17 @@
+{
+  "trace_id": "e2b520136fa7",
+  "now": "2026-09-22T14:17:03+00:00",
+  "enabled": true,
+  "dry_run": false,
+  "prior_hit_count": 0,
+  "prior_note_ids": [],
+  "evidence_count": 8,
+  "counts": {
+    "reviewed": 0,
+    "superseded": 0,
+    "merged": 0,
+    "conflicts": 0,
+    "skipped": 0
+  },
+  "actions": []
+}
