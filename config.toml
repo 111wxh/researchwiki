@@ -12,16 +12,20 @@ delay = 0.04
 [llm]
 # strong / cheap 两档，OpenAI 兼容协议（POST {base_url}/chat/completions，SSE 流式）。
 # base_url 留空 = mock 模式：无需 API key，全链路可跑（router 返回 MockProvider）。
-# 接入真模型时填 model / base_url，key 放到 api_key_env 指定的环境变量（如 .env）。
+# key 放到 api_key_env 指定的环境变量（写在项目根 .env 即可，.env 已 gitignore）。
+# 下面是智谱的可用组合；换厂商只改 model / base_url，不动代码，例如：
+#   SiliconFlow  https://api.siliconflow.cn/v1        （Qwen3 / DeepSeek-V3 等）
+#   DeepSeek     https://api.deepseek.com/v1          （deepseek-chat）
+#   Kimi         https://api.moonshot.cn/v1           （kimi-k2-*）
 
 [llm.strong]
-model = ""                # 例："glm-4.7"
-base_url = ""             # 例："https://open.bigmodel.cn/api/paas/v4"（不含 /chat/completions）
+model = "glm-4.7"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_STRONG_API_KEY"
 
 [llm.cheap]
-model = ""                # 例："glm-4.7-flash"
-base_url = ""
+model = "glm-4.5-air"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
 
 [runtime]

@@ -19,12 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from researchwiki.env import load_env_file
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.router import ModelRouter
 from researchwiki.loop.agent_loop import AgentLoop
 from researchwiki.loop.research_run import ResearchRun
 from researchwiki.tools import get_search_provider
 from researchwiki.wiki.embeddings import get_embedding_provider
+
+# 早于任何读 key 的代码：把项目根的 .env 灌进环境（真实环境变量优先）
+load_env_file()
 
 app = FastAPI(title="ResearchWiki API")
 

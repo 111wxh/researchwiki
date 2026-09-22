@@ -8,6 +8,11 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 先加载 .env：所有子命令（serve / lint / serve-mcp）都要能读到 key
+    from researchwiki.env import load_env_file
+
+    load_env_file()
+
     parser = argparse.ArgumentParser(prog="researchwiki", description="自进化研究 Wiki 智能体")
     sub = parser.add_subparsers(dest="command", required=True)
     serve_parser = sub.add_parser("serve", help="启动 FastAPI server（SSE）")

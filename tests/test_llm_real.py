@@ -301,12 +301,32 @@ def test_router_returns_openai_provider_for_real_config():
 
 
 def test_router_matches_project_config_toml():
-    """config.toml 的 [llm] 段结构化后应能被 router 直接消费（默认全 mock）。"""
+    """config.toml 的 [llm] 段能被 router 直接消费：结构完整、两档可解析。
+
+    仓库里的 config.toml 会写真实模型与 base_url（便于 clone 后改 mode 即用），
+    所以断言的**不是**"默认 mock"，而是：
+    - 两档都存在且结构合法（model / base_url / api_key_env 键齐全）；
+    - base_url 为空才回退 mock——真正保证演示与测试不外呼的是 [server].mode="mock"，
+      该约束由 tests/test_server.py 的 mode 开关测试覆盖。
+    """
     with CONFIG_TOML.open("rb") as f:
         data = tomllib.load(f)
-    router = ModelRouter(data["llm"])
-    assert isinstance(router.get("strong"), MockProvider)
-    assert isinstance(router.get("cheap"), MockProvider)
+    llm_cfg = data["llm"]
+    assert set(llm_cfg) >= {"strong", "cheap"}
+    for tier in ("strong", "cheap"):
+        section = llm_cfg[tier]
+        assert {"model", "base_url", "api_key_env"} <= set(section)
+
+    router = ModelRouter(llm_cfg)
+    for tier in ("strong", "cheap"):
+        provider = router.get(tier)
+        if str(llm_cfg[tier].get("base_url") or "").strip():
+            assert isinstance(provider, OpenAICompatibleProvider)
+        else:  # 配置留空 = mock，无需 key 即可跑
+            assert isinstance(provider, MockProvider)
+
+    # 仓库默认必须仍是演示模式：不动配置直接起服务不会带 key 外出
+    assert str((data.get("server") or {}).get("mode") or "mock").lower() == "mock"
 
 
 # ---- ReplayProvider --------------------------------------------------------
