@@ -17,6 +17,12 @@ state 约定：每次 run 落盘 wiki-data/runs/{时间戳}-{trace_id}/：
 Prior 注入（PLAN §4.2）：run 开始前对问题检索历史 Wiki 的 active notes（索引
 落后先 rebuild），以"仅供核验"标签块注入 plan 步骤的 user 消息；Prior 的 URL
 不进本轮 SourcePool，报告 [n] 编号只指向本轮 fresh 来源。
+
+Formation 判定（PLAN v2 RQ1：什么时候应该记住）：蒸馏候选入库前过确定性策略
+（wiki/formation.py，零模型调用）——正文过短 / knowledge 无来源 / importance
+不足 / 与既有记忆近乎重复的候选拒绝入库并计数，其余按权重表赋 importance、把
+判定理由写进笔记 extra。显式传入 [formation] 段才启用（server 通路），
+``enabled = false`` 是逃生阀；未配置时照旧入库、零行为变化。
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ if TYPE_CHECKING:
     # 模块级「loop 导入 wiki」形成循环导入。
     from researchwiki.wiki.distiller import CandidateNote
     from researchwiki.wiki.embeddings import EmbeddingProvider
+    from researchwiki.wiki.formation import FormationDecision
     from researchwiki.wiki.frontmatter import SourceRef
     from researchwiki.wiki.index import SearchIndex
     from researchwiki.wiki.prior import PriorContext
@@ -500,6 +507,7 @@ class AgentLoop:
         embedding: EmbeddingProvider | None = None,
         wiki_config: Mapping[str, Any] | None = None,
         prior_config: Mapping[str, Any] | None = None,
+        formation_config: Mapping[str, Any] | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -537,7 +545,10 @@ class AgentLoop:
         # wiki 三层存储（notes/ pages/ conflicts/，与 loop 层既有目录布局互读兼容）：
         # run 内蒸馏走 Distiller（报告素材 → 原子笔记）→ Ingestor（查重合并 + 规范 ID）。
         self._build_wiki_layer(
-            embedding=embedding, wiki_config=wiki_config, prior_config=prior_config
+            embedding=embedding,
+            wiki_config=wiki_config,
+            prior_config=prior_config,
+            formation_config=formation_config,
         )
         self.build_pages = build_pages
         # 滚动状态（state.md 的数据源）
@@ -557,6 +568,8 @@ class AgentLoop:
         self.notes_created = 0
         self.notes_merged = 0
         self.notes_superseded = 0
+        # formation 判定计数（RQ1）：候选 = 拒绝 + 入库（逃生阀关闭时拒绝恒 0）
+        self.formation_stats = {"candidates": 0, "persisted": 0, "rejected": 0}
 
     # ---- 基础设施 ----------------------------------------------------------
 
@@ -566,6 +579,7 @@ class AgentLoop:
         embedding: EmbeddingProvider | None,
         wiki_config: Mapping[str, Any] | None,
         prior_config: Mapping[str, Any] | None,
+        formation_config: Mapping[str, Any] | None,
     ) -> None:
         """装配 wiki 层：WikiStore / EntityRegistry / Ingestor / Distiller / Prior 索引。
 
@@ -574,6 +588,7 @@ class AgentLoop:
         """
         from researchwiki.wiki.distiller import Distiller
         from researchwiki.wiki.entities import EntityRegistry
+        from researchwiki.wiki.formation import FormationSettings, from_config
         from researchwiki.wiki.index import SearchIndex, wiki_settings
         from researchwiki.wiki.ingest import Ingestor, dedup_settings
         from researchwiki.wiki.prior import prior_settings
@@ -622,6 +637,14 @@ class AgentLoop:
                 tokenizer=settings.fts_tokenizer,
                 half_life_days=settings.half_life_days,
             )
+        # formation（RQ1：什么时候应该记住）：显式传入 [formation] 段才启用入库
+        # 判定；None = 未配置（脚本 / 既有测试等老调用方），跳过判定照旧入库、
+        # 零行为变化。server 始终传 config.get("formation")，段内 enabled=false
+        # 是逃生阀（同样跳过判定，但计数照记）。
+        if formation_config is None:
+            self.formation_settings = FormationSettings(enabled=False)
+        else:
+            self.formation_settings = from_config(formation_config)
 
     def _retrieve_priors(self) -> None:
         """run 开始前的 Prior 检索（PLAN §4.2）：索引新鲜检查（落后即 rebuild）→ 检索。
@@ -645,6 +668,83 @@ class AgentLoop:
             k=self.prior_settings.k,
             max_chars=self.prior_settings.max_chars,
         )
+
+    # ---- formation 判定（RQ1：什么时候应该记住）-----------------------------
+
+    def _formation_decision(self, candidate: CandidateNote) -> FormationDecision | None:
+        """对蒸馏候选做 formation 判定；未启用（逃生阀 / 未传配置）返回 None。
+
+        similarity_max 用入库层同一套嵌入与余弦实现现算（确定性、零网络）：
+        嵌入失败或 Wiki 为空时为 None，交给 formation 跳过近乎重复规则。
+        """
+        if not self.formation_settings.enabled:
+            return None
+        from researchwiki.wiki.formation import evaluate_candidate  # 延迟导入，见文件头说明
+
+        return evaluate_candidate(
+            candidate.text,
+            entities=candidate.entities,
+            sources=candidate.source_refs,
+            similarity_max=self._similarity_max(candidate.text),
+            settings=self.formation_settings,
+        )
+
+    def _similarity_max(self, text: str) -> float | None:
+        """候选正文与既有 active 记忆的最大余弦相似度；无笔记或嵌入失败返回 None。"""
+        existing = self.wiki_store.list_notes()  # 只与 active 笔记比对（与查重同口径）
+        if not existing:
+            return None
+        try:
+            vectors = self.ingestor.embedding.embed(
+                [text, *(note.body.strip() for note in existing)]
+            )
+        except Exception as exc:  # noqa: BLE001 -- 嵌入失败降级为"不做近乎重复判定"
+            print(
+                f"[agent-loop] formation 相似度计算失败，跳过近乎重复规则："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        from researchwiki.wiki.ingest import cosine  # 延迟导入，见文件头说明
+
+        return max(cosine(vectors[0], vector) for vector in vectors[1:])
+
+    def _annotate_formation(self, note: Note, decision: FormationDecision) -> None:
+        """把 formation 判定写回已入库笔记：importance/kind 进 frontmatter，
+        判定理由与置信度进 extra（extra["formation_reason"] / extra["formation_confidence"]）。
+
+        原地覆写（note_id 传回，created 保留），其余元数据字段透传不变；
+        属辅助产物：失败只记 stderr，不推翻已完成的入库。
+        """
+        try:
+            meta = note.meta
+            extra: dict[str, Any] = dict(meta.extra)
+            extra["formation_reason"] = decision.reason
+            extra["formation_confidence"] = decision.confidence
+            self.wiki_store.save_note(
+                note.body,
+                note_id=note.id,
+                title=note.title,
+                entities=list(note.entities),
+                confidence=meta.confidence,
+                status=meta.status,
+                redirect_to=meta.redirect_to,
+                superseded_by=meta.superseded_by,
+                volatility=meta.volatility,
+                kind=decision.kind,
+                importance=decision.importance,
+                observed_at=meta.observed_at,
+                reviewed_at=meta.reviewed_at,
+                trace_id=meta.trace_id,
+                sources=list(meta.sources),
+                extra=extra,
+                created=meta.created,
+            )
+        except Exception as exc:  # noqa: BLE001 -- 标注失败不能推翻入库
+            print(
+                f"[agent-loop] formation 标注入库笔记失败：{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     def _run_subagent(self, topic: str, brief: str) -> SubagentResult:
         sub = ResearchSubagent(
@@ -724,6 +824,8 @@ class AgentLoop:
             f"（预算 {self.token_budget}，已用 {pct}%）",
             f"- 来源：{len(self.ctx.source_pool.entries)} 个",
             f"- 笔记：本次已写 {self.notes_written} 条",
+            f"- 记忆形成：候选 {self.formation_stats['candidates']}，"
+            f"入库 {self.formation_stats['persisted']}，拒绝 {self.formation_stats['rejected']}",
         ]
         if self.forced_reason:
             lines.append(f"- 熔断：{self.forced_reason}")
@@ -906,9 +1008,21 @@ class AgentLoop:
         merged = 0
         ingested: list[Note] = []
         for candidate in candidates:
+            # formation 判定（RQ1：什么时候应该记住）：未启用返回 None（逃生阀，
+            # 全部照旧入库）；拒绝的候选不入库、只计数，防无差别堆积。
+            self.formation_stats["candidates"] += 1
+            decision = self._formation_decision(candidate)
+            if decision is not None and not decision.persist:
+                self.formation_stats["rejected"] += 1
+                continue
             result = self.ingestor.add(candidate, trace_id=self.trace_id)
             note_seq += 1
             self.notes_written += 1
+            self.formation_stats["persisted"] += 1
+            if decision is not None:
+                # importance/kind 写进 frontmatter，判定理由写进 extra（辅助产物，
+                # 失败不推翻入库）
+                self._annotate_formation(result.note, decision)
             created += 1 if result.action == "created" else 0
             merged += 1 if result.action == "merged" else 0
             ingested.append(result.note)

@@ -65,3 +65,20 @@ dedup_entity_overlap = 1
 enabled = true
 top_k = 5
 max_chars = 4000
+
+[formation]
+# 记忆形成（RQ1：什么时候应该记住）：run 内蒸馏候选入库前过确定性判定——
+# 正文过短 / knowledge 无来源 / importance 低于阈值 / 与既有 active 记忆相似度
+# ≥ near_duplicate_similarity（近乎重复）的候选拒绝入库、只计数，其余按权重表
+# 赋 importance（0.0–1.0，规则见 wiki/formation.py docstring）后入库，判定理由
+# 写进笔记 extra.formation_reason。只约束自动入库路径；显式写入（MCP memory.store）
+# 不经 formation。enabled = false 为逃生阀：全部候选照旧入库（拒绝恒 0）。
+enabled = true
+# 正文最短字符数（strip 后，低于即拒绝）
+min_body_chars = 20
+# knowledge 类候选是否必须带至少一个来源（MVP 恒按 knowledge 判定）
+require_source_for_knowledge = true
+# importance 低于该值不入库（0.0–1.0）
+min_importance_to_persist = 0.3
+# 与既有 active 记忆的最大相似度达到该值视为近乎重复，拒绝入库
+near_duplicate_similarity = 0.95
