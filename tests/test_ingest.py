@@ -2,6 +2,8 @@
 
 覆盖：未命中新建（编号续接）、命中合并（规范 ID 不变 + merged 留痕 + redirect 跟随）、
 阈值边界、实体重叠门槛、LLM 重写正文与降级、嵌入失败降级、config 阈值解析。
+
+P2-F 修复轮 I-1 追加：墓碑不入查重全集、不被合并清标记（`meta.replace` 透传纪律）。
 """
 
 import math
@@ -11,7 +13,7 @@ import pytest
 
 from researchwiki.llm.provider import ScriptedProvider, StreamEvent
 from researchwiki.wiki.distiller import CandidateNote
-from researchwiki.wiki.frontmatter import SourceRef
+from researchwiki.wiki.frontmatter import NoteMeta, SourceRef
 from researchwiki.wiki.ingest import (
     DedupSettings,
     Ingestor,
@@ -217,6 +219,106 @@ def test_missing_existing_note_body_still_matches(store: WikiStore):
     store.save_note("", entities=["实体A"])
     ingestor = Ingestor(store, embedding=FixedEmbedding({"": [0.0, 1.0], REPHRASED: [1.0, 0.0]}))
     assert ingestor.add(CandidateNote(text=REPHRASED, entities=["实体A"])).action == "created"
+
+
+# ---- 墓碑：不入查重全集、不被合并清标记（P2-F 修复轮 I-1）----------------------
+
+
+def _tombstone_meta(**overrides) -> NoteMeta:
+    """一条"全字段非默认"的 NoteMeta：任何字段被静默重置都会被对比断言抓住。"""
+    fields = {
+        "id": "N-0001",
+        "title": "上下文压缩（旧）",
+        "entities": ["GLM-5.3"],
+        "confidence": "high",
+        "status": "active",
+        "volatility": "drifting",
+        "kind": "experience",
+        "importance": 0.7,
+        "tombstone": True,
+        "observed_at": "2026-05-01T00:00:00+00:00",
+        "reviewed_at": "2026-05-02T00:00:00+00:00",
+        "valid_from": "2026-05-01T00:00:00+00:00",
+        "valid_until": "2026-06-01T00:00:00+00:00",
+        "source_changed_at": "2026-05-03T00:00:00+00:00",
+        "created": "2026-04-30T00:00:00+00:00",
+        "trace_id": "run-7",
+        "sources": [SourceRef(url="https://a", content_hash="a" * 64)],
+        "extra": {"keep": "me"},
+    }
+    fields.update(overrides)
+    return NoteMeta(**fields)
+
+
+def test_tombstone_excluded_from_dedup_candidates(store: WikiStore):
+    """候选与墓碑正文高度相似（余弦 1.0 + 实体重叠）也不合并：墓碑不参与查重。"""
+    meta = _tombstone_meta(tombstone=True)
+    store.save_meta(meta, BASE)
+    ingestor = Ingestor(
+        store, embedding=FixedEmbedding({BASE: [1.0, 0.0], REPHRASED: [1.0, 0.0]})
+    )
+    result = ingestor.add(CandidateNote(text=REPHRASED, entities=["GLM-5.3"]))
+
+    # 不命中墓碑 → 新建（而不是把候选并进失效裁定里）
+    assert result.action == "created"
+    assert result.note.id == "N-0002"
+    # 墓碑原样不动：标记在、正文在、没有任何 merged 留痕
+    tombstone = store.get_note("N-0001")
+    assert tombstone.tombstone is True
+    assert tombstone.body == BASE
+    assert tombstone.meta.extra == {"keep": "me"}
+
+
+def test_merge_does_not_lose_tombstone_or_semantic_fields(store: WikiStore):
+    """即便合并命中（此处绕过查重直接调 _merge），标记与其余字段也不能被清掉。
+
+    这是修复轮 I-1 的"第二道防线"：``_merge`` 用 ``meta.replace`` 只点名要改的
+    字段，其余逐字段保留——旧写法逐参数透传 ``save_note`` 时，kind / importance /
+    tombstone 会被默认值静默覆盖。
+    """
+    meta = _tombstone_meta(tombstone=True)
+    canonical = store.save_meta(meta, BASE)
+    ingestor = Ingestor(store, embedding=FixedEmbedding({BASE: [1.0, 0.0]}))
+    result = ingestor._merge(  # noqa: SLF001 -- 直接驱动"命中合并"分支（查重已单测覆盖）
+        canonical,
+        CandidateNote(
+            text=REPHRASED,
+            entities=["glm-5-3"],
+            confidence="low",
+            volatility="volatile",
+            source_refs=[SourceRef(url="https://b", content_hash="b" * 64)],
+        ),
+        similarity=0.95,
+        refs=[SourceRef(url="https://b", content_hash="b" * 64)],
+        trace_id="run-9",
+    )
+
+    merged = result.note
+    assert merged.id == "N-0001"
+    # 预期变更的字段
+    assert [s.url for s in merged.meta.sources] == ["https://a", "https://b"]
+    assert merged.confidence == "high"  # 取更强
+    assert merged.volatility == "volatile"  # 取更易变
+    assert merged.meta.extra["merged_from"] == ["N-0002"]
+    assert merged.meta.trace_id == "run-7"  # 既有 trace_id 优先
+    # 除预期变更外**逐字段不变**（含 tombstone：漏传会把它变回可召回的正常笔记）
+    expected = meta.replace(
+        entities=["GLM-5.3"],  # 实体并集按 slugify 归一，保留既有写法
+        confidence="high",
+        volatility="volatile",
+        sources=[SourceRef(url="https://a", content_hash="a" * 64),
+                 SourceRef(url="https://b", content_hash="b" * 64)],
+        extra={"keep": "me", "merged_from": ["N-0002"]},
+    )
+    assert merged.meta == expected
+    assert merged.meta.tombstone is True
+
+
+def test_created_path_keeps_candidate_fields(store: WikiStore):
+    """新建路径不受修复影响：候选字段照旧写入（回归护栏）。"""
+    ingestor = Ingestor(store, embedding=FixedEmbedding({"全新断言": [1.0, 0.0]}))
+    result = ingestor.add(CandidateNote(text="全新断言", entities=["实体B"], confidence="high"))
+    assert result.action == "created" and result.note.tombstone is False
 
 
 # ---- 批量与配置 --------------------------------------------------------------

@@ -17,6 +17,14 @@
 
 ``add()`` 返回的 ``IngestResult.note`` 一定是规范 ID 那条，调用方（事件层/引用层）
 必须用它。
+
+查重全集与合并目标都**排除墓碑**（``meta.tombstone``，P2-F 裁定一）：墓碑是失效
+裁定记录而非当前知识，既不能当"近似重复"的基准，也不能被合并改写（那会把标记
+清掉、让已失效的记忆复活成可召回的正常笔记）。
+
+``_merge`` 重写规范笔记时走 ``meta.replace(...) + store.save_meta(...)``：只点名
+真正要改的字段，其余逐字段保留——``save_note`` 的参数默认值会静默丢字段，是
+kind / importance / tombstone 被悄悄重置的根因（修复轮 I-1）。
 """
 
 from __future__ import annotations
@@ -173,7 +181,11 @@ class Ingestor:
         if not text:
             raise ValueError("候选笔记正文为空，不能入库")
         refs = list(candidate.source_refs)
-        existing = self.store.list_notes()  # 只与 active 笔记比对
+        # 只与 active 笔记比对，且**排除墓碑**（P2-F 裁定一 + 修复轮 I-1）：墓碑是
+        # 失效裁定记录而非当前知识，既不该拦截候选入库（"近似重复"的基准不该是
+        # 审计记录），更不该被合并——合并会把它改写回普通笔记（标记被清、失效记忆
+        # 复活）。这里从根上断掉，`_merge` 的字段透传只是第二道防线。
+        existing = [note for note in self.store.list_notes() if not note.tombstone]
         match, similarity = self._best_match(text, candidate.entities, existing)
         if match is None:
             note = self.store.save_note(
@@ -229,7 +241,15 @@ class Ingestor:
         *,
         trace_id: str,
     ) -> IngestResult:
-        """把候选并入规范笔记，并写一条 merged 留痕记录（新编号）。"""
+        """把候选并入规范笔记，并写一条 merged 留痕记录（新编号）。
+
+        规范笔记的重写走 ``canonical.meta.replace(...) + store.save_meta(...)``：
+        **只点名真正要改的字段**（entities / confidence / volatility / sources /
+        trace_id / extra），其余（title、kind、importance、tombstone、created、
+        observed_at、reviewed_at、redirect_to、superseded_by、valid_*）逐字段保留。
+        旧写法逐参数透传 ``save_note``，漏传 kind / importance / tombstone 会把它们
+        静默重置成默认值（P2-F 修复轮 I-1：合并命中墓碑会把标记清掉、墓碑复活）。
+        """
         extra: dict[str, Any] = dict(canonical.meta.extra)
         body = self._merged_body(canonical.body, candidate.text)
         # 留痕先落盘：候选的原始表述 + 来源进 merged 记录（旧 ID 永不消失）
@@ -252,19 +272,19 @@ class Ingestor:
         if trail.id not in history:
             history.append(trail.id)
         extra["merged_from"] = history
-        note = self.store.save_note(
+        note = self.store.save_meta(
+            canonical.meta.replace(
+                entities=_merge_names(canonical.entities, candidate.entities),
+                confidence=_stronger_confidence(
+                    canonical.meta.confidence, candidate.confidence
+                ),
+                status="active",
+                volatility=_more_volatile(canonical.meta.volatility, candidate.volatility),
+                trace_id=canonical.meta.trace_id or trace_id or self.trace_id,
+                sources=_merge_refs(canonical.meta.sources, refs),
+                extra=extra,
+            ),
             body,
-            note_id=canonical.id,
-            title=canonical.title,
-            entities=_merge_names(canonical.entities, candidate.entities),
-            confidence=_stronger_confidence(canonical.meta.confidence, candidate.confidence),
-            status="active",
-            volatility=_more_volatile(canonical.meta.volatility, candidate.volatility),
-            observed_at=canonical.meta.observed_at,
-            created=canonical.meta.created,
-            trace_id=canonical.meta.trace_id or trace_id or self.trace_id,
-            sources=_merge_refs(canonical.meta.sources, refs),
-            extra=extra,
         )
         return IngestResult(
             note=note,
