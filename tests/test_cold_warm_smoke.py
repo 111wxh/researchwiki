@@ -5,6 +5,11 @@
 零网络、零 key；config 模式只测"真模型不可用时明确报失败"的路径
 （config 读不到 → MockProvider 占位回复 → 蒸馏无产出 → warm prior 命中 0
 → 退出码 1，绝不静默通过）。
+
+记忆演化三段（P1-B formation / P2-E memory_update / P2-C verification）的接线也被
+本文件覆盖：脚本"传了配置"不算证据，断言落在**可观察产物**上——笔记 frontmatter
+的 formation_reason、run_dir/memory-update.json、state.md 的记忆形成/记忆更新行，
+以及"run_once 到底把哪三段传给了 AgentLoop"（spy 住 AgentLoop 记录 kwargs）。
 """
 
 from __future__ import annotations
@@ -14,11 +19,13 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
 from researchwiki.loop.metrics import RunMetrics, sum_tokens_from_jsonl
 from researchwiki.tools import MockSearch
+from researchwiki.wiki.store import WikiStore
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +59,25 @@ def _run(tmp_path: Path, argv: list[str]) -> tuple[int, list[dict], Path]:
     return rc, [json.loads(line) for line in lines], out
 
 
+def _spy_agent_loop(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """把脚本里的 AgentLoop 换成子类，记录每次构造的 kwargs（wiring 证据）。
+
+    子类是同一个真实 AgentLoop（行为逐字段不变），只是把 kwargs 抄一份出来——
+    断言"三段配置真的传进去了"必须看构造点，而不是看结果差异（结果差异在
+    formation/memory_update 关闭时会完全消失）。
+    """
+    seen: list[dict[str, Any]] = []
+    real_loop = smoke.AgentLoop
+
+    class SpyLoop(real_loop):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            seen.append(dict(kwargs))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(smoke, "AgentLoop", SpyLoop)
+    return seen
+
+
 # ---- mock 模式端到端（真实 AgentLoop 两次 run）--------------------------------
 
 
@@ -72,6 +98,9 @@ def test_mock_end_to_end_prior_hit_and_token_reconciliation(tmp_path, capsys) ->
         "provider_mode",
         "model",
         "metrics",
+        # P2-G 新增键：记忆形成计数 + run 落盘的记忆更新报告（阶段未执行时 None）
+        "formation",
+        "memory_update",
     }
     assert all(set(row) == expected_keys for row in rows)
     assert all(set(row["metrics"]) == set(RunMetrics().to_dict()) for row in rows)
@@ -109,7 +138,7 @@ def test_mock_end_to_end_prior_hit_and_token_reconciliation(tmp_path, capsys) ->
         assert row["metrics"]["input_tokens"] == tok_in
         assert row["metrics"]["output_tokens"] == tok_out
 
-    # 汇总表可打印：对照字段、差值列、防误读声明
+    # 汇总表可打印：对照字段、差值列、防误读声明、记忆形成/记忆更新计数块
     printed = capsys.readouterr().out
     for field in (
         "fresh_search_count",
@@ -125,6 +154,10 @@ def test_mock_end_to_end_prior_hit_and_token_reconciliation(tmp_path, capsys) ->
     assert "差值" in printed
     assert "小样本冒烟" in printed
     assert f"JSONL 已写入 {out}" in printed
+    for field in smoke.MEMORY_UPDATE_COUNT_KEYS:
+        assert field in printed
+    assert "记忆形成 / 记忆更新" in printed
+    assert "features    : formation=enabled=True" in printed
 
 
 def test_mock_mode_supports_custom_question(tmp_path) -> None:
@@ -150,7 +183,204 @@ def test_mock_mode_locks_mock_search_even_with_env_keys(monkeypatch, tmp_path) -
     assert rc == smoke.EXIT_PASS
 
 
-# ---- config 模式：真模型不可用时必须明确报失败 ---------------------------------
+# ---- 记忆演化三段配置：接上了 + 真的生效（P1-B / P2-E / P2-C）------------------
+
+
+def test_mock_mode_passes_three_memory_configs_to_agent_loop(monkeypatch, tmp_path) -> None:
+    """wiring：run_once 把三段配置原样传给 AgentLoop（两个 run 各一次）。
+
+    断言的是**构造点**：三层配置关掉时结果差异会完全消失（loop 的保守默认是
+    "None = 零行为变化"），所以"生效"必须先证"传进去了"。
+    """
+    seen = _spy_agent_loop(monkeypatch)
+    rc, rows, _out = _run(
+        tmp_path, ["--provider", "mock", "--wiki-root", str(tmp_path / "wiki")]
+    )
+
+    assert rc == smoke.EXIT_PASS
+    assert len(seen) == 2, "cold / warm 各构造一次 AgentLoop"
+    for kwargs in seen:
+        assert kwargs["formation_config"] == smoke.MOCK_FORMATION_CONFIG
+        assert kwargs["memory_update_config"] == smoke.MOCK_MEMORY_UPDATE_CONFIG
+        assert kwargs["verification_config"] == smoke.MOCK_VERIFICATION_CONFIG
+    # 三段解析出的状态与脚本打印的一行一致（打印用的就是同一套 src 侧解析函数）
+    stack = smoke.build_mock_stack(smoke.DEFAULT_QUESTION)
+    for field in ("formation=enabled=True", "memory_update=enabled=True, dry_run=False"):
+        assert field in smoke.describe_features(stack)
+    assert "verification=已传" in smoke.describe_features(stack)
+    assert all(row["memory_update"]["enabled"] is True for row in rows)
+
+
+def test_mock_mode_formation_gates_ingest_and_annotates_note(tmp_path) -> None:
+    """formation 不只是计数：冷启动笔记带 formation_reason/importance；warm 的近乎重复候选被拒。
+
+    同一份剧本下 warm 的候选与 cold 沉淀的笔记正文完全相同 → 最大相似度 ≈ 1.0
+    ≥ near_duplicate_similarity(0.95) → 拒绝入库。这是判定的预期语义（防无差别
+    堆积），不是失败；代价是 warm 的"新证据"为空、memory_update 无动作可比
+    （故 counts 全 0，动作语义由 tests/test_memory_update.py 覆盖）。
+    """
+    wiki_root = tmp_path / "wiki"
+    rc, rows, _out = _run(tmp_path, ["--provider", "mock", "--wiki-root", str(wiki_root)])
+
+    assert rc == smoke.EXIT_PASS
+    cold, warm = rows
+    assert cold["formation"] == {"candidates": 1, "persisted": 1, "rejected": 0}
+    assert warm["formation"] == {"candidates": 1, "persisted": 0, "rejected": 1}
+
+    # 判定结果落到了笔记 frontmatter（只判过才写：接受理由 + importance + kind）
+    notes = WikiStore(wiki_root).list_notes()
+    assert len(notes) == 1
+    meta = notes[0].meta
+    assert str(meta.extra.get("formation_reason", "")).startswith("接受：")
+    assert meta.extra.get("formation_confidence") == "high"
+    assert meta.importance is not None and meta.importance > 0.0
+    assert meta.kind == "knowledge"
+    assert meta.sources and meta.sources[0].url == smoke.MOCK_SOURCE_URL
+
+    # warm 的候选被拒 → 没有第二条笔记（也没有新的 data-note 落库）
+    assert warm["metrics"]["notes_created"] == 0
+    assert warm["metrics"]["notes_merged"] == 0
+
+
+def test_mock_mode_memory_update_report_is_readable_and_enabled(tmp_path) -> None:
+    """memory_update 真的跑了：run_dir 有 memory-update.json，state.md 有记忆更新行。
+
+    warm run 的报告必须能看到它命中的 Prior（prior_hit_count/prior_note_ids 非空）
+    ——"阶段执行了并且看见了旧记忆"是这一步能给出的最强可观察证据；因为 warm 的
+    候选被 formation 拒（近乎重复），evidence_count 为 0，counts 全 0（见上一个
+    测试的说明），所以这里不断言任何写盘动作。
+    """
+    wiki_root = tmp_path / "wiki"
+    rc, rows, _out = _run(tmp_path, ["--provider", "mock", "--wiki-root", str(wiki_root)])
+
+    assert rc == smoke.EXIT_PASS
+    cold, warm = rows
+    for row in rows:
+        payload = row["memory_update"]
+        assert isinstance(payload, dict), "run_dir/memory-update.json 必须被读回"
+        assert payload["trace_id"] == row["trace_id"]
+        assert payload["enabled"] is True and payload["dry_run"] is False
+        assert set(payload["counts"]) == set(smoke.MEMORY_UPDATE_COUNT_KEYS)
+        # JSONL 里的对象就是盘子上的那份报告（落盘契约，不是脚本另算的副本）
+        on_disk = json.loads(
+            (Path(row["run_dir"]) / "memory-update.json").read_text(encoding="utf-8")
+        )
+        assert on_disk == payload
+
+    assert cold["memory_update"]["prior_hit_count"] == 0
+    assert warm["memory_update"]["prior_hit_count"] > 0
+    assert warm["memory_update"]["prior_note_ids"]
+    assert warm["memory_update"]["evidence_count"] == 0
+    assert warm["memory_update"]["counts"] == dict.fromkeys(
+        smoke.MEMORY_UPDATE_COUNT_KEYS, 0
+    )
+
+    # state.md：记忆形成行恒在；记忆更新行只在阶段启用时出现
+    cold_state = (Path(cold["run_dir"]) / "state.md").read_text(encoding="utf-8")
+    warm_state = (Path(warm["run_dir"]) / "state.md").read_text(encoding="utf-8")
+    assert "记忆形成：候选 1，入库 1，拒绝 0" in cold_state
+    assert "记忆更新：复核 0，替代 0，合并 0，冲突 0，跳过 0" in warm_state
+
+
+def test_no_memory_update_flag_skips_stage_entirely(tmp_path, capsys) -> None:
+    """逃生开关：--no-memory-update = 不传该段（整阶段不执行、逐字段零行为变化）。
+
+    P1 的四道硬闸不受影响；memory-update.json 不落盘、state.md 没有记忆更新行、
+    JSONL 里 memory_update 为 None（"没跑"与"跑了但零动作"必须可区分）。
+    """
+    wiki_root = tmp_path / "wiki"
+    rc, rows, _out = _run(
+        tmp_path,
+        ["--provider", "mock", "--no-memory-update", "--wiki-root", str(wiki_root)],
+    )
+
+    assert rc == smoke.EXIT_PASS
+    assert smoke.verify_rows(rows) == []
+    for row in rows:
+        assert row["memory_update"] is None
+        assert not (Path(row["run_dir"]) / "memory-update.json").exists()
+        state = (Path(row["run_dir"]) / "state.md").read_text(encoding="utf-8")
+        assert "记忆更新" not in state
+        # formation 不受逃生开关影响（照旧判定与计数）
+        assert row["formation"]["candidates"] == 1
+    # 汇总块里两行的 memory_update 列都是占位符（"没跑" != "跑了但零动作"）
+    data_lines = [
+        line
+        for line in smoke.format_feature_summary(rows).splitlines()
+        if line.strip().startswith(("cold", "warm"))
+    ]
+    assert len(data_lines) == 2 and all("—" in line for line in data_lines)
+    assert "memory_update=未传（整阶段不执行）" in capsys.readouterr().out
+
+def test_no_memory_update_flag_passes_none_to_agent_loop(monkeypatch, tmp_path) -> None:
+    """逃生开关的 wiring：memory_update_config 是 None（loop 的"未配置"分支），
+    另两段照旧传（逃生开关只关一个阶段，不整体降级）。"""
+    seen = _spy_agent_loop(monkeypatch)
+    rc, _rows, _out = _run(
+        tmp_path,
+        ["--provider", "mock", "--no-memory-update", "--wiki-root", str(tmp_path / "wiki")],
+    )
+
+    assert rc == smoke.EXIT_PASS
+    assert len(seen) == 2
+    assert all(kwargs["memory_update_config"] is None for kwargs in seen)
+    assert all(kwargs["formation_config"] == smoke.MOCK_FORMATION_CONFIG for kwargs in seen)
+    assert all(
+        kwargs["verification_config"] == smoke.MOCK_VERIFICATION_CONFIG for kwargs in seen
+    )
+
+
+def test_config_mode_passes_sections_and_reports_feature_state(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """config 模式按 config.toml 的段落传三段（传法同 server）+ 打印解析后的状态。
+
+    模型不可用时（无 key / 空 base_url）研究链路照旧跑完但断言失败——本测试只
+    关心配置接线：告警行、features 行、以及 spy 到的 kwargs 必须来自 temp config。
+    """
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[verification]\n"
+        "similarity_floor = 0.45\n"
+        "consistent_similarity = 0.85\n"
+        "supersede_min_similarity = 0.65\n"
+        "[formation]\n"
+        "enabled = false\n"
+        "[memory_update]\n"
+        "enabled = true\n"
+        "dry_run = true\n",
+        encoding="utf-8",
+    )
+    seen = _spy_agent_loop(monkeypatch)
+    rc, _rows, _out = _run(
+        tmp_path,
+        [
+            "--provider",
+            "config",
+            "--config",
+            str(config_path),
+            "--env-file",
+            "",
+            "--wiki-root",
+            str(tmp_path / "wiki"),
+        ],
+    )
+
+    assert rc == smoke.EXIT_ASSERT_FAILED  # 无可用模型 → warm 命中 0，明确报失败
+    assert seen and seen[0]["verification_config"] == {
+        "similarity_floor": 0.45,
+        "consistent_similarity": 0.85,
+        "supersede_min_similarity": 0.65,
+    }
+    assert seen[0]["formation_config"] == {"enabled": False}
+    assert seen[0]["memory_update_config"] == {"enabled": True, "dry_run": True}
+    printed = capsys.readouterr().out
+    assert "成本警告" in printed
+    assert "formation=enabled=False" in printed
+    assert "memory_update=enabled=True, dry_run=True" in printed
+    assert "verification=已传（floor=0.45, consistent=0.85, supersede_min=0.65）" in printed
+
+
 
 
 def test_config_mode_fails_loudly_without_usable_models(tmp_path, capsys) -> None:

@@ -23,6 +23,20 @@
 任一断言不满足即打印原因并以非零退出码结束——这是"复用收益可复算"的
 脚本化闸，绝不静默通过。
 
+── 记忆演化配置（P1-B / P2-E，终审留档 F9 的补齐点）──────────────────────
+run_once 构造 AgentLoop 时显式传入三段配置（传法与 server 的 real 通路一致）：
+
+  formation_config      config.get("formation")      [#formation] 入库判定（RQ1）
+  memory_update_config  config.get("memory_update")  [#memory_update] 收尾的记忆更新（RQ2）
+  verification_config   config.get("verification")   [#verification] 上面那一步的判定阈值
+
+不传这三段时 P1-B/P2-E 的功能全部关闭（loop 的保守默认：None = 整阶段不执行、
+逐字段零行为变化）——真模型冒烟因此看似"跑过了"，实际没验证到任何记忆演化机制。
+mock 模式不读 config.toml，故由脚本内置三段最小等价配置（见 MOCK_*_CONFIG），
+让离线剧本也覆盖判定与更新链路。`--no-memory-update` 是逃生开关：等价于不传
+[memory_update] 段（整阶段不执行、连 memory-update.json 都不写），用于在只用
+P1 口径比较 cold/warm 时排除记忆更新的影响。
+
 ── 两种 provider 模式（--provider）──────────────────────────────────────
   mock（默认）  ScriptedProvider 驱动 strong/cheap 两档（极简 TierRouter 注入，
                 gate 脚本 / tests/test_loop_prior.py 同款造法）+ 显式锁定的
@@ -32,6 +46,14 @@
                 MockEmbeddingProvider，tokenizer 固定 trigram。全程零网络、
                 零 API key、不读 .env；两次 run 用同一份剧本、各自全新
                 provider 实例，模型响应完全脚本化、可重复。
+                剧本的笔记带一条来源 URL（MOCK_SOURCE_URL，取自 MockSearch
+                夹具，必在来源池内）——formation 的 require_source_for_knowledge
+                要求知识类候选有来源，否则冷启动沉淀为 0、四道硬闸第一条即失败。
+                同剧本下 **warm 的候选与 cold 沉淀的笔记近乎重复**（同一段正文），
+                formation 按 near_duplicate_similarity 拒绝它入库：这是判定的
+                预期语义（防无差别堆积），代价是 warm 的"新证据"为空、
+                memory_update 无动作可比（counts 全 0）——记忆更新的动作语义由
+                tests/test_memory_update.py 覆盖，本脚本只证"真的接上了"。
   config        从 config.toml 读真实 strong/cheap 档位（ModelRouter）、真实搜索
                 provider 与真实 embedding（get_embedding_provider，缓存指向
                 <wiki_root>/index.db）；输出行记录 model 名与 base_url
@@ -43,9 +65,15 @@
   {"run": "cold"|"warm", "question", "trace_id", "wiki_root", "run_dir",
    "provider_mode",
    "model": {"strong": {"model", "base_url"}, "cheap": {"model", "base_url"}},
-   "metrics": {…run-metrics.json 14 字段原文…}}
+   "metrics": {…run-metrics.json 14 字段原文…},
+   "formation": {"candidates", "persisted", "rejected"},
+   "memory_update": {…run_dir/memory-update.json 原文…} | null}
+记忆形成计数取自 loop.formation_stats（run-metrics 的 14 字段契约不动，不新增
+指标字段）；memory_update 直接读回 run 自己落的 memory-update.json（阶段未执行/
+未启用时该文件不存在 → null），与 metrics 一样测"落盘契约"而非脚本另算的副本。
 --json <path> 另存机器可读汇总（含断言结论）。stdout 末段是 cold vs warm
-对照表（含差值），并注明"小样本冒烟，不构成收益结论"（PLAN §11.1）。
+对照表（含差值）+ 记忆形成/记忆更新计数块，并注明"小样本冒烟，不构成收益结论"
+（PLAN §11.1）。
 
 ── 成本警告（config 模式）──────────────────────────────────────────────
 config 模式会调用真实 LLM 与真实搜索、完整跑两次研究（cold + warm），
@@ -60,6 +88,8 @@ config 模式会调用真实 LLM 与真实搜索、完整跑两次研究（cold 
   # 指定问题 / 落盘位置
   uv run --no-sync python scripts/cold_warm_smoke.py --provider mock \
       --question "..." --wiki-root wiki-data/smoke/my-run --out wiki-data/smoke/my-run.jsonl
+  # 逃生开关：不接 [memory_update]（等价于该段缺失，整阶段不执行）
+  uv run --no-sync python scripts/cold_warm_smoke.py --provider mock --no-memory-update
 """
 
 from __future__ import annotations
@@ -79,9 +109,12 @@ from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import ScriptedProvider, StreamEvent, TokenUsage
 from researchwiki.llm.router import ModelRouter
 from researchwiki.loop.agent_loop import AgentLoop
+from researchwiki.loop.memory_update import COUNT_KEYS, memory_update_settings
 from researchwiki.loop.metrics import sum_tokens_from_jsonl
 from researchwiki.tools import get_search_provider
 from researchwiki.wiki.embeddings import MockEmbeddingProvider, get_embedding_provider
+from researchwiki.wiki.formation import from_config as formation_settings
+from researchwiki.wiki.verification import VerificationSettings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config.toml"
@@ -100,6 +133,18 @@ MOCK_SEARCH_QUERY = "agent 长期记忆 方案"
 MOCK_SUMMARY_TEXT = "已检索到主流方案，信息足够，研究完成。"
 MOCK_REPORT_TEXT = "## 研究报告\n\nLetta 的后台 subagent 方案[1] 值得优先试点。\n"
 
+# mock 剧本笔记引用的来源 URL：取 MockSearch 夹具第一条（同一次 run 的检索结果，
+# 必定在来源池内）。formation 的 require_source_for_knowledge 要求知识类候选带来源，
+# 剧本不给来源的话冷启动的候选会在入库判定处被拒 → notes_created=0 → 硬闸 2 失败。
+MOCK_SOURCE_URL = "https://github.com/letta-ai/letta"
+
+# mock 模式内置的三段记忆演化配置（mock 不读 config.toml；语义与 config.toml 的
+# [formation] / [memory_update] / [verification] 同形，值取"开着 + 全默认阈值"）。
+# 不接这三段就等于把 P1-B/P2-E 的功能全关，本脚本存在的意义之一就是让它们被跑到。
+MOCK_FORMATION_CONFIG: dict[str, Any] = {"enabled": True}
+MOCK_MEMORY_UPDATE_CONFIG: dict[str, Any] = {"enabled": True, "dry_run": False}
+MOCK_VERIFICATION_CONFIG: dict[str, Any] = {}
+
 # 对照表字段（PLAN §4.5 阶段验收口径 + prior 命中证据行；差值 = warm − cold）
 COMPARE_FIELDS: tuple[str, ...] = (
     "prior_hit_count",
@@ -112,6 +157,11 @@ COMPARE_FIELDS: tuple[str, ...] = (
     "latency_ms",
     "citation_coverage",
 )
+
+# memory_update 计数桶（口径只有一份：loop/memory_update.COUNT_KEYS）
+MEMORY_UPDATE_COUNT_KEYS: tuple[str, ...] = tuple(COUNT_KEYS)
+# formation 计数桶（loop.formation_stats / state.md 的"记忆形成"行同源）
+FORMATION_COUNT_KEYS: tuple[str, ...] = ("candidates", "persisted", "rejected")
 
 
 # ---- mock 剧本构造（与 tests/test_loop_prior.py 同构的事件造法）--------------
@@ -141,6 +191,8 @@ def mock_distill_json(question: str) -> str:
 
     笔记正文嵌入问题原文，保证 warm run 的 Prior 检索（FTS trigram + 向量双通道）
     必然命中——这是"cold 蒸馏产出 ≥1 条与问题相关的 active note"的脚本化保证。
+    `source_urls` 给的是本轮检索结果里的 URL（MOCK_SOURCE_URL），让候选带上真实
+    来源：formation 的"knowledge 必须带来源"规则据此放行（缺来源即拒绝入库）。
     """
     note = (
         f"关于「{question}」的研究结论：Letta 用后台 subagent 在会话空闲期整理长期记忆，"
@@ -148,7 +200,14 @@ def mock_distill_json(question: str) -> str:
     )
     return json.dumps(
         {
-            "notes": [{"text": note, "entities": ["Letta"], "confidence": "high"}],
+            "notes": [
+                {
+                    "text": note,
+                    "entities": ["Letta"],
+                    "confidence": "high",
+                    "source_urls": [MOCK_SOURCE_URL],
+                }
+            ],
             "conflicts": [],
         },
         ensure_ascii=False,
@@ -201,6 +260,10 @@ class ProviderStack:
 
     make_router 每次调用返回一个可用于一次 run 的 router（mock 是全新脚本化
     实例；config 的 ModelRouter 无状态，直接复用）。
+
+    formation_config / memory_update_config / verification_config 是 AgentLoop 的
+    三段记忆演化配置（传法同 server 的 real 通路）；memory_update_config 置 None
+    即整阶段不执行（`--no-memory-update` 逃生开关就是这么实现的）。
     """
 
     mode: str
@@ -211,6 +274,9 @@ class ProviderStack:
     search_provider: Any
     embedding: Any
     make_router: Callable[[], Any]
+    formation_config: Mapping[str, Any] | None
+    memory_update_config: Mapping[str, Any] | None
+    verification_config: Mapping[str, Any] | None
 
 
 def build_mock_stack(question: str) -> ProviderStack:
@@ -221,7 +287,9 @@ def build_mock_stack(question: str) -> ProviderStack:
     TAVILY_API_KEY / BOCHA_API_KEY 环境变量兜底——mock 模式的零网络不依赖
     环境巧合。llm_config 按 tests/test_loop_prior.py 的口径给 cheap 配置
     base_url，使蒸馏/子 agent 明确走 cheap 档；wiki_config 固定 trigram
-    （不探测 vendor DLL，保证确定性）；prior_config 缺省 = enabled + 默认预算。
+    （不探测 vendor DLL，保证确定性）；prior_config 缺省 = enabled + 默认预算；
+    formation / memory_update / verification 三段用内置最小等价配置（见
+    MOCK_*_CONFIG）——不接就等于把 P1-B/P2-E 的功能关掉，冒烟就验证不到它们。
     """
     llm_config = {
         "strong": {"base_url": "https://mock"},
@@ -239,11 +307,19 @@ def build_mock_stack(question: str) -> ProviderStack:
         search_provider=get_search_provider({"search": {"provider": "mock"}}),
         embedding=MockEmbeddingProvider(dim=512),
         make_router=lambda: make_mock_router(question),
+        formation_config=MOCK_FORMATION_CONFIG,
+        memory_update_config=MOCK_MEMORY_UPDATE_CONFIG,
+        verification_config=MOCK_VERIFICATION_CONFIG,
     )
 
 
 def build_config_stack(config: Mapping[str, Any], *, wiki_root: Path) -> ProviderStack:
-    """config 模式：真实 ModelRouter / 搜索 provider / embedding（缓存指向本次 wiki 根目录）。"""
+    """config 模式：真实 ModelRouter / 搜索 provider / embedding（缓存指向本次 wiki 根目录）。
+
+    三段记忆演化配置按 server 的 real 通路原样传 config.get(...)：段缺失即 None
+    （loop 的保守默认 = 该阶段不执行），不在这里替用户打开——真模型冒烟的配置形态
+    必须与生产一致，否则证据不能代表生产。
+    """
     llm_cfg = config.get("llm") or {}
     router = ModelRouter(dict(llm_cfg))
     strong = router.get("strong")
@@ -264,10 +340,56 @@ def build_config_stack(config: Mapping[str, Any], *, wiki_root: Path) -> Provide
         search_provider=get_search_provider(config),
         embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
         make_router=lambda: router,
+        formation_config=config.get("formation"),
+        memory_update_config=config.get("memory_update"),
+        verification_config=config.get("verification"),
     )
 
 
+def describe_features(stack: ProviderStack) -> str:
+    """三段记忆演化配置的启用状态一行摘要（冒烟留档要能一眼看出真的接上了）。
+
+    直接复用 src 侧的解析函数，不在这里另写一套判据：状态取自"AgentLoop 会看到的
+    那一份 settings"，因此这一行与 run 行为同源。
+    """
+    if stack.formation_config is None:
+        formation = "未传（跳过入库判定）"
+    else:
+        formation = f"enabled={formation_settings(stack.formation_config).enabled}"
+    if stack.memory_update_config is None:
+        memory_update = "未传（整阶段不执行）"
+    else:
+        settings = memory_update_settings(stack.memory_update_config)
+        memory_update = f"enabled={settings.enabled}, dry_run={settings.dry_run}"
+    if stack.verification_config is None:
+        verification = "未传（模块默认阈值）"
+    else:
+        thresholds = VerificationSettings.from_config(stack.verification_config)
+        verification = (
+            f"已传（floor={thresholds.similarity_floor}, "
+            f"consistent={thresholds.consistent_similarity}, "
+            f"supersede_min={thresholds.supersede_min_similarity}）"
+        )
+    return f"formation={formation}  memory_update={memory_update}  verification={verification}"
+
+
 # ---- 单次 run 与硬断言 ------------------------------------------------------
+
+
+def read_memory_update(run_dir: Path) -> dict[str, Any] | None:
+    """读回 run_dir/memory-update.json；文件不存在 → None（阶段未启用/未执行）。
+
+    与 metrics 同一口径：输出行里放的是 run **自己落盘的那份报告**（counts +
+    逐条动作留痕），不是脚本另算的副本。
+    """
+    path = run_dir / "memory-update.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def run_once(
@@ -277,7 +399,13 @@ def run_once(
     stack: ProviderStack,
     tokens_path: Path,
 ) -> dict[str, Any]:
-    """跑一次完整 AgentLoop，从 <run_dir>/run-metrics.json 读回指标（测的就是落盘契约）。"""
+    """跑一次完整 AgentLoop，从 <run_dir>/run-metrics.json 读回指标（测的就是落盘契约）。
+
+    三段记忆演化配置（formation / memory_update / verification）随 stack 传入，
+    传法与 server 的 real 通路一致；formation 计数取 loop.formation_stats
+    （run-metrics 的 14 字段契约不动），memory_update 取 run 落盘的
+    memory-update.json。
+    """
     accountant = TokenAccountant(path=tokens_path)
     loop = AgentLoop(
         question,
@@ -289,6 +417,9 @@ def run_once(
         embedding=stack.embedding,
         wiki_config=stack.wiki_config,
         prior_config=stack.prior_config,
+        formation_config=stack.formation_config,
+        memory_update_config=stack.memory_update_config,
+        verification_config=stack.verification_config,
     )
     for event in loop.events():
         if event.get("type") == "data-note":
@@ -305,6 +436,8 @@ def run_once(
         "provider_mode": stack.mode,
         "model": stack.model_info,
         "metrics": metrics,
+        "formation": dict(loop.formation_stats),
+        "memory_update": read_memory_update(loop.run_dir),
     }
 
 
@@ -389,6 +522,36 @@ def _fmt_delta(cold: Any, warm: Any) -> str:
     return f"{delta:+d}"
 
 
+def _fmt_counts(payload: Any, keys: Sequence[str]) -> str:
+    """计数视图：`key=值` 用 `/` 连接；payload 缺失（阶段未运行）→ 占位符。"""
+    if not isinstance(payload, Mapping):
+        return "—"
+    return "/".join(f"{int(payload.get(key) or 0)}" for key in keys)
+
+
+def format_feature_summary(rows: Sequence[Mapping[str, Any]]) -> str:
+    """记忆形成 / 记忆更新两列（本脚本新接的三段配置的可读证据）。
+
+    形态说明：format_summary 的主表是"指标 × (cold, warm, 差值)"，没有地方塞
+    两个新字典；这里按"run × 两个计数列"再给一块，列头写清各桶含义，缺数据的
+    行（--no-memory-update 或未接 formation）打占位符而不是假装 0。
+    """
+    lines = [
+        "── 记忆形成 / 记忆更新（本轮计数；formation=candidates/persisted/rejected，"
+        "memory_update=" + "/".join(MEMORY_UPDATE_COUNT_KEYS) + "）──",
+        f"  {'run':<6}{'formation':<26}{'memory_update'}",
+    ]
+    for row in rows:
+        memory_update = row.get("memory_update")
+        counts = memory_update.get("counts") if isinstance(memory_update, Mapping) else None
+        lines.append(
+            f"  {str(row.get('run')):<6}"
+            f"{_fmt_counts(row.get('formation'), FORMATION_COUNT_KEYS):<26}"
+            f"{_fmt_counts(counts, MEMORY_UPDATE_COUNT_KEYS)}"
+        )
+    return "\n".join(lines)
+
+
 def format_summary(rows: Sequence[Mapping[str, Any]]) -> str:
     """cold vs warm 人类可读对照表（含差值与 PLAN §11.1 的防误读声明）。"""
     by_run = {str(row.get("run")): dict(row.get("metrics") or {}) for row in rows}
@@ -406,6 +569,8 @@ def format_summary(rows: Sequence[Mapping[str, Any]]) -> str:
             f"{_fmt_metric(warm_value):>14}{_fmt_delta(cold_value, warm_value):>14}"
         )
     lines.append("注：小样本冒烟，不构成收益结论（PLAN §11.1）。")
+    lines.append("")
+    lines.append(format_feature_summary(rows))
     return "\n".join(lines)
 
 
@@ -444,6 +609,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE),
                         help=".env 路径（仅 config 模式读取；传空串跳过）")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="config.toml 路径")
+    parser.add_argument("--no-memory-update", action="store_true",
+                        help="逃生开关：不接 [memory_update]（等价于该段缺失——整阶段不执行、"
+                             "不写 memory-update.json、state.md 无记忆更新行）；"
+                             "用于只想看 P1 口径 cold/warm 对照的场景")
     return parser
 
 
@@ -475,6 +644,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.provider == "config"
         else build_mock_stack(question)
     )
+    if args.no_memory_update:
+        # 逃生开关：置 None = AgentLoop 的"未配置"分支（整阶段不执行，逐字段零行为
+        # 变化）。只影响 memory_update，formation / verification 照旧接上。
+        stack.memory_update_config = None
 
     tokens_path = wiki_root / "tokens.jsonl"
     strong_info = stack.model_info["strong"]
@@ -487,6 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"（{strong_info['base_url'] or '—'}）  "
         f"cheap={cheap_info['model']}（{cheap_info['base_url'] or '—'}）"
     )
+    print(f"features    : {describe_features(stack)}")
     print(f"wiki_root   : {wiki_root}")
     print(f"out         : {out_path}")
     print("-" * 76, flush=True)
@@ -499,12 +673,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             row = run_once(label, question, wiki_root, stack, tokens_path)
             rows.append(row)
             metrics = row["metrics"]
+            formation = row["formation"]
+            memory_update = row["memory_update"]
+            counts = memory_update.get("counts") if isinstance(memory_update, dict) else None
             print(
                 f"[{label}] trace_id={row['trace_id']}  prior_hit={metrics['prior_hit_count']}"
                 f"  notes(created/merged)={metrics['notes_created']}/{metrics['notes_merged']}"
                 f"  sources={metrics['source_count']}"
                 f"  in/out={metrics['input_tokens']}/{metrics['output_tokens']}"
                 f"  latency={metrics['latency_ms']}ms",
+                flush=True,
+            )
+            print(
+                f"[{label}] formation(candidates/persisted/rejected)="
+                f"{_fmt_counts(formation, FORMATION_COUNT_KEYS)}"
+                f"  memory_update({_fmt_counts(counts, MEMORY_UPDATE_COUNT_KEYS)})"
+                f"  run_dir={row['run_dir']}",
                 flush=True,
             )
     except Exception as exc:  # noqa: BLE001 -- 环境/网络问题不作数，明确退出而非裸栈
@@ -554,6 +738,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"warm run prior_hit_count={warm['metrics']['prior_hit_count']} > 0；"
         "两次 run 的 input/output tokens 与 "
         "sum_tokens_from_jsonl(<wiki_root>/tokens.jsonl, trace_id) 完全一致（可复算）。"
+    )
+    print(
+        f"  记忆演化三段已接线：{describe_features(stack)}"
+        f"（formation 计数与 memory-update.json 见 JSONL 的 formation / memory_update 键）"
     )
     print(f"JSONL 已写入 {out_path}")
     return EXIT_PASS
