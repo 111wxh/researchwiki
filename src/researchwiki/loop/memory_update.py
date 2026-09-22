@@ -824,35 +824,31 @@ def _save_preserving(
     sources: Sequence[SourceRef] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Note:
-    """覆写一条笔记，**逐字段透传**未显式覆盖的 frontmatter 字段。
+    """覆写一条笔记：走 ``meta.replace(...) + store.save_meta(...)``（P2-F 的推荐入口）。
 
-    与 ``store.mark_source_changed`` / ``AgentLoop._annotate_formation`` 同一手法：
-    ``save_note`` 的参数默认值会静默丢字段，所以这里把 title / entities /
-    confidence / volatility / kind / importance / observed_at / valid_* /
-    source_changed_at / created 逐字段搬过去（只改调用方点名的那几项）。
+    **为什么不逐参数透传 ``save_note``**（终审 F1）：那条路要手写每一个字段，漏一个
+    就静默丢一个——本方法原来就漏了 ``tombstone``（``save_note`` 的缺省 False），
+    于是一条墓碑（失效裁定记录）只要被 consistent / merge 动作碰到就会被"复活"成
+    可召回的正常笔记：这是**静默改变记忆语义**，而 ``apply_comparisons`` 是公开
+    函数（P4 refresh 是天然的下一个调用方）。改成 ``replace`` 之后，"没点名的字段
+    必然保留"是语法保证，而不是靠记性——tombstone 与 kind / importance / valid_* /
+    redirect_to / created 全都在内。与 ``store.mark_source_changed`` / ``ingest._merge``
+    的重建点同一手法。
     """
-    meta = note.meta
-    return store.save_note(
+    changes: dict[str, Any] = {}
+    if status is not None:
+        changes["status"] = status
+    if superseded_by is not None:
+        changes["superseded_by"] = superseded_by
+    if reviewed_at is not None:
+        changes["reviewed_at"] = reviewed_at
+    if sources is not None:
+        changes["sources"] = list(sources)
+    if extra is not None:
+        changes["extra"] = dict(extra)
+    return store.save_meta(
+        note.meta.replace(**changes),
         body if body is not None else note.body,
-        note_id=note.id,
-        title=meta.title,
-        entities=list(meta.entities),
-        confidence=meta.confidence,
-        status=status if status is not None else meta.status,
-        redirect_to=meta.redirect_to,
-        superseded_by=superseded_by if superseded_by is not None else meta.superseded_by,
-        volatility=meta.volatility,
-        kind=meta.kind,
-        importance=meta.importance,
-        observed_at=meta.observed_at,
-        reviewed_at=reviewed_at if reviewed_at is not None else meta.reviewed_at,
-        valid_from=meta.valid_from,
-        valid_until=meta.valid_until,
-        source_changed_at=meta.source_changed_at,
-        trace_id=meta.trace_id,
-        sources=list(sources) if sources is not None else list(meta.sources),
-        extra=dict(extra) if extra is not None else dict(meta.extra),
-        created=meta.created,
     )
 
 
@@ -972,19 +968,24 @@ def _apply_supersede(
     )
     new_id: str | None = None
     if not dry_run:
-        extra = _audit_only_extra(key, content_key, reason, comparison, now)
-        extra[SUPERSEDE_REASON_KEY] = reason
-        extra["superseded_from"] = prior.id
         if target is not None:
+            # 复用路径：留痕必须**追加在目标既有 extra 上**（终审 F5）——原来从 {}
+            # 起算并与目标 extra 做浅合并，会把目标自己的 memory_update_keys /
+            # body_keys / reasons 覆写成单元素，跨 run 的幂等记录随之丢失（同一段
+            # 证据会被重复处置，甚至把目标自己再退役一次）。
             merged_sources, _ = _merge_sources(target.meta.sources, sources)
-            _save_preserving(
-                store,
-                target,
-                sources=merged_sources,
-                extra={**dict(target.meta.extra), **extra},
+            target_extra = _audit_extra(
+                target.meta.extra, key, content_key, reason, comparison, now
             )
+            target_extra[SUPERSEDE_REASON_KEY] = reason
+            target_extra["superseded_from"] = prior.id
+            _save_preserving(store, target, sources=merged_sources, extra=target_extra)
             new_id = target.id
         else:
+            # 新建路径：新笔记没有既有 extra，用干净的留痕（不继承旧来源标记）
+            extra = _audit_only_extra(key, content_key, reason, comparison, now)
+            extra[SUPERSEDE_REASON_KEY] = reason
+            extra["superseded_from"] = prior.id
             written = store.save_note(
                 item.text,
                 title=_derive_title(item.text, fallback=prior.title or "替代记忆"),
@@ -1082,7 +1083,10 @@ def _apply_merge(
     records = extra.get(UPDATE_REASONS_KEY)
     history = list(records) if isinstance(records, list) else []
     history.append({"reason": reason, "at": now})
-    extra[UPDATE_REASONS_KEY] = history
+    # 也按 MAX_RECORDED_KEYS 封顶（终审 F6）：P2-D 的 update_reasons 是全量追加契约，
+    # 本模块把上限统一到同一常量，四个列表（keys / body_keys / reasons / update_reasons）
+    # 的口径才一致——报告 §M-4 声称的"四个列表都保留最近 50 条"由此成立。
+    extra[UPDATE_REASONS_KEY] = history[-MAX_RECORDED_KEYS:]
     if not dry_run:
         _save_preserving(
             store,

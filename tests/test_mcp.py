@@ -959,7 +959,7 @@ class TestMemoryTools:
     def test_update_reasons_accumulate_across_revisions(
         self, service: WikiService, wiki_root: Path
     ) -> None:
-        """多次修订：update_reasons 按序追加，全部原因保留（不整键覆盖）。"""
+        """多次修订：update_reasons 按序累积（不整键覆盖），未超上限时全量保留。"""
         _write_note(service, "v1 正文", title="标题")
         assert service.update_memory("N-0001", "v2 正文", "原因一")["ok"] is True
         assert service.update_memory("N-0001", "v3 正文", "原因二")["ok"] is True
@@ -968,6 +968,27 @@ class TestMemoryTools:
         assert [r["reason"] for r in records] == ["原因一", "原因二"]
         assert all(str(r["at"]).startswith("20") for r in records)
         assert records[1]["at"] >= records[0]["at"]
+
+    def test_update_reasons_capped_by_retention_limit(
+        self, service: WikiService, wiki_root: Path, monkeypatch
+    ) -> None:
+        """终审 F6：update_reasons 累积但**封顶**（保留最近 N 条），防 frontmatter 无界膨胀。
+
+        与 loop 侧 memory_update.MAX_RECORDED_KEYS 同口径；被裁掉的原因仍可从
+        ``.backups/<时间戳>/`` 的历史原稿追溯（每次修订前都备份）。这里把上限调到 3，
+        用 5 次修订复现裁剪，不必真写 50+ 次。
+        """
+        monkeypatch.setattr(service_module, "MAX_UPDATE_REASONS", 3)
+        _write_note(service, "v1 正文", title="标题")
+        for index in range(2, 7):
+            assert service.update_memory("N-0001", f"v{index} 正文", f"原因{index}")["ok"] is True
+        meta, body = parse((wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8"))
+        records = meta["update_reasons"]
+        assert [r["reason"] for r in records] == ["原因4", "原因5", "原因6"]  # 保留最近 3 条
+        assert records[-1]["at"] >= records[0]["at"]
+        assert body == "v6 正文"  # 正文照旧是最新修订
+        # 返回体的 reasons_so_far 报的是实际落盘长度（审计信息不撒谎）
+        assert service.update_memory("N-0001", "v7 正文", "原因7")["reasons_so_far"] == 3
 
     def test_update_reason_folds_legacy_single_key(
         self, service: WikiService, wiki_root: Path

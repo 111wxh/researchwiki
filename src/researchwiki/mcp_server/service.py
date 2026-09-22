@@ -115,6 +115,12 @@ MAX_K = 50
 MAX_LIMIT = 200
 MAX_BODY_CHARS = 200_000
 BACKUP_DIR_NAME = ".backups"
+# extra.update_reasons 的保留上限（终审 F6）：修订原因按序累积，但**只保留最近 N 条**
+# ——无界追加会让 frontmatter 随修订次数无限膨胀（取舍同 store.mark_source_changed 的
+# "上界 = 引用过的 URL 数"）。被裁掉的原因仍可从 `.backups/<时间戳>/` 的历史原稿追溯
+# （每次修订前都备份），所以全量审计没有丢，只是不再随笔记长胖。与 loop 侧
+# memory_update.MAX_RECORDED_KEYS 同值：两条写路径对同一字段保持同一口径。
+MAX_UPDATE_REASONS = 50
 
 logger = logging.getLogger(__name__)
 
@@ -796,7 +802,9 @@ class WikiService:
 
         - 备份：create_backup(existed=True)，原稿进 wiki-data/.backups/；
         - reason：**追加**进 frontmatter extra 的 ``update_reasons`` 列表（按修订顺序，
-          每条 ``{"reason", "at"}``），多次修订的全部原因都保留；同时刷新
+          每条 ``{"reason", "at"}``），按序累积、不覆盖，但只保留最近
+          ``MAX_UPDATE_REASONS`` 条（终审 F6：防 frontmatter 无界膨胀；更早的原因
+          仍可从 ``.backups/<时间戳>/`` 的历史原稿追溯）；同时刷新
           ``reviewed_at``（list_changes 里表现为 reviewed 变更）。兼容迁移：旧版
           本的单键 ``update_reason``/``update_reason_at`` 在首次追加时折叠为列表
           首条目，随后旧键移除（round-trip 归一，不丢历史原因）；
@@ -1700,7 +1708,10 @@ def _change_time(note: Note) -> datetime | None:
 def _append_update_reason(extra: Mapping[str, Any], reason: str, at: str) -> dict[str, Any]:
     """把一次修订原因**追加**进 extra 的 ``update_reasons``（按修订顺序累积）。
 
-    条目形态 ``{"reason": ..., "at": ...}``；多次修订全部保留，不覆盖。
+    条目形态 ``{"reason": ..., "at": ...}``；多次修订按序累积、不覆盖，但**只保留
+    最近 ``MAX_UPDATE_REASONS`` 条**（终审 F6：无界追加会让 frontmatter 随修订次数
+    无限膨胀）。被裁掉的原因仍可从 ``.backups/<时间戳>/`` 的历史原稿追溯——每次修订
+    前都备份，所以这是"不在笔记里长胖"而不是"丢掉审计"。
     兼容迁移：旧版本把原因写在单键 ``update_reason``/``update_reason_at``，
     首次追加时先把它折叠为列表首条目，随后旧键移除——round-trip 归一，
     历史原因不丢。
@@ -1719,7 +1730,7 @@ def _append_update_reason(extra: Mapping[str, Any], reason: str, at: str) -> dic
             }
         )
     records.append({"reason": reason, "at": at})
-    merged["update_reasons"] = records
+    merged["update_reasons"] = records[-MAX_UPDATE_REASONS:]
     return merged
 
 

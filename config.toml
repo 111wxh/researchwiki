@@ -101,12 +101,23 @@ near_duplicate_similarity = 0.95
 # 旧记忆 vs 新证据的结构化比较阈值（P2-C，wiki/verification.py）：研究 run 收尾的
 # "记忆更新"阶段用它判定命中 Prior 该怎么处置。半衰期/新鲜度不在本段（那在
 # [freshness] 与 [wiki].half_life_days）。缺省段 = 模块默认值（同下）。
+# 这里的相似度是**判定层自带的确定性度量**（bigram 特征哈希余弦，零网络、可复算），
+# 与 [wiki].dedup_similarity（入库去重，走 [embedding] 段模型）以及 formation 的
+# near_duplicate_similarity **不是同一尺度**，数值不可直接比较：本段阈值在这套
+# 度量上独立标定（若将来要求与检索侧同尺度，需要把 embedding provider 注入判定层、
+# 放弃零模型调用——那是一次显式取舍，见 wiki/verification.py docstring）。
 # similarity_floor：相似度地板，低于它直接判 uncertain（不做任何比较，也不调用
 #   语义判官——地板存在的意义就是不让无关证据消耗比较器）；
 # consistent_similarity：断言重述的相似度阈值，达到且槽位级取值逐一对得上才判
 #   consistent（只刷新 reviewed_at）；被夹到不低于 similarity_floor。
 similarity_floor = 0.3
 consistent_similarity = 0.8
+# supersede_min_similarity：**替换门**（终审 F2 监察者裁定）——相似度低于它的证据
+#   不得判 newer/supersede（落 uncertain）："时间更晚"不是覆盖旧记忆的充分条件，
+#   主题相邻、facet 不同的更晚证据（实体为空时实体护栏也不设防）曾经能覆盖仍然有效
+#   的旧记忆。只约束替换类覆盖动作；冲突（开台账，保守动作）与 merge（保留规范 ID）
+#   不受它约束。小于 similarity_floor 时被夹到 floor。
+supersede_min_similarity = 0.6
 # similarity_dim：比较用的确定性 bigram 特征哈希向量维度（与 [embedding] 无关，
 #   判定必须零网络、可复算）
 similarity_dim = 128

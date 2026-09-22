@@ -1376,3 +1376,101 @@ def test_deterministic_paths_leave_guard_and_judge_verdict_none() -> None:
     )
     assert consistent.verdict == vf.VERDICT_CONSISTENT
     assert consistent.guard is None and consistent.judge_verdict is None
+
+
+# ---- 终审 F2：替换门（supersede_min_similarity，监察者裁定）------------------
+
+
+# 主题相邻、facet 不同的一对（终审实测 sim≈0.52）：旧记忆讲 Letta 的后台子代理，
+# 证据讲 MemGPT 的分页机制，两侧都没有事实令牌（具体度规则不会命中），时间更晚。
+ADJACENT_PRIOR = "Letta 的后台子代理方案在长会话里更省 token。"
+ADJACENT_EVIDENCE = "MemGPT 的分页机制在长文档里更省 token。"
+# 低相似度**冲突**对（sim≈0.52，命中 number:k:上下文窗口 槽位）：开台账是保守动作，
+# 替换门不该拦它。
+LOW_SIM_CONFLICT_PRIOR = "上下文窗口 128k，模型 A 定位多轮长会话。"
+LOW_SIM_CONFLICT_EVIDENCE = "上下文窗口 256k，模型 B 面向单轮短任务，成本结构完全不同。"
+
+
+def test_supersede_gate_blocks_facet_adjacent_later_evidence() -> None:
+    """F2①：异 facet 的更晚证据（sim≈0.52 < 替换门 0.60）不得判 newer/supersede。
+
+    没有这道门时规则 4（时间）会直接判 newer——地板 0.3 只保证"不是完全无关"，
+    实体为空时实体护栏也不设防，于是"主题相邻、facet 不同"的更晚证据能把仍然有效
+    的旧记忆覆盖掉（静默覆盖最现实的形态）。
+    """
+    note = make_note(body=ADJACENT_PRIOR)
+    evidence = evi(ADJACENT_EVIDENCE, observed_at=LATER)
+    similarity = vf.token_similarity(ADJACENT_PRIOR, ADJACENT_EVIDENCE)
+    assert 0.3 <= similarity < vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY  # 前提：落在地板与门之间
+
+    result = vf.compare_prior_and_evidence(note, evidence)
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    assert result.similarity == similarity
+    joined = "\n".join(result.reasons)
+    assert "低于替换门 0.60" in joined
+    assert f"相似度 {similarity:.3f}" in joined  # 理由写出实际相似度
+    assert "不足以放行覆盖动作（supersede）" in joined
+    assert "→ 新证据更新（建议 supersede）" not in joined
+    assert result.to_dict()["verdict"] == vf.VERDICT_UNCERTAIN
+
+
+def test_supersede_gate_keeps_legitimate_update_and_conflict() -> None:
+    """F2②：同主题同 facet 的高相似更新仍判 newer；conflicting 不受门约束。"""
+    # 高相似（sim≈0.83 > 0.60）的更晚 / 更具体证据 → 照旧 newer
+    legit = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 的上下文窗口是 128k。"),
+        evi("模型 A 的上下文窗口是 128k，另有 256k 可选。", observed_at=LATER),
+    )
+    assert legit.verdict == vf.VERDICT_NEWER
+    assert legit.suggested_action == vf.ACTION_SUPERSEDE
+    assert "→ 新证据更新（建议 supersede）" in "\n".join(legit.reasons)
+
+    # 低相似（sim≈0.52）但同槽位取值矛盾 → 仍判 conflicting（开台账是保守动作）
+    low_sim = vf.token_similarity(LOW_SIM_CONFLICT_PRIOR, LOW_SIM_CONFLICT_EVIDENCE)
+    assert low_sim < vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY
+    conflict = vf.compare_prior_and_evidence(
+        make_note(body=LOW_SIM_CONFLICT_PRIOR),
+        evi(LOW_SIM_CONFLICT_EVIDENCE, observed_at=LATER),
+    )
+    assert conflict.verdict == vf.VERDICT_CONFLICTING
+    assert conflict.suggested_action == vf.ACTION_OPEN_CONFLICT
+    assert "低于替换门" not in "\n".join(conflict.reasons)
+
+
+def test_supersede_gate_default_is_above_floor_and_configurable() -> None:
+    """F2③：缺省高于地板、可经 [verification] 段覆盖，且不低于地板。"""
+    default = vf.VerificationSettings()
+    assert default.supersede_min_similarity == vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY == 0.6
+    assert default.similarity_floor < default.supersede_min_similarity < (
+        default.consistent_similarity
+    )
+    assert "DEFAULT_SUPERSEDE_MIN_SIMILARITY" in vf.__all__
+
+    # 段内覆盖（两种口径：段本身 / 完整 config）都生效（0.7 是收窄，也在区间内）
+    section = {"supersede_min_similarity": 0.7}
+    assert vf.VerificationSettings.from_config(section).supersede_min_similarity == 0.7
+    assert (
+        vf.VerificationSettings.from_config({"verification": section}).supersede_min_similarity
+        == 0.7
+    )
+    # 非法值宽容回退默认；低于地板时被夹到地板（地板是"连比较都不做"的绝对下界）
+    assert (
+        vf.VerificationSettings.from_config({"supersede_min_similarity": "乱写"})
+        .supersede_min_similarity
+        == vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY
+    )
+    assert vf.VerificationSettings(supersede_min_similarity=0.1).supersede_min_similarity == (
+        vf.DEFAULT_SIMILARITY_FLOOR
+    )
+
+    # 把门放到最低（0.0 被夹到地板 0.3）：同一对异 facet 证据恢复判 newer
+    # ——证明是这道门在拦，而不是别的原因
+    lowered = vf.VerificationSettings(supersede_min_similarity=0.0)
+    relaxed = vf.compare_prior_and_evidence(
+        make_note(body=ADJACENT_PRIOR),
+        evi(ADJACENT_EVIDENCE, observed_at=LATER),
+        settings=lowered,
+    )
+    assert relaxed.verdict == vf.VERDICT_NEWER
+    assert "低于替换门" not in "\n".join(relaxed.reasons)

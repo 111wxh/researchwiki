@@ -36,7 +36,9 @@
      后继续走 3/4/5（同一快照的重述 → consistent；同一快照里更完整的事实 →
      more_specific）。
    - ``content_hash`` **不同**、且 ``prior.meta.source_changed_at`` 存在且可解析
-     → ``newer`` / ``supersede``，理由给出两个 hash 的前 8 位与 source_changed_at。
+     → ``newer`` / ``supersede``，理由给出两个 hash 的前 8 位与 source_changed_at；
+     **须同时过替换门**（``supersede_min_similarity``，见下方「替换门」一节），
+     否则不判更新并写明相似度与门值。
    - ``content_hash`` 不同但未声明 ``source_changed_at``（或声明了但不是合法
      ISO）→ **不据此判定**，追加审计行后继续（来源标记由 P2-B 的检测器写入，
      本模块不替它背判定）。
@@ -59,7 +61,9 @@
    ``created``，**与 P2-A freshness 同口径**，直接复用其公开的
    ``freshness.resolve_base_time`` / ``freshness.parse_ts``，不写第二份）→
    ``newer`` / ``supersede``；相等或更早、旧记忆缺基准、证据时间
-   不可解析 → **不因时间判更新**（各写一行理由）。
+   不可解析 → **不因时间判更新**（各写一行理由）。**须过替换门**（终审 F2）：
+   相似度低于 ``supersede_min_similarity`` 时本规则不判更新——时间更晚不是覆盖
+   旧记忆的充分条件（见下方「替换门」）。
 5. **具体度**：证据的事实令牌数 **多于**旧记忆且无冲突 → ``more_specific`` /
    ``merge``。建议动作取 ``merge`` 而非 ``supersede``：证据是旧记忆事实集合的
    超集，恰当地处置是把新事实并入旧记忆（保住规范 ID），而不是换掉旧 ID；简报
@@ -133,13 +137,36 @@ judge 注入约束（逐条可测）
 
 - **零模型调用、零网络、全确定性**：同一 ``(prior, evidence, settings)`` 恒得同一
   结果；相似度用 ``MockEmbeddingProvider``（确定性 bigram 特征哈希）配
-  ``ingest.cosine``——与 ``Ingestor`` 去重同一套度量，只是阈值尺度不同（去重
-  0.9 = 近乎重复；本模块 0.8 = 断言重述，0.3 = 还值得比较）。
+  ``ingest.cosine``——**独立于检索/入库侧的确定性度量**（终审 F3 更正口径）：
+  判定层刻意不接配置的 embedding provider，所以它与 ``Ingestor`` 去重的相似度
+  （``[wiki].dedup_similarity`` 0.9，走 ``[embedding]`` 段模型）、formation 的近乎
+  重复阈值（0.95）**不是同一尺度**，数值不可直接比较（生产用真 embedding 时，
+  更无法保证两边的次序关系）。本模块的阈值（地板 0.3 / 替换门 0.6 / 一致 0.8）
+  都是在这套度量上标定的经验值，独立成立、不依赖去重侧的阈值。
+  设计取舍：若将来要求"与检索侧同尺度"，需要把 embedding provider 注入判定层并
+  放弃零模型调用（判定变成有网络/成本依赖）——那是一次显式取舍，不是补一个参数。
 - **不写盘**：本模块不 import 任何写接口（``store.save_conflict`` 由 P2-D 调用）。
 - 相似度与令牌都用纯函数实现，可单测；``scan_slots`` 暴露完整扫描细节供审计。
 - 时间解析与基准时间直接复用 ``freshness.parse_ts`` / ``freshness.resolve_base_time``
   （修复轮 1/5 把这两个名字从私有提升为公开：口径只有一份，freshness 侧内部重构
   不再能静默改变判定结果；旧私有名保留为别名）。
+
+替换门（终审 F2 监察者裁定：给替换类动作独立的相似度门）
+--------------------------------------------------------
+
+规则 4（时间）此前**没有任何相似度门**：只要证据更晚、无冲突、实体信号不可用
+（``entities`` 为空时护栏不设防），就判 ``newer`` / 建议 supersede。实测后果：
+一条主题相邻但 facet 不同的更晚证据（sim≈0.517）能覆盖掉仍然有效的旧记忆，而它
+根本不过冲突门（不同 facet 的取值不落同一槽位）。
+
+因此新增 ``supersede_min_similarity``（缺省 0.6，独立于地板 0.3、低于一致阈值
+0.8）：**相似度低于门的证据不得判 newer / supersede**，落到 uncertain（理由行写出
+实际相似度与门值），由人工 / 判官 / 下一轮更高相似度的证据来处理。门同时约束
+规则 2（来源变化）与规则 4（时间）两条 newer 出口——两者都会退役旧记忆身份。
+
+门**不**约束：``conflicting``（开台账是保守动作，宁可多开一条）、``merge``
+（more_specific 保留规范 ID、只追加内容）、``consistent``（另有 0.8 的一致阈值）。
+方向与前几轮的取舍一致：宁可多一次"需要复核"，不可多一次静默覆盖。
 
 与 freshness 规则 5 的取舍差异（**声明式取舍，P2-D 接线的决策输入**）
 ---------------------------------------------------------------------
@@ -223,6 +250,10 @@ VERDICT_ACTIONS: Mapping[str, str] = {
 
 DEFAULT_SIMILARITY_FLOOR = 0.3
 DEFAULT_CONSISTENT_SIMILARITY = 0.8
+# 替换类动作（newer → supersede）的**独立**相似度门（终审 F2 监察者裁定）：高于
+# 地板，低于一致阈值。地板只负责"别拿无关证据来比较"，挡不住"主题相邻、facet
+# 不同"的更晚证据——见模块 docstring「替换门」一节。
+DEFAULT_SUPERSEDE_MIN_SIMILARITY = 0.6
 # 与 MockEmbeddingProvider 的默认维度同值（tests 逐值断言锁死，防单侧漂移）
 DEFAULT_SIMILARITY_DIM = 128
 DEFAULT_CONTEXT_CHARS = 6
@@ -429,6 +460,11 @@ class VerificationSettings:
       不调用 judge。
     - ``consistent_similarity``：判定"断言重述"的相似度阈值（规则 3）；小于地板时
       被夹到地板（否则规则 3 不可能命中，判定退化）。
+    - ``supersede_min_similarity``：**替换门**（终审 F2 监察者裁定）：相似度低于它
+      的证据**不得判 newer / supersede**（落 uncertain），独立于地板、只约束替换类
+      覆盖动作；conflicting（开台账）与 merge（保留规范 ID 的修订）不受它约束。
+      默认 0.6（地板 0.3 与一致阈值 0.8 之间）；小于地板时被夹到地板——地板已经是
+      "连比较都不做"的绝对下界，替换门不必比它更低。
     - ``similarity_dim``：bigram 特征哈希向量的维度（8–4096，缺省与
       MockEmbeddingProvider 一致）。
     - ``context_chars``：槽位上下文锚点长度（1–24 字符）。
@@ -442,6 +478,7 @@ class VerificationSettings:
 
     similarity_floor: float = DEFAULT_SIMILARITY_FLOOR
     consistent_similarity: float = DEFAULT_CONSISTENT_SIMILARITY
+    supersede_min_similarity: float = DEFAULT_SUPERSEDE_MIN_SIMILARITY
     similarity_dim: int = DEFAULT_SIMILARITY_DIM
     context_chars: int = DEFAULT_CONTEXT_CHARS
     extract_dates: bool = True
@@ -453,6 +490,10 @@ class VerificationSettings:
         self.similarity_floor = _ratio(self.similarity_floor, DEFAULT_SIMILARITY_FLOOR)
         self.consistent_similarity = max(
             _ratio(self.consistent_similarity, DEFAULT_CONSISTENT_SIMILARITY),
+            self.similarity_floor,
+        )
+        self.supersede_min_similarity = max(
+            _ratio(self.supersede_min_similarity, DEFAULT_SUPERSEDE_MIN_SIMILARITY),
             self.similarity_floor,
         )
         self.similarity_dim = _int_in_range(
@@ -475,6 +516,7 @@ class VerificationSettings:
             [verification]
             similarity_floor = 0.3
             consistent_similarity = 0.8
+            supersede_min_similarity = 0.6
             similarity_dim = 128
             context_chars = 6
             extract_dates = true
@@ -493,6 +535,10 @@ class VerificationSettings:
             ),
             consistent_similarity=_ratio(
                 section.get("consistent_similarity"), DEFAULT_CONSISTENT_SIMILARITY
+            ),
+            supersede_min_similarity=_ratio(
+                section.get("supersede_min_similarity"),
+                DEFAULT_SUPERSEDE_MIN_SIMILARITY,
             ),
             similarity_dim=_int_in_range(
                 section.get("similarity_dim"), DEFAULT_SIMILARITY_DIM, low=8, high=4096
@@ -909,32 +955,43 @@ def compare_prior_and_evidence(
         else:
             changed = parse_ts(prior.meta.source_changed_at)
             if changed is not None:
-                reasons.append(
-                    f"来源变化：url={ref.url} 命中旧来源，content_hash "
-                    f"旧={_short_hash(ref.content_hash)} 新={_short_hash(evidence.content_hash)}"
-                    f"（source_changed_at={changed.isoformat()}）"
-                    " → 新证据更新（建议 supersede）"
+                gate = _supersede_gate(cfg, similarity)
+                hashes = (
+                    f"旧={_short_hash(ref.content_hash)} "
+                    f"新={_short_hash(evidence.content_hash)}"
                 )
-                reviewed = parse_ts(prior.meta.reviewed_at)
-                if reviewed is not None and changed <= reviewed:
-                    # 与 freshness 规则 5 的取舍不同，显式留痕（见模块 docstring
-                    # 「与 freshness 规则 5 的取舍差异」）：本模块判"新证据怎么处置"，
-                    # 触发条件里还有证据侧的新 hash，不看复核时间。
+                if gate is not None:
                     reasons.append(
-                        f"注：source_changed_at 不晚于 reviewed_at="
-                        f"{reviewed.isoformat()}（旧记忆已复核过），本模块仍按来源变化"
-                        "处理——本模块判的是「新证据怎么处置」，且证据侧 hash 与记录不同"
-                        "本身即新事实（取舍见模块 docstring）"
+                        f"来源变化：url={ref.url} 命中旧来源，content_hash {hashes}"
+                        f"（source_changed_at={changed.isoformat()}），但{gate}"
+                        " → 本轮不据此判更新"
                     )
-                reasons.extend(_new_token_notes(scan))
-                return _make(
-                    prior,
-                    evidence_index,
-                    VERDICT_NEWER,
-                    reasons,
-                    similarity=similarity,
-                    source=source_trace,
-                )
+                else:
+                    reasons.append(
+                        f"来源变化：url={ref.url} 命中旧来源，content_hash {hashes}"
+                        f"（source_changed_at={changed.isoformat()}）"
+                        " → 新证据更新（建议 supersede）"
+                    )
+                    reviewed = parse_ts(prior.meta.reviewed_at)
+                    if reviewed is not None and changed <= reviewed:
+                        # 与 freshness 规则 5 的取舍不同，显式留痕（见模块 docstring
+                        # 「与 freshness 规则 5 的取舍差异」）：本模块判"新证据怎么处置"，
+                        # 触发条件里还有证据侧的新 hash，不看复核时间。
+                        reasons.append(
+                            f"注：source_changed_at 不晚于 reviewed_at="
+                            f"{reviewed.isoformat()}（旧记忆已复核过），本模块仍按来源变化"
+                            "处理——本模块判的是「新证据怎么处置」，且证据侧 hash 与记录不同"
+                            "本身即新事实（取舍见模块 docstring）"
+                        )
+                    reasons.extend(_new_token_notes(scan))
+                    return _make(
+                        prior,
+                        evidence_index,
+                        VERDICT_NEWER,
+                        reasons,
+                        similarity=similarity,
+                        source=source_trace,
+                    )
             if prior.meta.source_changed_at:
                 reasons.append(
                     f"source_changed_at={prior.meta.source_changed_at} 不是合法 ISO 时间，"
@@ -977,23 +1034,32 @@ def compare_prior_and_evidence(
     base_field, base_ts = resolve_base_time(prior.meta)
     if evidence_ts is not None and base_ts is not None:
         if evidence_ts > base_ts:
+            gate = _supersede_gate(cfg, similarity)
+            if gate is not None:
+                reasons.append(
+                    f"时间：证据 observed_at={evidence_ts.isoformat()} 晚于旧记忆 "
+                    f"{base_field}={base_ts.isoformat()}，但{gate}"
+                    " → 本轮不因时间判更新"
+                )
+            else:
+                reasons.append(
+                    f"时间：证据 observed_at={evidence_ts.isoformat()} 晚于旧记忆 "
+                    f"{base_field}={base_ts.isoformat()} → 新证据更新（建议 supersede）"
+                )
+                reasons.extend(_new_token_notes(scan))
+                return _make(
+                    prior,
+                    evidence_index,
+                    VERDICT_NEWER,
+                    reasons,
+                    similarity=similarity,
+                    source=source_trace,
+                )
+        else:
             reasons.append(
-                f"时间：证据 observed_at={evidence_ts.isoformat()} 晚于旧记忆 "
-                f"{base_field}={base_ts.isoformat()} → 新证据更新（建议 supersede）"
+                f"时间：证据 observed_at={evidence_ts.isoformat()} 不晚于旧记忆 "
+                f"{base_field}={base_ts.isoformat()}（相等或更早）→ 不因时间判更新"
             )
-            reasons.extend(_new_token_notes(scan))
-            return _make(
-                prior,
-                evidence_index,
-                VERDICT_NEWER,
-                reasons,
-                similarity=similarity,
-                source=source_trace,
-            )
-        reasons.append(
-            f"时间：证据 observed_at={evidence_ts.isoformat()} 不晚于旧记忆 "
-            f"{base_field}={base_ts.isoformat()}（相等或更早）→ 不因时间判更新"
-        )
     elif evidence_ts is not None:
         reasons.append(
             "时间：旧记忆无时间基准（observed_at 与 created 均缺失或不可解析），"
@@ -1094,6 +1160,28 @@ def _make(
         guard=guard,
         judge_verdict=judge_verdict,
     )
+
+
+def _supersede_gate(cfg: VerificationSettings, similarity: float) -> str | None:
+    """替换门（终审 F2 监察者裁定）：返回"为何不放行 newer"的一句说明，或 None（放行）。
+
+    存在理由：规则 4（时间）**没有任何相似度门**——地板 0.3 只保证"不是完全无关"，
+    而蒸馏候选的 ``entities`` 经常为空 → 实体护栏不设防（护栏只在两侧都非空时才
+    短路）。于是"主题相邻、facet 不同"的更晚证据（实测 sim≈0.517）可以把一条仍然
+    有效的旧记忆 supersede 掉：这是**静默覆盖**最现实的形态，而且它绕过了冲突门
+    （不同 facet 的取值不落同一槽位，根本不判冲突）。
+
+    门只约束**替换类动作**（``newer`` → supersede）：那是唯一会退役一条记忆身份的
+    动作；``conflicting``（开台账）是保守动作，不受门限制；``merge``（more_specific）
+    保留规范 ID、只追加内容，同样不受限。
+    """
+    if similarity < cfg.supersede_min_similarity:
+        return (
+            f"相似度 {similarity:.3f} 低于替换门 {cfg.supersede_min_similarity:.2f}"
+            "：证据与旧记忆可能只是主题相邻（facet / 主体未经确认），"
+            "不足以放行覆盖动作（supersede）"
+        )
+    return None
 
 
 def _consistency_blockers(scan: SlotScan) -> list[str]:
@@ -1282,6 +1370,7 @@ __all__ = [
     "DEFAULT_CONTEXT_CHARS",
     "DEFAULT_SIMILARITY_DIM",
     "DEFAULT_SIMILARITY_FLOOR",
+    "DEFAULT_SUPERSEDE_MIN_SIMILARITY",
     "GUARD_ENTITIES_DISJOINT",
     "VERDICTS",
     "VERDICT_ACTIONS",

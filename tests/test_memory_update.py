@@ -1419,3 +1419,172 @@ def test_supersede_requires_content_hash_not_just_url(tmp_path: Path) -> None:
     assert [n.id for n in store.list_notes()] == ["N-0001"]  # 没造替代记忆
     conflict = store.list_conflicts()[0]
     assert conflict.claim_b["source_url"] == URL and conflict.claim_b["content_hash"] == ""
+
+
+# ---- 终审 F1：墓碑不得被记忆更新动作复活 -------------------------------------
+
+
+def tombstone_prior(store: WikiStore, body: str, **kwargs) -> Note:
+    """一条墓碑笔记（memory_invalidate 的失效裁定记录）。"""
+    kwargs.setdefault("note_id", "N-0001")
+    kwargs.setdefault("title", "失效裁定")
+    kwargs.setdefault("observed_at", EARLIER)
+    kwargs.setdefault("created", EARLIER)
+    kwargs.setdefault("tombstone", True)
+    return store.save_note(body, **kwargs)
+
+
+def test_tombstone_survives_reviewed_and_merge_actions(tmp_path: Path) -> None:
+    """F1：墓碑经 reviewed（一致）与 merge（更具体）两条动作后标记仍在、语义字段不丢。
+
+    终审实测的缺陷：``_save_preserving`` 逐参数透传 ``save_note`` 时漏了 ``tombstone``
+    （其缺省 False），于是墓碑被 consistent / merge 一碰就"复活"成可召回的正常笔记
+    ——静默改变记忆语义。经 AgentLoop 不可达（Prior 检索已排除墓碑），但
+    ``apply_comparisons`` 是公开函数（P4 refresh 是天然下一个调用方）。
+    """
+    store = make_store(tmp_path)
+    reviewed_prior = tombstone_prior(
+        store,
+        BODY_CONSISTENT,
+        kind="experience",
+        importance=0.4,
+        volatility="volatile",
+    )
+    _, _, reviewed_action = one(
+        store, reviewed_prior, EvidenceItem(text=BODY_CONSISTENT, observed_at=None)
+    )
+    assert reviewed_action.applied == APPLIED_REVIEWED_AT
+    after = store.get_note("N-0001")
+    assert after is not None
+    assert after.meta.tombstone is True  # 失效裁定记录没有被复活
+    assert after.meta.reviewed_at == NOW
+    assert after.meta.kind == "experience" and after.meta.importance == 0.4
+    assert after.meta.volatility == "volatile"
+    assert "tombstone: true" in (tmp_path / "wiki-data" / "notes" / "N-0001.md").read_text(
+        encoding="utf-8"
+    )
+
+    # merge：正文真的被改写（追加要点 + 追加来源），墓碑标记与语义字段照样保留
+    merge_prior = tombstone_prior(
+        store,
+        BODY_SPECIFIC,
+        note_id="N-0002",
+        kind="user",
+        importance=0.8,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+    )
+    _, merge_report, merge_action = one(
+        store,
+        merge_prior,
+        EvidenceItem(
+            text=EVIDENCE_SPECIFIC, observed_at=None, source_url=URL_B, content_hash=HASH_NEW
+        ),
+    )
+    assert merge_action.applied == APPLIED_MERGED and merge_report.counts["merged"] == 1
+    merged = store.get_note("N-0002")
+    assert merged is not None
+    assert EVIDENCE_SPECIFIC in merged.body  # 确实改了正文
+    assert merged.meta.tombstone is True
+    assert merged.meta.kind == "user" and merged.meta.importance == 0.8
+    assert merged.meta.sources[-1] == SourceRef(url=URL_B, content_hash=HASH_NEW)
+
+
+def test_tombstone_survives_supersede_retirement(tmp_path: Path) -> None:
+    """F1 的另一条路径：supersede 把墓碑退役时，墓碑标记与 kind/importance 也不丢。"""
+    store = make_store(tmp_path)
+    prior = tombstone_prior(
+        store,
+        BODY_NEWER,
+        kind="experience",
+        importance=0.5,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+        source_changed_at="2026-08-01T00:00:00+00:00",
+    )
+    item = EvidenceItem(
+        text=EVIDENCE_NEWER, observed_at=LATER, source_url=URL, content_hash=HASH_NEW
+    )
+    _, _, action = one(store, prior, item)
+    assert action.applied == APPLIED_SUPERSEDED
+    old = store.get_note("N-0001")
+    assert old is not None and old.status == "superseded"
+    assert old.meta.tombstone is True  # 退役不清标记
+    assert old.meta.kind == "experience" and old.meta.importance == 0.5
+
+
+# ---- 终审 F5：复用路径的留痕必须是并集 ---------------------------------------
+
+
+def test_supersede_reuse_appends_to_existing_audit_keys(tmp_path: Path) -> None:
+    """F5：复用既有规范笔记时，幂等键/留痕在既有基础上**追加**（不是覆写成单元素）。
+
+    原缺陷：``_audit_only_extra`` 从 {} 起算再与目标 extra 浅合并，会把目标自己的
+    ``memory_update_keys`` / ``memory_update_body_keys`` / ``memory_update_reasons``
+    覆写掉——上一轮记下的跨 run 幂等键随之消失，同一段证据会被重复处置（甚至把目标
+    自己再退役一次）。
+    """
+    store = make_store(tmp_path)
+    prior = make_prior(
+        store,
+        BODY_NEWER,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+        source_changed_at="2026-08-01T00:00:00+00:00",
+    )
+    ingested = store.save_note(
+        EVIDENCE_NEWER,
+        note_id="N-0002",
+        title="本轮入库",
+        extra={
+            "memory_update_keys": ["N-0099:deadbeefdeadbeef"],
+            "memory_update_body_keys": ["deadbeefdeadbeef"],
+            "memory_update_reasons": [
+                {"at": EARLIER, "reason": "上一轮的动作", "verdict": "consistent"}
+            ],
+            "formation_reason": "保留我",
+        },
+    )
+    item = EvidenceItem(
+        text=EVIDENCE_NEWER, observed_at=LATER, source_url=URL, content_hash=HASH_NEW
+    )
+    comparison = pairs_for(store, [(prior, item)])[0][0]
+    report = apply_comparisons(
+        store, [comparison], evidence=[item], now=NOW, evidence_notes={0: ingested.id}
+    )
+    assert report.actions[0].applied == APPLIED_SUPERSEDED
+
+    target = store.get_note("N-0002")
+    assert target is not None
+    new_key = update_key("N-0001", EVIDENCE_NEWER)
+    assert recorded_keys(target) == ["N-0099:deadbeefdeadbeef", new_key]  # 并集、保序
+    assert recorded_body_keys(target) == ["deadbeefdeadbeef", body_key(EVIDENCE_NEWER)]
+    reasons = target.meta.extra[MEMORY_UPDATE_REASONS]
+    assert [r["reason"] for r in reasons][0] == "上一轮的动作"  # 既有留痕没被清
+    assert reasons[-1]["verdict"] == VERDICT_NEWER
+    assert target.meta.extra["formation_reason"] == "保留我"  # 其他 extra 键也不丢
+
+
+# ---- 终审 F6：update_reasons 也按上限保留 -------------------------------------
+
+
+def test_update_reasons_are_bounded_like_other_audit_lists(tmp_path: Path) -> None:
+    """F6：update_reasons 与另三个列表同口径——只保留最近 MAX_RECORDED_KEYS 条。
+
+    修复前它无界追加，而报告声称"四个列表都保留最近 50 条"（只有三条封顶）。
+    """
+    store = make_store(tmp_path)
+    stale = [
+        {"reason": f"历史原因 {index}", "at": EARLIER} for index in range(MAX_RECORDED_KEYS + 5)
+    ]
+    prior = make_prior(store, BODY_SPECIFIC, extra={UPDATE_REASONS_KEY: stale})
+    _, _, action = one(
+        store,
+        prior,
+        EvidenceItem(text=EVIDENCE_SPECIFIC, observed_at=None, source_url=URL_B,
+                      content_hash=HASH_NEW),
+    )
+    assert action.applied == APPLIED_MERGED
+    after = store.get_note("N-0001")
+    assert after is not None
+    records = after.meta.extra[UPDATE_REASONS_KEY]
+    assert len(records) == MAX_RECORDED_KEYS  # 封顶到与另三条一致
+    assert records[-1]["reason"] == action.reason  # 最新一条在末尾
+    assert records[0]["reason"] == "历史原因 6"  # 最老的 6 条被裁掉（保留最近 50）
