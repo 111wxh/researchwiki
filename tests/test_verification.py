@@ -1474,3 +1474,154 @@ def test_supersede_gate_default_is_above_floor_and_configurable() -> None:
     )
     assert relaxed.verdict == vf.VERDICT_NEWER
     assert "低于替换门" not in "\n".join(relaxed.reasons)
+
+
+# ---- 终审修复波复审：Important（F2 门控路径的留痕）+ Minor 1/2 ----------------
+
+
+def test_source_change_gate_blocked_reasons_are_not_self_contradictory() -> None:
+    """复审 Important 复现：门控路径不得再输出"未声明 / 不是合法 ISO"的审计行。
+
+    prior 有合法的 source_changed_at + 来源命中 + hash 不同 + sim 低于替换门 → 门控
+    不放行 newer。修复前控制流会继续落到**原本只为 `changed is None` 写**的那两行
+    审计，于是理由里同时出现三条互相矛盾的行（对 frontmatter 说假话，并随
+    memory-update.json / lint 输出流出）。判定本身仍是 uncertain（方向正确、零写盘），
+    问题在留痕——所以本用例断言的是理由行的事实性。
+    """
+    similarity = vf.token_similarity(ADJACENT_PRIOR, ADJACENT_EVIDENCE)
+    assert vf.DEFAULT_SIMILARITY_FLOOR <= similarity < vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY
+    note = make_note(
+        body=ADJACENT_PRIOR,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+        source_changed_at="2026-08-01T00:00:00+00:00",
+    )
+    evidence = evi(ADJACENT_EVIDENCE, source_url=URL, content_hash=HASH_NEW)
+    result = vf.compare_prior_and_evidence(note, evidence)
+
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    assert result.suggested_action == vf.ACTION_NONE
+    joined = "\n".join(result.reasons)
+    # 与事实一致的门控行：来源确已变化、只是相似度不到门
+    assert "来源变化：url=" in joined
+    assert f"相似度 {similarity:.3f} 低于替换门 {vf.DEFAULT_SUPERSEDE_MIN_SIMILARITY:.2f}" in joined
+    assert "→ 本轮不据此判更新" in joined
+    assert "source_changed_at=2026-08-01T00:00:00+00:00" in joined
+    # 两条自相矛盾的行都不在（source_changed_at 明明合法、明明声明过）
+    assert "不是合法 ISO 时间" not in joined
+    assert "未声明 source_changed_at" not in joined
+    # 门控不吃掉来源留痕：结构化字段照旧带全量 hash
+    assert result.source is not None
+    assert result.source.prior_content_hash == HASH_OLD
+    assert result.source.evidence_content_hash == HASH_NEW
+
+    # 同一对、门放宽 → 该分支的放行侧照旧 newer（修的是留痕，不是把门加严）
+    relaxed = vf.compare_prior_and_evidence(
+        note, evidence, settings=vf.VerificationSettings(supersede_min_similarity=0.3)
+    )
+    assert relaxed.verdict == vf.VERDICT_NEWER
+    relaxed_joined = "\n".join(relaxed.reasons)
+    assert "→ 新证据更新（建议 supersede）" in relaxed_joined
+    assert "不是合法 ISO 时间" not in relaxed_joined
+    assert "未声明 source_changed_at" not in relaxed_joined
+
+
+def test_source_change_gate_blocked_with_later_time_says_it_once_per_rule() -> None:
+    """门控 + 时间更晚：规则 2 与规则 4 各写一行门控说明，都不说假话。"""
+    note = make_note(
+        body=ADJACENT_PRIOR,
+        sources=[SourceRef(url=URL, content_hash=HASH_OLD)],
+        source_changed_at="2026-08-01T00:00:00+00:00",
+    )
+    result = vf.compare_prior_and_evidence(
+        note, evi(ADJACENT_EVIDENCE, observed_at=LATER, source_url=URL, content_hash=HASH_NEW)
+    )
+    assert result.verdict == vf.VERDICT_UNCERTAIN
+    joined = "\n".join(result.reasons)
+    assert joined.count("低于替换门 0.60") == 2  # 来源侧一行、时间侧一行
+    assert "不是合法 ISO 时间" not in joined
+    assert "未声明 source_changed_at" not in joined
+    assert "→ 新证据更新" not in joined
+
+
+def test_supersede_gate_is_clamped_to_consistency_threshold() -> None:
+    """Minor 1：替换门夹到 [地板, 一致阈值]，越界值不静默禁用 supersede。
+
+    只夹下界时 `= 1.5` 会被 `_ratio` 夹到 1.0——而"相似度 1.0 且有新令牌"不可能
+    成立，于是全部确定性 supersede 静默失效且无任何告警；一致阈值之上是"断言基本
+    没变"的区间（由规则 3 刷新 / 规则 5 merge 处置），替换门抬到那里不是有效配置。
+    """
+    consistent = vf.VerificationSettings().consistent_similarity  # 0.8
+    # 越界上界 → 夹到一致阈值
+    settings_15 = vf.VerificationSettings(supersede_min_similarity=1.5)
+    assert settings_15.supersede_min_similarity == consistent
+    assert vf.VerificationSettings(supersede_min_similarity=1.0).supersede_min_similarity == (
+        consistent
+    )
+    assert vf.VerificationSettings(supersede_min_similarity=0.9).supersede_min_similarity == (
+        consistent
+    )
+    # 区间内的值原样保留（0.6 缺省 / 0.7 收窄 / 0.8 恰在一致阈值上）
+    assert vf.VerificationSettings().supersede_min_similarity == 0.6
+    assert vf.VerificationSettings(supersede_min_similarity=0.7).supersede_min_similarity == 0.7
+    assert vf.VerificationSettings(supersede_min_similarity=0.8).supersede_min_similarity == 0.8
+    # 下界照旧夹到地板
+    assert vf.VerificationSettings(supersede_min_similarity=0.05).supersede_min_similarity == (
+        vf.DEFAULT_SIMILARITY_FLOOR
+    )
+    # 不变式（含越界 / 非法 / 极端组合）：地板 ≤ 门 ≤ 一致阈值
+    for raw in (1.5, 1.0, 0.9, 0.6, 0.0, -3, "乱写", None, float("nan")):
+        settings = vf.VerificationSettings(supersede_min_similarity=raw)  # type: ignore[arg-type]
+        assert settings.similarity_floor <= settings.supersede_min_similarity
+        assert settings.supersede_min_similarity <= settings.consistent_similarity
+    # from_config 同口径
+    from_config = vf.VerificationSettings.from_config(
+        {"verification": {"supersede_min_similarity": 1.5}}
+    )
+    assert from_config.supersede_min_similarity == consistent
+
+    # 行为可预期（门夹到 0.8 之后）：sim≈0.83 的同主题更新照旧判 newer（没被静默禁用）
+    legit = vf.compare_prior_and_evidence(
+        make_note(body="模型 A 的上下文窗口是 128k。"),
+        evi("模型 A 的上下文窗口是 128k，另有 256k 可选。", observed_at=LATER),
+        settings=settings_15,
+    )
+    assert legit.verdict == vf.VERDICT_NEWER
+    assert "低于替换门" not in "\n".join(legit.reasons)
+    # 也没有被夹到地板而失去作用：异 facet 低相似对仍被挡住
+    blocked = vf.compare_prior_and_evidence(
+        make_note(body=ADJACENT_PRIOR),
+        evi(ADJACENT_EVIDENCE, observed_at=LATER),
+        settings=settings_15,
+    )
+    assert blocked.verdict == vf.VERDICT_UNCERTAIN
+    assert f"低于替换门 {consistent:.2f}" in "\n".join(blocked.reasons)
+
+
+def test_meta_rebuild_without_created_keeps_unknown_age(tmp_path) -> None:
+    """Minor 2：覆写路径不伪造 created（锁定语义 = 保持"年龄未知"）。
+
+    F 波的 meta 重建改走 ``meta.replace(...) + store.save_meta(...)``，而
+    ``save_meta`` 不补 ``created``（``save_note`` 是 ``created or now``）。对一条本就
+    缺 ``created`` 的笔记（手工维护 / 外部写入）补 ``now`` 会把"年龄未知"变成"刚刚
+    创建"：freshness 少降级、verification 规则 4 把它当成可比较的新记忆，两个方向
+    都是用假时间戳换更乐观的判定。本用例锁定所选语义（声明见 store.save_meta
+    docstring）：覆写保持空 = 未知年龄，创建路径照旧补 now。
+    """
+    store = WikiStore(tmp_path)
+    # 外部写入 / 手工维护的笔记：frontmatter 里没有 created
+    meta = NoteMeta.from_dict({"id": "N-0001", "title": "外部写入"})
+    assert meta.created == ""
+    saved = store.save_meta(meta.replace(volatility="drifting"), ADJACENT_PRIOR)
+    assert saved.meta.created == ""
+    assert "created: ''" in (tmp_path / "notes" / "N-0001.md").read_text(encoding="utf-8")
+    reloaded = store.get_note("N-0001")
+    assert reloaded is not None and reloaded.meta.created == ""
+
+    # 判定侧后果：年龄未知 → 不因时间判更新（而不是显得"刚创建"）
+    result = vf.compare_prior_and_evidence(reloaded, evi(ADJACENT_EVIDENCE, observed_at=LATER))
+    assert result.verdict != vf.VERDICT_NEWER
+    assert any("旧记忆无时间基准" in reason for reason in result.reasons)
+
+    # 创建路径（save_note）语义不变：缺 created 时补 now（此刻创建是事实）
+    created = store.save_note("新建的断言。")
+    assert created.meta.created

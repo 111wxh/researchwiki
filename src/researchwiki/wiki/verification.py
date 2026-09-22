@@ -168,6 +168,12 @@ judge 注入约束（逐条可测）
 （more_specific 保留规范 ID、只追加内容）、``consistent``（另有 0.8 的一致阈值）。
 方向与前几轮的取舍一致：宁可多一次"需要复核"，不可多一次静默覆盖。
 
+门值的归一区间是 **[地板, 一致阈值]**（终审修复波复审判定补上界，见
+``VerificationSettings``）：低于地板按地板夹取，高于一致阈值按一致阈值夹取。上界这条
+是必要的——只夹下界时 ``= 1.5`` 会被夹到 1.0，而"相似度 1.0 且证据有新令牌"不可能
+成立，于是全部确定性 supersede **静默失效且无告警**（实测：门 1.0 时连 sim≈0.83 的
+同主题更新也判 uncertain）。越界值一律夹取、不抛异常，与全模块的宽容归一风格一致。
+
 与 freshness 规则 5 的取舍差异（**声明式取舍，P2-D 接线的决策输入**）
 ---------------------------------------------------------------------
 
@@ -463,8 +469,13 @@ class VerificationSettings:
     - ``supersede_min_similarity``：**替换门**（终审 F2 监察者裁定）：相似度低于它
       的证据**不得判 newer / supersede**（落 uncertain），独立于地板、只约束替换类
       覆盖动作；conflicting（开台账）与 merge（保留规范 ID 的修订）不受它约束。
-      默认 0.6（地板 0.3 与一致阈值 0.8 之间）；小于地板时被夹到地板——地板已经是
-      "连比较都不做"的绝对下界，替换门不必比它更低。
+      默认 0.6（地板 0.3 与一致阈值 0.8 之间）。**归一方向：夹到
+      [similarity_floor, consistent_similarity] 闭区间**——下界是地板（地板已经是
+      "连比较都不做"的绝对下界），上界是一致阈值。上界这条是终审修复波复审判定补
+      的：只夹下界时 ``supersede_min_similarity=1.5`` 会被 ``_ratio`` 夹到 1.0，
+      而相似度几乎不可能到 1.0（新令牌必然改变文本），于是**所有确定性 supersede
+      静默失效且无任何告警**；一致阈值之上是"断言基本没变"的区间（由规则 3 的
+      刷新、规则 5 的 merge 处置），替换门抬到那里不是有效配置意图，按一致阈值夹取。
     - ``similarity_dim``：bigram 特征哈希向量的维度（8–4096，缺省与
       MockEmbeddingProvider 一致）。
     - ``context_chars``：槽位上下文锚点长度（1–24 字符）。
@@ -492,9 +503,15 @@ class VerificationSettings:
             _ratio(self.consistent_similarity, DEFAULT_CONSISTENT_SIMILARITY),
             self.similarity_floor,
         )
-        self.supersede_min_similarity = max(
-            _ratio(self.supersede_min_similarity, DEFAULT_SUPERSEDE_MIN_SIMILARITY),
-            self.similarity_floor,
+        self.supersede_min_similarity = min(
+            max(
+                _ratio(self.supersede_min_similarity, DEFAULT_SUPERSEDE_MIN_SIMILARITY),
+                self.similarity_floor,
+            ),
+            # 上界 = 一致阈值（终审修复波复审判定）：只夹下界时 1.5 会被 _ratio 夹到
+            # 1.0，而"相似度 = 1.0 且有新令牌"不可能成立 → 全部确定性 supersede 静默
+            # 失效且无告警。上界保证替换门始终落在 [地板, 一致阈值] 的语义区间内。
+            self.consistent_similarity,
         )
         self.similarity_dim = _int_in_range(
             self.similarity_dim, DEFAULT_SIMILARITY_DIM, low=8, high=4096
@@ -524,6 +541,10 @@ class VerificationSettings:
 
         映射型非已知键一律忽略（本模块没有按 kind 分段的语义）；布尔开关接受
         ``true/false``、``1/0``、``yes/no``、``on/off``（字符串宽松归一）。
+        三个比率键的夹取方向在 ``__post_init__`` 里统一执行（越界不抛异常）：
+        ``similarity_floor`` 夹到 [0, 1]；``consistent_similarity`` 不低于地板；
+        ``supersede_min_similarity`` 夹到 **[地板, 一致阈值]** 闭区间——**配在区间
+        外的值会被夹取**，`= 1.5` 等价于 0.8（一致阈值），不是"禁用 supersede"。
         """
         section: Mapping[str, Any] = {}
         if isinstance(config, Mapping):
@@ -954,13 +975,33 @@ def compare_prior_and_evidence(
             )
         else:
             changed = parse_ts(prior.meta.source_changed_at)
-            if changed is not None:
+            if changed is None:
+                # 只有"声明了但解析不出来"才走这两行审计。**必须在 changed is None
+                # 之内**（终审修复波 Minor 复审判定）：F2 的替换门在门控路径上不早退，
+                # 若这两行留在外层，门控时也会执行——而能走到这里说明 source_changed_at
+                # 已解析成功，于是理由里同时出现"（source_changed_at=…合法时间）但相似度
+                # 低于替换门…"与"…不是合法 ISO 时间""…未声明 source_changed_at"三条
+                # 互相矛盾的行，对 frontmatter 说假话并流入 memory-update.json / lint。
+                if prior.meta.source_changed_at:
+                    reasons.append(
+                        f"source_changed_at={prior.meta.source_changed_at} 不是合法 ISO 时间，"
+                        "按未声明处理（不参与判定）"
+                    )
+                reasons.append(
+                    f"来源哈希不同（旧={_short_hash(ref.content_hash)} "
+                    f"新={_short_hash(evidence.content_hash)}），但旧记忆未声明 "
+                    "source_changed_at → 本轮不据此判定"
+                )
+            else:
                 gate = _supersede_gate(cfg, similarity)
                 hashes = (
                     f"旧={_short_hash(ref.content_hash)} "
                     f"新={_short_hash(evidence.content_hash)}"
                 )
                 if gate is not None:
+                    # 门控不放行更新：写一行"来源确已变化、但相似度低于替换门"，
+                    # 然后**继续**走规则 3–6（不早退、也不再输出任何"未声明/非法"的
+                    # 审计行）；证据若确实更晚，规则 4 会用自己的门控行再说明一次。
                     reasons.append(
                         f"来源变化：url={ref.url} 命中旧来源，content_hash {hashes}"
                         f"（source_changed_at={changed.isoformat()}），但{gate}"
@@ -992,16 +1033,6 @@ def compare_prior_and_evidence(
                         similarity=similarity,
                         source=source_trace,
                     )
-            if prior.meta.source_changed_at:
-                reasons.append(
-                    f"source_changed_at={prior.meta.source_changed_at} 不是合法 ISO 时间，"
-                    "按未声明处理（不参与判定）"
-                )
-            reasons.append(
-                f"来源哈希不同（旧={_short_hash(ref.content_hash)} "
-                f"新={_short_hash(evidence.content_hash)}），但旧记忆未声明 "
-                "source_changed_at → 本轮不据此判定"
-            )
 
     # 规则 3：一致（高相似重述、无新增令牌且**槽位级取值对得上**）→ 只刷新 reviewed_at
     if similarity >= cfg.consistent_similarity and not scan.new_tokens:

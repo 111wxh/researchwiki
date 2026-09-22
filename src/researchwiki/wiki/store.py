@@ -236,6 +236,16 @@ class WikiStore:
         ``meta.id`` 决定落盘文件名（不存在即新建）；元数据按 ``NoteMeta.to_dict``
         序列化，未知字段仍在 ``extra`` 里 round-trip 不丢。事实校验（title 非空、
         枚举白名单等）是**调用方**的职责：本方法不猜调用方意图。
+
+        **``created`` 为空时不补写（终审修复波 Minor 2 明确声明的语义变更）**：
+        ``save_note`` 是 ``created or now``，本方法**不**补——两者语义不同，且不是
+        疏漏。``save_note`` 的 ``now`` 在"这条笔记此刻正被创建"这一点上是**事实**；
+        本方法按定义是**覆写既有笔记**，对一条本就缺 ``created`` 的笔记（手工维护 /
+        外部写入 / 旧数据）补 ``now`` 等于伪造创建时间，会把"年龄未知"变成"刚刚
+        创建"——freshness 会因此少降级、verification 规则 4 会把它当成可比较的新
+        记忆，两个方向都是**用假时间戳换取更乐观的判定**。保持 ``created: ''`` =
+        "创建时间未知"：freshness 判 ``review_due``、verification 不因时间判更新，
+        都是保守方向。调用方若确有可靠的创建时间，请显式写进传入的 ``meta``。
         """
         return self._write_note(meta, body)
 
