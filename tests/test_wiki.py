@@ -8,6 +8,7 @@ clock）、嵌入缓存命中、工厂无 key 回退 mock。
 
 import hashlib
 import json
+import sqlite3
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -366,6 +367,78 @@ class TestEmbeddings:
         fresh = cached.embed(["你好世界", "新文本"])
         assert len(calls) == 2 and fresh[:1] == first[:1]
         cached.close()
+
+    def test_store_commits_second_connection_can_write(self, tmp_path: Path):
+        """缓存未命中→写缓存后，另一连接写同库不锁死（模拟 SearchIndex rebuild）。
+
+        缓存与检索索引共享同一 index.db（设计如此）：修复前 _store 只 INSERT
+        不 commit，未提交写事务持有 RESERVED 锁直到连接关闭（且关闭时回滚），
+        第二连接的写操作忙等超时即抛 "database is locked"。本测试以 200ms
+        短忙等钉住该失败模式：_store 后必须立即可被另一连接写入。
+        """
+        db = tmp_path / "shared.db"
+        cached = CachedEmbeddingProvider(MockEmbeddingProvider(dim=8), db)
+        vec = cached.embed(["某条需要缓存的文本"])  # 未命中 → _store 写入
+        assert len(vec[0]) == 8
+        other = sqlite3.connect(db, timeout=0.2)
+        try:
+            other.execute("CREATE TABLE IF NOT EXISTS probe (id INTEGER PRIMARY KEY)")
+            other.execute("INSERT INTO probe (id) VALUES (1)")
+            other.commit()
+        finally:
+            other.close()
+        cached.close()
+
+    def test_cache_persists_across_instances(self, tmp_path: Path):
+        """缓存写入须真正持久化：第二次实例化同一 cache_path 全命中，底层不再被调。"""
+        calls: list[str] = []
+
+        class CountingMock(MockEmbeddingProvider):
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                calls.extend(texts)
+                return super().embed(texts)
+
+        db = tmp_path / "cache.db"
+        first = CachedEmbeddingProvider(CountingMock(dim=8), db)
+        v1 = first.embed(["持久化检查文本"])
+        first.close()
+        second = CachedEmbeddingProvider(CountingMock(dim=8), db)
+        v2 = second.embed(["持久化检查文本"])
+        second.close()
+        assert calls == ["持久化检查文本"]  # 第二实例全命中，未再调底层 embedding
+        # 缓存以 float32（struct 'f'）序列化，回读有 ~1e-7 级精度损失，用 approx 比
+        assert v2[0] == pytest.approx(v1[0])
+
+    def test_store_visible_to_fresh_connection(self, tmp_path: Path):
+        """_store 后数据必须已提交：关闭 provider 后用全新连接能读到缓存行。"""
+        db = tmp_path / "cache.db"
+        cached = CachedEmbeddingProvider(MockEmbeddingProvider(dim=4), db)
+        cached.embed(["提交语义钉"])
+        cached.close()
+        conn = sqlite3.connect(db)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()
+        finally:
+            conn.close()
+        assert row is not None and row[0] == 1
+
+    def test_index_rebuild_with_shared_cache_db_no_deadlock(self, store: WikiStore):
+        """SearchIndex 与嵌入缓存连接共享同一 index.db：rebuild（缓存全未命中）不锁死。
+
+        复现真模型 warm run 的死锁：若 index_note 在本连接写事务中途调 embed，
+        缓存连接的 INSERT 要等 SearchIndex 的 RESERVED 锁、SearchIndex 在等
+        embed 返回，busy_timeout 只能以 locked 收场。embed 已移到事务前；
+        以 200ms 短忙等（任一侧竞争即快速失败）钉住 rebuild 必须正常完成。
+        """
+        store.save_note("上下文压缩技术显著降低长会话成本", title="上下文压缩")
+        cached = CachedEmbeddingProvider(MockEmbeddingProvider(dim=8), store.root / "index.db")
+        index = SearchIndex(store.root, embedding=cached, tokenizer="trigram")
+        try:
+            assert index.rebuild(store) == 1
+            assert index.search("上下文压缩")
+        finally:
+            index.close()
+            cached.close()
 
     def test_factory_falls_back_to_mock(self):
         assert isinstance(get_embedding_provider({}), MockEmbeddingProvider)

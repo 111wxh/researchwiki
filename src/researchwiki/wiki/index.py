@@ -235,7 +235,9 @@ class SearchIndex:
         if half_life_days:
             self.half_life_days.update(half_life_days)
         self.clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
-        self._conn = sqlite3.connect(self.db_path)
+        # 与嵌入缓存（CachedEmbeddingProvider）共享同一库文件：两连接都可能写，
+        # timeout=5.0 即 busy_timeout 5000ms，短暂锁竞争时忙等而非立刻 locked。
+        self._conn = sqlite3.connect(self.db_path, timeout=5.0)
         self._vec_ready = self._load_vec_extension()
         self._tokenizer = resolve_tokenizer(tokenizer, vendor_dir=vendor_dir)
         if self._tokenizer == "simple":
@@ -346,6 +348,12 @@ class SearchIndex:
     def index_note(self, note: Note) -> None:
         """增量 upsert 一条笔记（fts / note_meta / 向量三处同步）。"""
         conn = self._conn
+        # embed 必须在本连接写事务开启之前算完：embedding 可能是
+        # CachedEmbeddingProvider，其缓存连接与本连接写同一个库文件。若在事务中
+        # 调 embed 且缓存未命中，缓存连接的 INSERT 要等本连接的 RESERVED 锁，
+        # 而本连接在等 embed 返回——成环死锁，busy_timeout 只能以 locked 收场
+        # （真模型 warm run rebuild 时确定性复现）。先算后写，两连接互不持锁。
+        vec = self.embedding.embed([f"{note.title}\n{note.body}"])[0]
         conn.execute("DELETE FROM note_fts WHERE note_id = ?", (note.id,))
         conn.execute(
             "INSERT INTO note_fts (note_id, title, body) VALUES (?, ?, ?)",
@@ -368,8 +376,6 @@ class SearchIndex:
                 note.meta.created,
             ),
         )
-        embedding_text = f"{note.title}\n{note.body}"
-        vec = self.embedding.embed([embedding_text])[0]
         conn.execute(
             "INSERT OR REPLACE INTO note_vec_cache (note_id, dim, vec) VALUES (?, ?, ?)",
             (note.id, len(vec), _serialize_vector(vec)),

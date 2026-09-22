@@ -127,7 +127,11 @@ class CachedEmbeddingProvider:
         self.inner = inner
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.cache_path)
+        # 现状：cache_path 常与检索索引同一个 <wiki_root>/index.db，即本连接与
+        # SearchIndex 的连接共享同一库文件（设计如此，见模块 docstring）。
+        # timeout=5.0 即 SQLite busy_timeout（毫秒粒度 5000ms）：写锁被另一连接
+        # 短暂持有时本连接忙等而非立刻抛 locked。
+        self._conn = sqlite3.connect(self.cache_path, timeout=5.0)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS embedding_cache ("
             "model TEXT NOT NULL, key TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL, "
@@ -149,6 +153,11 @@ class CachedEmbeddingProvider:
             "INSERT OR REPLACE INTO embedding_cache (model, key, dim, vec) VALUES (?, ?, ?, ?)",
             (self.inner.model, key, len(vec), struct.pack(f"{len(vec)}f", *vec)),
         )
+        # 连接默认 isolation_level=""（隐式事务）：INSERT 会开启写事务并持有
+        # RESERVED 锁直到显式 commit。必须立即 commit——否则未提交写事务随
+        # 连接存活（与 SearchIndex 第二连接共库时令其写操作忙等超时 →
+        # "database is locked"），且连接关闭时写入回滚、缓存永不持久化。
+        self._conn.commit()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         results: dict[int, list[float]] = {}
