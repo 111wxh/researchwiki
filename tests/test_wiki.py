@@ -586,7 +586,10 @@ class TestConfig:
         with open(PROJECT_ROOT / "config.toml", "rb") as f:
             config = tomllib.load(f)
         embedding = config["embedding"]
-        assert embedding["model"] == "" and embedding["base_url"] == ""
+        # 仓库配置会填真实模型与 base_url（clone 后填入自己的 key 即可用），
+        # 所以断言结构完整而非"值为空"；真正的安全属性是 [server].mode 默认 mock——
+        # 不动配置直接起服务，不会有任何带 key 的外呼。
+        assert {"model", "base_url", "api_key_env"} <= set(embedding)
         assert embedding["api_key_env"] == "RESEARCHWIKI_EMBEDDING_API_KEY"
         assert config["wiki"]["half_life_days"] == {"volatile": 30, "drifting": 90}
         assert config["wiki"]["fts_tokenizer"] == "auto"
@@ -595,3 +598,10 @@ class TestConfig:
         assert config["runtime"]["compaction_threshold"] == 0.7
         settings = wiki_settings(config)
         assert settings.half_life_days == {"volatile": 30.0, "drifting": 90.0}
+
+    def test_embedding_blank_means_mock(self):
+        """base_url 或 model 留空 = MockEmbeddingProvider（无 key 也能跑）。"""
+        provider = get_embedding_provider(
+            {"embedding": {"model": "", "base_url": "", "api_key_env": "X"}}
+        )
+        assert isinstance(provider, MockEmbeddingProvider)

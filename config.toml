@@ -36,8 +36,9 @@ compaction_threshold = 0.7
 # 检索索引的向量通道（OpenAI 兼容 POST {base_url}/embeddings）。
 # base_url 或 model 留空 = MockEmbeddingProvider：确定性 bigram 特征哈希，
 # 无需 key、零网络，测试与演示全链路可跑（与 llm 路由同一 skeleton-first 哲学）。
-model = ""                # 例："embedding-3"（智谱）或 "BAAI/bge-m3"（SiliconFlow）
-base_url = ""             # 例："https://open.bigmodel.cn/api/paas/v4"（不含 /embeddings）
+# 换厂商同样只改 model / base_url：SiliconFlow 用 "BAAI/bge-m3"，OpenAI 用 "text-embedding-3-small"
+model = "embedding-3"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_EMBEDDING_API_KEY"
 
 [wiki]
