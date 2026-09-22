@@ -41,6 +41,27 @@
    extra），但幂等与护栏判定照常执行——所以"先 dry 后真"看到的动作集合一致。
    ``[memory_update] dry_run = true`` 是生产侧的同款影子开关。
 
+每条动作都可复算（P2-G 可审计性缺口修复）
+----------------------------------------
+
+``memory-update.json`` 的每条动作（含 **skipped**）都带判定侧的可复算留痕：
+
+- ``similarity``：该条比较的实际相似度值；
+- ``reasons``：``EvidenceComparison.reasons`` 的**原文**（含槽位取值 / 实体护栏 /
+  相似度地板 / 替换门 / 来源变化 / 时间基准等判定依据）；
+- ``verdict`` / ``suggested_action`` / ``guard`` / ``evidence_index`` / ``key``。
+
+背景：早先只有 ``_reason()``（真正写盘的动作）带这些信息，``_skip()`` 只记一句文案
+——真模型端到端证据（P2-G）里 35 条比较有 31 条 skipped 却无法只凭该文件复算，必须在
+脚本外近似重建解释，与 PLAN §10"所有数字必须能由原始 JSON 复算"和本模块"理由必须
+引用具体值"的纪律相冲突。现在 skip 与动作走同一条 ``_action`` 组装路径，一视同仁。
+
+另加 ``skip_reason_kind``：跳过**归因分类**（``verdict`` 判定结果即不做动作 /
+``idempotent`` 幂等命中 / ``guard`` 护栏拦截 / ``state`` 结构或状态不满足 /
+``error`` 写入失败降级），让"为什么没做动作"可以机器归因，不必匹配中文文案；
+取值见 ``SKIP_KINDS``，字段只在 ``applied == skipped`` 时非空。**不改 run-metrics
+的 14 字段契约**——这些信息只进 ``memory-update.json`` 与 state.md 的计数行。
+
 为什么不用 MCP 的 memory_* 通道写
 --------------------------------
 
@@ -103,6 +124,21 @@ APPLIED_SUPERSEDED = "superseded"
 APPLIED_MERGED = "merged"
 APPLIED_CONFLICT_OPENED = "conflict_opened"
 APPLIED_SKIPPED = "skipped"
+
+# skip 归因分类（MemoryUpdateAction.skip_reason_kind；P2-G 可审计性缺口修复）：
+# 让"为什么没做动作"可以机器归因，而不是靠匹配中文文案。
+SKIP_KIND_VERDICT = "verdict"  # 判定结果本身就是不做动作（uncertain → none）
+SKIP_KIND_IDEMPOTENT = "idempotent"  # 幂等命中（同 prior / 同正文 / 台账已记）
+SKIP_KIND_GUARD = "guard"  # 护栏拦截（主体同一性未确认，拒绝覆盖类动作）
+SKIP_KIND_STATE = "state"  # 结构或状态不满足（prior 缺失/非 active/下标越界/被替代）
+SKIP_KIND_ERROR = "error"  # 动作执行失败后的降级（写入异常，旧记忆保持原样）
+SKIP_KINDS: tuple[str, ...] = (
+    SKIP_KIND_VERDICT,
+    SKIP_KIND_IDEMPOTENT,
+    SKIP_KIND_GUARD,
+    SKIP_KIND_STATE,
+    SKIP_KIND_ERROR,
+)
 
 # applied → counts 桶名（counts 的键集合固定为这五个，恒出现，便于消费方逐键取值）
 APPLIED_COUNTS: Mapping[str, str] = {
@@ -213,6 +249,15 @@ class MemoryUpdateAction:
     - ``note_id``：新建/目标笔记 ID（reviewed/merged 为原笔记 ID；supersede 为新的
       或**复用的**替代版本 ID；冲突为台账 ID；skipped 为 None）。
     - ``key``：幂等键（审计用；跳过时也写明是"哪个证据"被跳过）。
+    - ``similarity`` / ``reasons``：**判定侧的可复算留痕**（PLAN §10"所有数字必须能
+      由原始 JSON 复算"；P2-G 真模型证据发现：早先只有 ``_reason()`` 路径带这些，
+      ``_skip()`` 只记一句文案，35 条比较里 31 条 skipped 无法从 memory-update.json
+      复算，必须在脚本外近似重建）。现在每条动作都带实际相似度与判定理由原文
+      （含槽位 / 实体护栏 / 地板 / 来源变化等依据），skip 与动作一视同仁。
+    - ``skip_reason_kind``：跳过**归因分类**（仅 ``applied == skipped`` 时非空），
+      取值见 ``SKIP_KIND_*``——``verdict``（判定结果就是不做动作）/ ``idempotent``
+      （幂等命中）/ ``guard``（护栏拦截）/ ``state``（结构或状态条件不满足）/
+      ``error``（写入失败降级）。审计据此按类归因，不必匹配中文文案。
     """
 
     prior_note_id: str
@@ -224,6 +269,9 @@ class MemoryUpdateAction:
     key: str = ""
     evidence_index: int = -1
     guard: str | None = None
+    similarity: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+    skip_reason_kind: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -235,6 +283,9 @@ class MemoryUpdateAction:
             "key": self.key,
             "evidence_index": self.evidence_index,
             "guard": self.guard,
+            "similarity": self.similarity,
+            "skip_reason_kind": self.skip_reason_kind,
+            "reasons": list(self.reasons),
             "reason": self.reason,
         }
 
@@ -519,7 +570,11 @@ def apply_comparisons(
         prior = store.get_note(comparison.prior_note_id)
         if prior is None:
             actions.append(
-                _skip(comparison, f"旧记忆 {comparison.prior_note_id} 不存在，跳过")
+                _skip(
+                    comparison,
+                    f"旧记忆 {comparison.prior_note_id} 不存在，跳过",
+                    kind=SKIP_KIND_STATE,
+                )
             )
             continue
         item = _evidence_at(evidence, comparison.evidence_index)
@@ -530,6 +585,7 @@ def apply_comparisons(
                     f"evidence_index={comparison.evidence_index} 越界"
                     f"（本轮证据 {len(evidence)} 条），跳过",
                     prior=prior,
+                    kind=SKIP_KIND_STATE,
                 )
             )
             continue
@@ -537,7 +593,13 @@ def apply_comparisons(
         content_key = body_key(item.text)
         if key in seen_keys:
             actions.append(
-                _skip(comparison, "同一批证据内重复：同一 prior 的同一正文已处置", prior, key)
+                _skip(
+                    comparison,
+                    "同一批证据内重复：同一 prior 的同一正文已处置",
+                    prior,
+                    key,
+                    kind=SKIP_KIND_IDEMPOTENT,
+                )
             )
             continue
         seen_keys.add(key)
@@ -557,6 +619,7 @@ def apply_comparisons(
                     f"（键见 {MEMORY_UPDATE_KEYS} / {MEMORY_UPDATE_BODY_KEYS} / 冲突台账），跳过",
                     prior,
                     key,
+                    kind=SKIP_KIND_IDEMPOTENT,
                 )
             )
             continue
@@ -567,12 +630,19 @@ def apply_comparisons(
                     f"旧记忆 {prior.id} 本轮已被替代（superseded 版本不再接受动作），跳过",
                     prior,
                     key,
+                    kind=SKIP_KIND_STATE,
                 )
             )
             continue
         if prior.meta.status != "active":
             actions.append(
-                _skip(comparison, f"旧记忆 {prior.id} 状态为 {prior.meta.status}，跳过", prior, key)
+                _skip(
+                    comparison,
+                    f"旧记忆 {prior.id} 状态为 {prior.meta.status}，跳过",
+                    prior,
+                    key,
+                    kind=SKIP_KIND_STATE,
+                )
             )
             continue
         action = comparison.suggested_action
@@ -590,6 +660,7 @@ def apply_comparisons(
                     "主体同一性未确认时不得覆盖旧记忆、也不得宣称旧断言仍然成立）",
                     prior,
                     key,
+                    kind=SKIP_KIND_GUARD,
                 )
             )
             continue
@@ -647,11 +718,18 @@ def apply_comparisons(
                         "uncertain → 不做动作（只计数：确定性判据不足，交人工/判官）",
                         prior,
                         key,
+                        kind=SKIP_KIND_VERDICT,
                     )
                 )
             else:
                 actions.append(
-                    _skip(comparison, f"未知建议动作 {action}，不执行", prior, key)
+                    _skip(
+                        comparison,
+                        f"未知建议动作 {action}，不执行",
+                        prior,
+                        key,
+                        kind=SKIP_KIND_STATE,
+                    )
                 )
         except Exception as exc:  # noqa: BLE001 -- 辅助产物失败不得中断 run 收尾
             actions.append(
@@ -661,6 +739,7 @@ def apply_comparisons(
                     "本次不落盘（旧记忆保持原样）",
                     prior,
                     key,
+                    kind=SKIP_KIND_ERROR,
                 )
             )
     return MemoryUpdateReport(actions=actions, counts=_counts(actions), dry_run=dry_run)
@@ -691,7 +770,14 @@ def _action(
     reason: str,
     key: str = "",
     prior_note_id: str = "",
+    skip_reason_kind: str = "",
 ) -> MemoryUpdateAction:
+    """组装一条动作记录，并**一律带上判定侧的可复算留痕**（P2-G 修复）。
+
+    ``similarity`` 与 ``reasons`` 直接取自 ``EvidenceComparison``（理由原文含槽位 /
+    实体护栏 / 地板 / 来源变化等依据），所以无论动作是执行还是跳过，验收方都能只
+    凭 memory-update.json 复算"这个数字是怎么来的"——不必回到脚本外重建解释。
+    """
     return MemoryUpdateAction(
         prior_note_id=prior_note_id or comparison.prior_note_id,
         verdict=comparison.verdict,
@@ -702,6 +788,9 @@ def _action(
         key=key,
         evidence_index=comparison.evidence_index,
         guard=comparison.guard,
+        similarity=comparison.similarity,
+        reasons=list(comparison.reasons),
+        skip_reason_kind=skip_reason_kind,
     )
 
 
@@ -710,8 +799,15 @@ def _skip(
     reason: str,
     prior: Note | None = None,
     key: str = "",
+    *,
+    kind: str = SKIP_KIND_STATE,
 ) -> MemoryUpdateAction:
-    """一条跳过动作（``prior`` 只用于把 prior_note_id 归一为实际读到的 ID）。"""
+    """一条跳过动作（``prior`` 只用于把 prior_note_id 归一为实际读到的 ID）。
+
+    ``kind`` 是跳过归因分类（缺省 ``state``：结构/状态条件不满足）；判定结果类的
+    跳过显式传 ``SKIP_KIND_VERDICT``、幂等命中传 ``SKIP_KIND_IDEMPOTENT``、护栏拒绝
+    传 ``SKIP_KIND_GUARD``、执行失败传 ``SKIP_KIND_ERROR``。
+    """
     return _action(
         comparison,
         APPLIED_SKIPPED,
@@ -719,6 +815,7 @@ def _skip(
         reason=reason,
         key=key,
         prior_note_id=prior.id if prior is not None else "",
+        skip_reason_kind=kind,
     )
 
 
@@ -954,6 +1051,7 @@ def _apply_supersede(
             "无需再 supersede/merge（不写盘）",
             prior,
             key,
+            kind=SKIP_KIND_STATE,
         )
     if target is not None and target.meta.status != "active":
         target = None  # 目标不是 active（异常状态）：退回新建路径，不把链挂到退役版本上
@@ -1069,6 +1167,7 @@ def _apply_merge(
             "不写盘（不把未发生的修订记成 merged）",
             prior,
             key,
+            kind=SKIP_KIND_IDEMPOTENT,
         )
     # 理由在写盘前一次成形（新增来源条数也进去）：笔记 extra 里的 update_reasons
     # 与报告/state 里的 reason 必须是**同一串**，否则审计时两处对不上。
@@ -1256,6 +1355,12 @@ __all__ = [
     "MemoryUpdateAction",
     "MemoryUpdateReport",
     "MemoryUpdateSettings",
+    "SKIP_KINDS",
+    "SKIP_KIND_ERROR",
+    "SKIP_KIND_GUARD",
+    "SKIP_KIND_IDEMPOTENT",
+    "SKIP_KIND_STATE",
+    "SKIP_KIND_VERDICT",
     "SUPERSEDE_REASON_KEY",
     "UPDATE_REASONS_KEY",
     "apply_comparisons",

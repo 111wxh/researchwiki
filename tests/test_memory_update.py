@@ -36,6 +36,12 @@ from researchwiki.loop.memory_update import (
     MAX_RECORDED_KEYS,
     MEMORY_UPDATE_KEYS,
     MEMORY_UPDATE_REASONS,
+    SKIP_KIND_ERROR,
+    SKIP_KIND_GUARD,
+    SKIP_KIND_IDEMPOTENT,
+    SKIP_KIND_STATE,
+    SKIP_KIND_VERDICT,
+    SKIP_KINDS,
     SUPERSEDE_REASON_KEY,
     UPDATE_REASONS_KEY,
     MemoryUpdateReport,
@@ -1588,3 +1594,158 @@ def test_update_reasons_are_bounded_like_other_audit_lists(tmp_path: Path) -> No
     assert len(records) == MAX_RECORDED_KEYS  # 封顶到与另三条一致
     assert records[-1]["reason"] == action.reason  # 最新一条在末尾
     assert records[0]["reason"] == "历史原因 6"  # 最老的 6 条被裁掉（保留最近 50）
+
+
+# ---- P2-G 可审计性缺口：skipped 记录也必须可复算 ------------------------------
+
+
+def test_uncertain_skip_carries_similarity_and_reasons(tmp_path: Path) -> None:
+    """P2-G①：uncertain 的 skip 记录带实际相似度与判定理由原文（可只凭 JSON 复算）。"""
+    store = make_store(tmp_path)
+    prior = make_prior(store, "项目使用 uv 管理依赖。")
+    item = EvidenceItem(text="今天天气很好，适合出门散步。", observed_at=None)
+    comparison, report, action = one(store, prior, item)
+
+    assert action.applied == APPLIED_SKIPPED
+    assert action.skip_reason_kind == SKIP_KIND_VERDICT
+    assert action.similarity == comparison.similarity > 0.0
+    assert action.reasons == comparison.reasons  # 理由原文，不是改写版
+    joined = "\n".join(action.reasons)
+    assert "相似度" in joined and "低于地板" in joined  # 判定依据本身在
+
+    payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
+    record = payload["actions"][0]
+    assert record["skip_reason_kind"] == SKIP_KIND_VERDICT
+    assert record["similarity"] == comparison.similarity
+    assert record["reasons"] == comparison.reasons
+    assert record["applied"] == APPLIED_SKIPPED and record["note_id"] is None
+    assert set(record) >= {
+        "similarity",
+        "reasons",
+        "skip_reason_kind",
+        "reason",
+        "verdict",
+        "guard",
+    }
+
+
+def test_every_skip_kind_is_classified(tmp_path: Path) -> None:
+    """P2-G②（+ 归因完备性）：幂等 / 护栏 / 状态 / 判定 / 失败五类 skip 各自标对。
+
+    每个用例用**互不相同的笔记与证据**：幂等是"同一 prior + 同一正文"的属性，
+    复用同一对会让后续用例全部被幂等通道拦下（那正是它的语义）。
+    """
+    store = make_store(tmp_path)
+    prior = make_prior(store, BODY_CONSISTENT)
+    item = EvidenceItem(text=BODY_CONSISTENT, observed_at=None)
+
+    # 幂等：同批同一 prior 的同一正文出现两次 → 第二条是 idempotent
+    idem = apply(store, pairs_for(store, [(prior, item), (prior, item)]))
+    assert idem.actions[0].applied == APPLIED_REVIEWED_AT
+    assert idem.actions[1].skip_reason_kind == SKIP_KIND_IDEMPOTENT
+    # 幂等（跨处置，带前缀键命中）→ 仍归 idempotent
+    again = apply(store, pairs_for(store, [(store.get_note("N-0001"), item)]))
+    assert again.actions[0].skip_reason_kind == SKIP_KIND_IDEMPOTENT
+    assert again.actions[0].similarity == idem.actions[0].similarity  # 复算字段照旧在
+
+    # 护栏：guard 非 None 且动作是覆盖类 → guard（用另一条 prior + 另一段证据）
+    guard_prior = make_prior(store, BODY_CONSISTENT, note_id="N-0002")
+    guard_item = EvidenceItem(text=f"{BODY_CONSISTENT}（护栏用例）", observed_at=None)
+    guarded = EvidenceComparison(
+        verdict=VERDICT_NEWER,
+        reasons=["人为构造：护栏标记 + 覆盖动作"],
+        prior_note_id="N-0002",
+        evidence_index=0,
+        suggested_action=ACTION_SUPERSEDE,
+        guard=GUARD_ENTITIES_DISJOINT,
+    )
+    guarded_report = apply(store, [(guarded, guard_item)])
+    assert guarded_report.actions[0].skip_reason_kind == SKIP_KIND_GUARD
+    assert guarded_report.actions[0].reasons == ["人为构造：护栏标记 + 覆盖动作"]
+
+    # 状态：旧记忆不存在
+    missing = EvidenceComparison(
+        verdict=VERDICT_CONSISTENT,
+        reasons=["人为构造：旧记忆不存在"],
+        prior_note_id="N-9999",
+        evidence_index=0,
+        suggested_action="refresh_reviewed_at",
+    )
+    missing_report = apply(store, [(missing, guard_item)])
+    assert missing_report.actions[0].skip_reason_kind == SKIP_KIND_STATE
+    assert missing_report.actions[0].key == ""  # 连 prior 都没有，无键可算
+    # 状态：旧记忆非 active
+    retired = make_prior(
+        store,
+        BODY_CONSISTENT,
+        note_id="N-0005",
+        status="superseded",
+        superseded_by="N-0001",
+    )
+    retired_report = apply(store, pairs_for(store, [(retired, guard_item)]))
+    assert retired_report.actions[0].skip_reason_kind == SKIP_KIND_STATE
+
+    # 判定：uncertain → none
+    uncertain, _, uncertain_action = one(
+        store, guard_prior, EvidenceItem(text="今天天气很好，适合出门散步。", observed_at=None)
+    )
+    assert uncertain.verdict == VERDICT_UNCERTAIN
+    assert uncertain_action.skip_reason_kind == SKIP_KIND_VERDICT
+
+    # 失败：写入异常（覆写 save_meta 的 store 替身）→ error
+    class BoomStore(WikiStore):
+        def save_meta(self, meta, body):  # type: ignore[no-untyped-def]
+            raise OSError("磁盘满了")
+
+    boom = BoomStore(tmp_path / "wiki-data")
+    boom_note = boom.save_note(BODY_CONSISTENT, note_id="N-0007", title="失败用例")
+    boom_item = EvidenceItem(text=f"{BODY_CONSISTENT}（失败用例）", observed_at=None)
+    boom_report = apply(boom, pairs_for(boom, [(boom_note, boom_item)]))
+    assert boom_report.actions[0].skip_reason_kind == SKIP_KIND_ERROR
+    assert "执行失败" in boom_report.actions[0].reason
+    assert boom.get_note("N-0007").meta.reviewed_at is None  # 旧记忆保持原样
+    assert SKIP_KINDS == ("verdict", "idempotent", "guard", "state", "error")
+
+
+def test_dry_run_skip_records_are_equally_complete(tmp_path: Path) -> None:
+    """P2-G③：dry_run 的影子报告同样带 similarity / reasons / skip_reason_kind。"""
+    store = make_store(tmp_path)
+    prior = make_prior(store, "项目使用 uv 管理依赖。")
+    item = EvidenceItem(text="今天天气很好，适合出门散步。", observed_at=None)
+    report = apply(store, pairs_for(store, [(prior, item)]), dry_run=True)
+    action = report.actions[0]
+    assert report.dry_run is True and action.applied == APPLIED_SKIPPED
+    assert action.skip_reason_kind == SKIP_KIND_VERDICT
+    assert action.similarity > 0.0 and action.reasons
+    payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
+    assert payload["actions"][0]["reasons"] == action.reasons
+    assert payload["actions"][0]["similarity"] == action.similarity
+
+
+def test_loop_memory_update_file_skips_are_recomputable(tmp_path: Path) -> None:
+    """P2-G 收口：run 级 memory-update.json 的 skip 记录也能只凭该文件复算。"""
+    store = WikiStore(tmp_path / "wiki-data")
+    # Prior 与候选主题无关 → 一定落 uncertain（地板短路），skip 必须带相似度与理由
+    store.save_note(
+        QUESTION + "：uv 管理依赖，Python 3.12。",
+        note_id="N-0001",
+        title="依赖管理（历史）",
+        observed_at=EARLIER,
+        created=EARLIER,
+    )
+    loop = make_loop(tmp_path, memory_update_config={"enabled": True})
+    list(loop.events())
+
+    payload = json.loads((tmp_path / "run" / "memory-update.json").read_text(encoding="utf-8"))
+    assert payload["counts"]["skipped"] >= 1
+    skipped = [a for a in payload["actions"] if a["applied"] == APPLIED_SKIPPED]
+    assert skipped, "本轮应至少有一条跳过（候选与 Prior 不构成同一断言）"
+    for record in skipped:
+        assert record["skip_reason_kind"] in SKIP_KINDS
+        assert record["similarity"] > 0.0
+        assert record["reasons"], "skip 也必须带判定理由原文"
+        joined = "\n".join(record["reasons"])
+        assert "相似度" in joined  # 判定依据引用具体值，可复算
+    # run-metrics 的 14 字段契约不受影响（新字段只在 memory-update.json）
+    metrics = json.loads((tmp_path / "run" / "run-metrics.json").read_text(encoding="utf-8"))
+    assert set(metrics) == METRICS_FIELDS
