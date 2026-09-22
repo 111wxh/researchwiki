@@ -138,9 +138,11 @@ def chat(req: ChatRequest) -> StreamingResponse:
             accountant=accountant,
             search_provider=get_search_provider(config),
             wiki_root=wiki_root,
-            # [wiki] / [embedding] 段的配置必须显式传入，否则去重阈值与嵌入模型会被静默忽略
-            wiki_config=wiki_cfg,
-            embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
+        # [wiki] / [embedding] 段的配置必须显式传入，否则去重阈值与嵌入模型会被静默忽略；
+        # [prior] 段同理（缺省时 AgentLoop 内部按 enabled=true + 默认值处理）
+        wiki_config=wiki_cfg,
+        prior_config=config.get("prior"),
+        embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
         ).events()
     else:
         iterator = ResearchRun(question, accountant=accountant).events()

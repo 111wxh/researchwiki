@@ -11,7 +11,12 @@ start / reasoning-* / data-task / data-note / data-conflict / text-* / source-ur
 state 约定：每次 run 落盘 wiki-data/runs/{时间戳}-{trace_id}/：
 - research-plan.md：规划阶段产出的研究计划；
 - state.md：滚动状态（阶段、步骤、token 消耗、来源数、关键发现），每阶段原子重写；
-- report.md：最终报告（供阶段 3 Distiller 消费）。
+- report.md：最终报告（供阶段 3 Distiller 消费）；
+- run-metrics.json：本次 run 的复用/成本/质量指标（PLAN §4.4，与 tokens.jsonl 可复算对账）。
+
+Prior 注入（PLAN §4.2）：run 开始前对问题检索历史 Wiki 的 active notes（索引
+落后先 rebuild），以"仅供核验"标签块注入 plan 步骤的 user 消息；Prior 的 URL
+不进本轮 SourcePool，报告 [n] 编号只指向本轮 fresh 来源。
 """
 
 from __future__ import annotations
@@ -26,6 +31,11 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import Message, Provider, TokenUsage, chunk_text
+from researchwiki.loop.metrics import (
+    RunMetrics,
+    compute_citation_coverage,
+    write_run_metrics,
+)
 from researchwiki.loop.registry import Tool, ToolRegistry
 from researchwiki.loop.subagent import ResearchSubagent, SubagentResult
 from researchwiki.tools import (
@@ -47,6 +57,8 @@ if TYPE_CHECKING:
     from researchwiki.wiki.distiller import CandidateNote
     from researchwiki.wiki.embeddings import EmbeddingProvider
     from researchwiki.wiki.frontmatter import SourceRef
+    from researchwiki.wiki.index import SearchIndex
+    from researchwiki.wiki.prior import PriorContext
     from researchwiki.wiki.store import Note
 
 # ---- 提示词 --------------------------------------------------------------
@@ -188,6 +200,10 @@ class RunContext:
     task_sink: list[dict[str, Any]] = field(default_factory=list)
     task_counter: int = 0
     subagent_factory: Callable[[str, str], SubagentResult] | None = None
+    # 本轮真实发生的 fresh 检索计数（run-metrics 用）；主循环与子 agent 的
+    # search/fetch handler 共享同一个 ctx，两个 registry 的调用都计在这里
+    search_calls: int = 0
+    fetch_calls: int = 0
 
     def next_task_id(self) -> str:
         self.task_counter += 1
@@ -246,6 +262,7 @@ def _register_research_tools(
         if not query:
             raise ValueError("query 不能为空")
         max_results = int(args.get("max_results") or 5)
+        ctx.search_calls += 1
         hits = ctx.search_provider.search(query, max_results=max_results)
         for h in hits:
             ctx.add_source(h.url, h.title)
@@ -263,6 +280,7 @@ def _register_research_tools(
         url = str(args.get("url") or "").strip()
         if not url:
             raise ValueError("url 不能为空")
+        ctx.fetch_calls += 1
         result: FetchResult = fetch_url(
             url,
             max_chars=ctx.max_fetch_chars,
@@ -480,6 +498,7 @@ class AgentLoop:
         clock: Callable[[], float] = time.perf_counter,
         embedding: EmbeddingProvider | None = None,
         wiki_config: Mapping[str, Any] | None = None,
+        prior_config: Mapping[str, Any] | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -516,7 +535,9 @@ class AgentLoop:
 
         # wiki 三层存储（notes/ pages/ conflicts/，与 loop 层既有目录布局互读兼容）：
         # run 内蒸馏走 Distiller（报告素材 → 原子笔记）→ Ingestor（查重合并 + 规范 ID）。
-        self._build_wiki_layer(embedding=embedding, wiki_config=wiki_config)
+        self._build_wiki_layer(
+            embedding=embedding, wiki_config=wiki_config, prior_config=prior_config
+        )
         self.build_pages = build_pages
         # 滚动状态（state.md 的数据源）
         self.input_tokens = 0
@@ -530,20 +551,31 @@ class AgentLoop:
         self.forced_reason = ""
         # 子 agent 带回的候选笔记，蒸馏阶段与主循环抽取结果一并入库
         self.pending_candidates: list[CandidateNote] = []
+        # Prior 检索结果（events() 开头填充；None = 未启用或尚未检索）与入库动作计数
+        self.prior_context: PriorContext | None = None
+        self.notes_created = 0
+        self.notes_merged = 0
+        self.notes_superseded = 0
 
     # ---- 基础设施 ----------------------------------------------------------
 
     def _build_wiki_layer(
-        self, *, embedding: EmbeddingProvider | None, wiki_config: Mapping[str, Any] | None
+        self,
+        *,
+        embedding: EmbeddingProvider | None,
+        wiki_config: Mapping[str, Any] | None,
+        prior_config: Mapping[str, Any] | None,
     ) -> None:
-        """装配 wiki 层：WikiStore / EntityRegistry / Ingestor（去重）/ Distiller（蒸馏）。
+        """装配 wiki 层：WikiStore / EntityRegistry / Ingestor / Distiller / Prior 索引。
 
         方法内延迟导入的原因见文件头 TYPE_CHECKING 注释：wiki.store 反向依赖
         loop.notes，模块级导入会在「先 import wiki 包」的顺序下形成循环导入。
         """
         from researchwiki.wiki.distiller import Distiller
         from researchwiki.wiki.entities import EntityRegistry
+        from researchwiki.wiki.index import SearchIndex, wiki_settings
         from researchwiki.wiki.ingest import Ingestor, dedup_settings
+        from researchwiki.wiki.prior import prior_settings
         from researchwiki.wiki.store import WikiStore
 
         # 去重阈值：config [wiki] 段（dedup_similarity / dedup_entity_overlap）可覆盖
@@ -568,6 +600,49 @@ class AgentLoop:
             clock=self.clock,
             step="distill",
             on_usage=self._absorb_usage,
+        )
+        # Prior 检索层（PLAN §4.2）：[prior] 段缺省 = enabled + 默认值，不强制用户配置。
+        # 索引复用 AgentLoop 的 embedding 与 [wiki] 的 tokenizer/半衰期配置，
+        # 构造方式同 mcp_server/service.py 的 _open_index；禁用时不建索引（零副作用）。
+        self.prior_settings = prior_settings(prior_config)
+        self.prior_index: SearchIndex | None = None
+        if self.prior_settings.enabled:
+            # wiki_config 的既定口径与 dedup_settings 一致：[wiki] 段或完整 config
+            # 皆可（server / smoke 脚本传的是段）；wiki_settings 只认完整 config，
+            # 这里归一后再解析。
+            if isinstance(wiki_config, Mapping) and "wiki" in wiki_config:
+                full_cfg: Mapping[str, Any] = wiki_config
+            else:
+                full_cfg = {"wiki": wiki_config or {}}
+            settings = wiki_settings(full_cfg)
+            self.prior_index = SearchIndex(
+                self.wiki_root,
+                embedding=embedding,
+                tokenizer=settings.fts_tokenizer,
+                half_life_days=settings.half_life_days,
+            )
+
+    def _retrieve_priors(self) -> None:
+        """run 开始前的 Prior 检索（PLAN §4.2）：索引新鲜检查（落后即 rebuild）→ 检索。
+
+        结果存 ``self.prior_context``（None = 未启用）；Prior 的 URL **不得**进
+        SourcePool（不调用 ctx.add_source），只随 ``format()`` 注入 plan 步骤的
+        user 消息——报告 [n] 编号因此只指向本轮 fresh 来源。
+        """
+        if self.prior_index is None:
+            self.prior_context = None
+            return
+        # wiki 层延迟导入，见文件头 TYPE_CHECKING 说明
+        from researchwiki.wiki.prior import ensure_index_fresh, retrieve_priors
+
+        # 正确性优先：索引落后于 store 就整体 rebuild（性能后优化）
+        ensure_index_fresh(self.wiki_store, self.prior_index)
+        self.prior_context = retrieve_priors(
+            self.question,
+            self.wiki_store,
+            self.prior_index,
+            k=self.prior_settings.k,
+            max_chars=self.prior_settings.max_chars,
         )
 
     def _run_subagent(self, topic: str, brief: str) -> SubagentResult:
@@ -654,10 +729,22 @@ class AgentLoop:
     # ---- 事件主流程 ----------------------------------------------------------
 
     def events(self) -> Iterator[dict[str, Any]]:
+        t_start = self.clock()
         yield {"type": "start"}
 
+        # ---- 阶段 0：Prior 检索（PLAN §4.2：plan 步骤之前，不污染来源池）----
+        self._retrieve_priors()
+        plan_content = self.question
+        if self.prior_context is not None:
+            prior_block = self.prior_context.format()
+            if prior_block:
+                # Prior 块放在问题之前、带分隔线；自带"仅供核验"标签行。
+                # 系统提示词一字不动——稳定 prompt 前缀是阶段 3 的前提，
+                # Prior 属于动态后缀区。
+                plan_content = f"{prior_block}\n---\n\n研究问题：{self.question}"
+        plan_messages = [Message(role="user", content=plan_content)]
+
         # ---- 阶段 1：规划（reasoning 流式转发，计划文本并入同一思考块）----
-        plan_messages = [Message(role="user", content=self.question)]
         t0 = self.clock()
         yield {"type": "reasoning-start", "id": "plan"}
         parts: list[str] = []
@@ -821,6 +908,11 @@ class AgentLoop:
                     "confidence": result.note.confidence,
                 },
             }
+        # 入库动作计数 → run-metrics.json（IngestResult.action 只有 created/merged，
+        # superseded 在阶段 1 恒为 0，字段保位以稳住 §4.4 契约）
+        self.notes_created = created
+        self.notes_merged = merged
+        self.notes_superseded = 0
         conflicts = self.distiller.last_conflicts
         for i, conflict in enumerate(conflicts, start=1):
             yield {
@@ -879,9 +971,41 @@ class AgentLoop:
 
         atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
         self._write_state("done")
+        self._write_run_metrics(t_start)
         yield {"type": "finish"}
 
     # ---- 辅助 ----------------------------------------------------------
+
+    def _write_run_metrics(self, t_start: float) -> None:
+        """收尾落盘 run-metrics.json（PLAN §4.4/§4.5，report 写盘后、finish 前）。
+
+        token 口径：self.input_tokens / self.output_tokens 已含子 agent 与蒸馏吸收；
+        与 tokens.jsonl 可复算对账（metrics.sum_tokens_from_jsonl）。latency 为
+        events() 全程的 self.clock 差取整。
+        """
+        prior = self.prior_context
+        source_count = len(self.ctx.source_pool.entries)
+        # 引用覆盖率精度口径（Task 2 遗留决定）：round(x, 4)
+        coverage = compute_citation_coverage(self.report_text, source_count)
+        if coverage is not None:
+            coverage = round(coverage, 4)
+        metrics = RunMetrics.from_loop(
+            trace_id=self.trace_id,
+            prior_hit_count=len(prior.hits) if prior else 0,
+            prior_note_ids=[h.note_id for h in prior.hits] if prior else [],
+            prior_context_chars=prior.context_chars if prior else 0,
+            fresh_search_count=self.ctx.search_calls,
+            fresh_fetch_count=self.ctx.fetch_calls,
+            source_count=source_count,
+            notes_created=self.notes_created,
+            notes_merged=self.notes_merged,
+            notes_superseded=self.notes_superseded,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            latency_ms=int((self.clock() - t_start) * 1000),
+            citation_coverage=coverage,
+        )
+        write_run_metrics(self.run_dir, metrics)
 
     def _report_material(self, history: list[Message]) -> str:
         """蒸馏输入 = 研究总结 + 工具结果摘编（研究问题由 extract_notes 的 question 参数带入）。

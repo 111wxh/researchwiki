@@ -56,3 +56,12 @@ half_life_days = { volatile = 30, drifting = 90 }
 # 向量用 [embedding] 段的模型（留空 = 确定性 Mock）；实体名按 slugify 归一后比较。
 dedup_similarity = 0.9
 dedup_entity_overlap = 1
+
+[prior]
+# Prior 注入（阶段 1）：run 开始前对问题检索历史 Wiki 的 active 笔记（索引落后
+# 先整体 rebuild），以"仅供核验"标签块注入规划上下文。Prior 的 URL 不进本轮
+# 来源池、不占报告 [n] 编号，只作核验比对；缺省段 = enabled + 默认值。
+# enabled = false 时完全不检索不注入；top_k 最多注入条数；max_chars 注入块字符预算。
+enabled = true
+top_k = 5
+max_chars = 4000
