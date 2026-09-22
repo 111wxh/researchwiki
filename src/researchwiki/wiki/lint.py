@@ -18,11 +18,21 @@ Distiller 生成页面时会用同一套规则做确定性兜底标注）：
   （fresh / review_due / stale，口径见 wiki/freshness.py），并列出生效的待复核队列
   （stale 优先、同级按年龄降序）。它**只统计与提示，不影响结论与退出码**——
   陈旧是"该复核"，不是"wiki 坏了"，故不进 healthy 判定；
-- **未裁决冲突**：``conflicts/`` 里 status=open 的台账条数（``conflicts_open``）。
+- **未裁决冲突**：``conflicts/`` 里 status=open 的台账条数（``conflicts_open``）；
+  P2-F 补齐 ``conflicts`` 二元组（open / resolved 各一条，复用 ``list_conflicts``）；
+- **墓碑（P2-F 裁定一）**：带 ``tombstone: true`` 标记的笔记条数——它们是
+  ``memory_invalidate`` 生成的失效裁定记录（审计用，默认不参与检索与 Prior 注入），
+  这里统计的是"库里有几条失效裁定"；
+- **悬空证据**：``store.missing_snapshots()`` 的长度——笔记声明的来源快照文件
+  已不存在（证据链断裂）的处数；只看 active 笔记（现役记忆的断裂才需处理）；
+- **待复核来源变化**：``source_changed_at`` 晚于 ``reviewed_at``（或从未复核）的
+  active 笔记数，即"来源内容变了、还没有复核结论"的队列长度——与 freshness 规则 5
+  的降级口径同源（''算得出 source_changed_at'' 才计入，不可解析的按未声明处理）。
 
 退出码约定（给 CI 用）：**有断链**，或"存在断言行且引用覆盖率为 0" → 1，否则 0。
 没有任何断言行（空 wiki）时覆盖率取 1.0（真空真），避免空库把 CI 判红。
-freshness / conflicts_open 是新增的**观测字段**，不参与退出码（既有契约不变）。
+freshness / conflicts / tombstones / dangling_evidence / source_changed_pending
+都是**观测字段**，不参与退出码（既有契约不变）。
 """
 
 from __future__ import annotations
@@ -40,11 +50,12 @@ from researchwiki.wiki.freshness import (
     evaluate_freshness,
     freshness_counts,
     freshness_queue,
+    parse_ts,
 )
 
 if TYPE_CHECKING:  # 仅类型标注用：避免 wiki.index → store → loop.notes 的循环导入
     from researchwiki.wiki.index import SearchIndex
-    from researchwiki.wiki.store import WikiStore
+    from researchwiki.wiki.store import Note, WikiStore
 
 # 笔记 ID：N-0001 这类编号（frontmatter 之外的正文里出现即算引用）
 NOTE_ID_RE = re.compile(r"\bN-\d+\b")
@@ -129,8 +140,11 @@ class MergedRef:
 class LintReport:
     """一次 lint 的完整结果（字段即对外契约，CLI 的 --json 直接序列化）。
 
-    freshness / conflicts_open 是 P2 新增的**观测字段**：只统计与提示，
-    不参与 healthy / exit_code 判定（既有退出码契约不变）。
+    freshness / conflicts_open / conflicts / tombstones / dangling_evidence /
+    source_changed_pending 都是 P2 新增的**观测字段**：只统计与提示，
+    不参与 healthy / exit_code 判定（既有退出码契约不变）。P2-F 的健康度补齐
+    （PLAN §3.3 验收第 5 条）是**追加**字段：``conflicts_open`` 语义不动，
+    另给 ``conflicts`` 二元组与三个队列长度。
     """
 
     citation_coverage: float = 1.0
@@ -144,6 +158,14 @@ class LintReport:
     freshness: dict[str, int] = field(default_factory=lambda: dict.fromkeys(FRESHNESS_STATES, 0))
     # conflicts/ 里 status=open 的台账条数（未裁决冲突）
     conflicts_open: int = 0
+    # 冲突台账健康度：{"open": N, "resolved": N}（P2-F；与 conflicts_open 同源同值）
+    conflicts: dict[str, int] = field(default_factory=lambda: {"open": 0, "resolved": 0})
+    # 带 tombstone 标记的笔记条数（失效裁定记录；默认不参与检索与 Prior 注入）
+    tombstones: int = 0
+    # 悬空证据处数（store.missing_snapshots() 的长度，只看 active 笔记）
+    dangling_evidence: int = 0
+    # 待复核的"来源已变化"队列长度（source_changed_at 晚于 reviewed_at 的 active 笔记）
+    source_changed_pending: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -188,7 +210,21 @@ class LintReport:
             )
         if len(queue) > QUEUE_TEXT_SHOWN:
             lines.append(f"  - 其余 {len(queue) - QUEUE_TEXT_SHOWN} 条见 --json 的 freshness_queue")
-        lines.append(f"- 未裁决冲突：{self.conflicts_open} 条")
+        lines.append(
+            f"- 未裁决冲突：{self.conflicts_open} 条"
+            f"（已裁决 {self.conflicts.get('resolved', 0)} 条）"
+        )
+        lines.append(
+            f"- 墓碑（失效裁定记录，默认不参与检索）：{self.tombstones} 条"
+        )
+        lines.append(
+            f"- 悬空证据：{self.dangling_evidence} 处"
+            "（笔记声明的来源快照文件不存在，证据链断裂）"
+        )
+        lines.append(
+            f"- 待复核来源变化：{self.source_changed_pending} 条"
+            "（source_changed_at 晚于 reviewed_at，尚无复核结论）"
+        )
         if self.orphan_notes:
             shown = "、".join(self.orphan_notes[:12])
             more = f" 等 {len(self.orphan_notes)} 条" if len(self.orphan_notes) > 12 else ""
@@ -234,6 +270,10 @@ def lint_wiki(
     可直接传 ``FreshnessSettings``，不读配置。
     时效统计只覆盖 active 笔记（与 notes_total 同口径：merged/superseded 已退役，
     不再参与"当前事实"判定）。
+
+    P2-F 起的健康度统计（conflicts / tombstones / dangling_evidence /
+    source_changed_pending）同样是纯读观测：只回答"库里有几处这类情况"，
+    不触发复核、不改状态、不影响退出码。
     """
     registry = EntityRegistry(store.root)
     all_notes = store.list_notes(status=None)
@@ -302,6 +342,17 @@ def lint_wiki(
     if stale is not None:
         details["index_checked"] = True
         details["index_stale"] = stale
+    # P2-F 健康度补齐（PLAN §3.3 验收第 5 条）：全部为**观测统计**，只读、不写盘、
+    # 不进 healthy / exit_code。冲突复用 store.list_conflicts（不另造一套解析）。
+    open_conflicts = store.list_conflicts(status="open")
+    resolved_conflicts = store.list_conflicts(status="resolved")
+    tombstones = sum(1 for n in all_notes if n.tombstone)
+    dangling = store.missing_snapshots()  # 默认只看 active（现役记忆的断裂才需处理）
+    source_changed_pending = sum(
+        1 for n in active_notes if _source_change_pending(n)
+    )
+    details["tombstone_note_ids"] = sorted(n.id for n in all_notes if n.tombstone)
+    details["dangling_evidence_total"] = len(dangling)
     return LintReport(
         citation_coverage=coverage,
         orphan_notes=orphans,
@@ -311,8 +362,27 @@ def lint_wiki(
         pages_total=len(pages),
         details=details,
         freshness=freshness_counts(freshness_states),
-        conflicts_open=len(store.list_conflicts(status="open")),
+        conflicts_open=len(open_conflicts),
+        conflicts={"open": len(open_conflicts), "resolved": len(resolved_conflicts)},
+        tombstones=tombstones,
+        dangling_evidence=len(dangling),
+        source_changed_pending=source_changed_pending,
     )
+
+
+def _source_change_pending(note: Note) -> bool:
+    """该 active 笔记是否"来源已变化、尚无复核结论"（freshness 规则 5 的同源口径）。
+
+    ``source_changed_at`` 不存在或不可解析 → 不算待复核（不可解析按"未声明"处理，
+    与 freshness 一致）；有 ``reviewed_at`` 且不早于它 → 已复核，不算。
+    这里不 import freshness 的私有实现（``_apply_source_change_floor``），只共用
+    公开的 ``parse_ts``，两条路径的时间解析口径完全一致。
+    """
+    changed_at = parse_ts(note.meta.source_changed_at)
+    if changed_at is None:
+        return False
+    reviewed_at = parse_ts(note.meta.reviewed_at)
+    return reviewed_at is None or changed_at > reviewed_at
 
 
 def _check_entity_links(

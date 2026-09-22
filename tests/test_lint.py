@@ -13,6 +13,7 @@ import pytest
 from researchwiki.cli import main
 from researchwiki.wiki.entities import EntityRegistry
 from researchwiki.wiki.freshness import FreshnessSettings
+from researchwiki.wiki.frontmatter import SourceRef
 from researchwiki.wiki.index import SearchIndex
 from researchwiki.wiki.lint import (
     LintReport,
@@ -230,6 +231,115 @@ def test_freshness_text_summary_lines(tmp_path: Path):
     assert "待复核：N-0003（stale，年龄 60.0 天，decay 0.250）" in text
     assert "待复核：N-0004（review_due，年龄 90.0 天，decay 0.500）" in text
     assert "- 未裁决冲突：1 条" in text
+    # P2-F 健康度摘要行（既有"未裁决冲突：N 条"文案保留为前缀，追加已裁决计数）
+    assert "- 未裁决冲突：1 条（已裁决 0 条）" in text
+    assert "- 墓碑（失效裁定记录，默认不参与检索）：0 条" in text
+    assert "- 悬空证据：0 处" in text
+    assert "- 待复核来源变化：0 条" in text
+
+
+# ---- 健康度补齐（P2-F 裁定三：PLAN §3.3 验收第 5 条）---------------------------
+
+
+def make_health_store(tmp_path: Path) -> WikiStore:
+    """一份把四个新计数都点亮的库：墓碑 / 悬空证据 / 来源变化待复核 / 冲突两态。
+
+    - N-0001：active、来源快照存在（sources/{sha1}/{hash}/content.md 真落盘）；
+    - N-0002：active、引用了不存在的快照（悬空证据）且 source_changed_at 晚于
+      reviewed_at（待复核队列）；另引用一个空 content_hash（同样算悬空，但同一
+      笔记同一 path 只计一次 → N-0002 共 2 处悬空）；
+    - N-0003：active、墓碑（tombstone=True，审计记录）；
+    - N-0004：已裁决冲突的载体笔记；
+    - 冲突：一条 open + 一条 resolved。
+    """
+    store = make_store(tmp_path)
+    good = store.save_note(
+        "证据完整的断言（N-0003）。",
+        note_id="N-0001",
+        title="有快照的记忆",
+        sources=[SourceRef(url="https://example.com/ok", content_hash="a" * 64)],
+    )
+    snapshot = store.note_snapshot_paths(good)[0]
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text("快照正文", encoding="utf-8")
+    store.save_note(
+        "来源已变化、尚未复核的断言。",
+        note_id="N-0002",
+        title="待复核记忆",
+        reviewed_at="2026-05-01T00:00:00+00:00",
+        source_changed_at="2026-05-02T00:00:00+00:00",
+        sources=[
+            SourceRef(url="https://example.com/gone", content_hash="b" * 64),
+            SourceRef(url="https://example.com/nohash", content_hash=""),
+        ],
+    )
+    store.save_note(
+        "记忆 N-0001 已被裁定失效：结论不成立。",
+        note_id="N-0003",
+        title="[已失效] 有快照的记忆",
+        tombstone=True,
+    )
+    store.save_note("冲突的另一方。", note_id="N-0004", title="另一方")
+    open_conflict = store.save_conflict("哪个对？", {"note_id": "N-0001"}, {"note_id": "N-0004"})
+    resolved = store.save_conflict("昨天的问题", {"note_id": "N-0001"}, {"note_id": "N-0004"})
+    store.resolve_conflict(resolved.id, verdict="采纳 N-0001", resolved_with="N-0001")
+    assert open_conflict.status == "open"
+    return store
+
+
+def test_health_metrics_counted_from_constructed_data(tmp_path: Path):
+    store = make_health_store(tmp_path)
+    report = lint_wiki(store, now=FIXED_NOW)
+
+    assert report.conflicts == {"open": 1, "resolved": 1}
+    assert report.conflicts_open == 1  # 既有字段语义不变（同源同值）
+    assert report.tombstones == 1
+    assert report.dangling_evidence == 2  # N-0002 的两处来源都没快照
+    assert report.source_changed_pending == 1  # 只有 N-0002（N-0001 没被标记过）
+    assert report.details["tombstone_note_ids"] == ["N-0003"]
+    assert report.details["dangling_evidence_total"] == 2
+    # 观测字段不影响结论与退出码（NEW: 全部是"该复核/该清理"，不是"wiki 坏了"）
+    assert report.exit_code() == 0 and report.healthy
+    payload = report.to_dict()
+    assert payload["conflicts"] == {"open": 1, "resolved": 1}
+    assert payload["tombstones"] == 1
+    assert payload["dangling_evidence"] == 2
+    assert payload["source_changed_pending"] == 1
+    text = report.format_text()
+    assert "- 墓碑（失效裁定记录，默认不参与检索）：1 条" in text
+    assert "- 悬空证据：2 处" in text
+    assert "- 待复核来源变化：1 条" in text
+
+
+def test_health_metrics_are_zero_on_empty_wiki(tmp_path: Path):
+    """空库 / 目录不存在：四个计数全 0 且不报错（新增字段必须有缺省值）。"""
+    for root in (tmp_path / "wiki-data", tmp_path / "nope"):
+        report = lint_wiki(WikiStore(root), now=FIXED_NOW)
+        assert report.conflicts == {"open": 0, "resolved": 0}
+        assert report.tombstones == 0
+        assert report.dangling_evidence == 0
+        assert report.source_changed_pending == 0
+        assert report.exit_code() == 0
+
+
+def test_health_metrics_ignore_unparsable_source_change(tmp_path: Path):
+    """不可解析的 source_changed_at 按"未声明"处理（与 freshness 规则 5 同口径）。"""
+    store = make_store(tmp_path)
+    store.save_note(
+        "坏时间戳。", note_id="N-0001", title="坏时间戳", source_changed_at="昨天下午"
+    )
+    report = lint_wiki(store, now=FIXED_NOW)
+    assert report.source_changed_pending == 0
+
+
+def test_tombstone_not_counted_as_source_change_or_dangling(tmp_path: Path):
+    """墓碑没有 sources：不会污染悬空证据 / 待复核来源变化计数。"""
+    store = make_store(tmp_path)
+    store.save_note("记忆 N-0001 已失效。", note_id="N-0001", title="[已失效] x", tombstone=True)
+    report = lint_wiki(store, now=FIXED_NOW)
+    assert report.tombstones == 1
+    assert report.dangling_evidence == 0
+    assert report.source_changed_pending == 0
 
 
 def test_freshness_settings_injection(tmp_path: Path):
@@ -332,6 +442,20 @@ def test_cli_lint_json_includes_freshness_and_conflicts(tmp_path: Path, capsys):
 def test_cli_lint_missing_root_is_healthy(tmp_path: Path, capsys):
     assert main(["lint", "--root", str(tmp_path / "nope")]) == 0
     assert "笔记：0 条" in capsys.readouterr().out
+
+
+def test_cli_lint_json_includes_health_metrics(tmp_path: Path, capsys):
+    """P2-F 裁定三：``lint --json`` 补齐 conflicts / tombstones / 两个队列长度。"""
+    store = make_health_store(tmp_path)
+    assert main(["lint", "--root", str(tmp_path / "wiki-data"), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["conflicts"] == {"open": 1, "resolved": 1}
+    assert payload["conflicts_open"] == 1  # 既有字段保留（追加式扩展）
+    assert payload["tombstones"] == 1
+    assert payload["dangling_evidence"] == 2
+    assert payload["source_changed_pending"] == 1
+    assert payload["exit_code"] == 0  # 新字段全是观测项，不进退出码
+    assert store.list_notes(status=None)  # 夹具真的建了库（防"空库恰好也全 0"）
 
 
 def _lint_json(root: Path, capsys) -> dict:
