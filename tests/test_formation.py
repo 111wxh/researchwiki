@@ -11,6 +11,7 @@
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from researchwiki.wiki.formation import (
     from_config,
 )
 from researchwiki.wiki.frontmatter import SourceRef
+from researchwiki.wiki.ingest import cosine
 from researchwiki.wiki.store import WikiStore
 
 QUESTION = "agent 记忆方案对比"
@@ -241,6 +243,26 @@ def test_from_config_tolerates_illegal_values() -> None:
     assert from_config({"min_body_chars": -5}).min_body_chars == 0
 
 
+def test_from_config_parses_boolean_strings() -> None:
+    """TOML 布尔误写成字符串时按内容解析（bool("false") 是 True，不能直接 bool 化）。
+
+    否则 enabled = "false" 的逃生阀静默失效：判定照常触发、候选照常被拒。
+    """
+    for raw in ("false", "False", " 0 ", "no", "OFF"):
+        assert from_config({"enabled": raw}).enabled is False
+        assert from_config(
+            {"require_source_for_knowledge": raw}
+        ).require_source_for_knowledge is False
+    for raw in ("true", "TRUE", " 1 ", "yes", "On"):
+        assert from_config({"enabled": raw}).enabled is True
+    # 其余非法字符串回退默认（enabled 默认开启），不让配置错误打断研究链路
+    assert from_config({"enabled": "maybe"}).enabled is True
+    assert from_config({"enabled": ""}).enabled is True
+    # 真布尔与数值沿用原语义
+    assert from_config({"enabled": False}).enabled is False
+    assert from_config({"require_source_for_knowledge": 0}).require_source_for_knowledge is False
+
+
 # ---- loop 接入（脚本化 provider 模式，与 tests/test_loop_prior.py 同构）--------
 
 
@@ -388,3 +410,166 @@ def test_loop_without_formation_config_keeps_legacy_behavior(tmp_path: Path) -> 
     saved = WikiStore(tmp_path / "wiki-data").list_notes()
     assert len(saved) == 2
     assert all(note.importance is None for note in saved)
+
+
+# ---- merged 路径 × formation 注写（P2 前回归网：0.90–0.95 相似度带）------------
+#
+# 默认配置下该相似度带走 Ingestor merge（dedup_similarity=0.90）而非 formation
+# 近重复拒绝（near_duplicate_similarity=0.95）；merge 命中时 result.note 是规范
+# 笔记，_annotate_formation 把【最后一条候选】的 importance/kind/extra 覆盖写到
+# 规范笔记上（ledger P1-B deferred：merged 路径注写为"最后候选覆盖"）。本组测试
+# 把该现状行为锁定为已知回归网，不构成对该语义的认可。
+
+_MERGE_SIM = 0.92  # 落在 [0.90, 0.95)：≥ dedup 阈值（merge）、< 近重复阈值（不拒）
+
+# 两两余弦恰为 _MERGE_SIM 的三条单位向量（等相关矩阵的 Cholesky 因子行），
+# 使"候选 vs 规范笔记"的相似度可控地恒落在 merge 带内：
+#   v0=(1,0,0)，v1=(s,a,0)，v2=(s,b,c)，其中 a=√(1-s²)，b=(s-s²)/a，c=√(1-s²-b²)
+_S = _MERGE_SIM
+_A = math.sqrt(1 - _S * _S)
+_B = (_S - _S * _S) / _A
+_C = math.sqrt(1 - _S * _S - _B * _B)
+_CANON_VEC = [1.0, 0.0, 0.0]
+_C1_VEC = [_S, _A, 0.0]
+_C2_VEC = [_S, _B, _C]
+
+assert cosine(_CANON_VEC, _C1_VEC) == pytest.approx(_MERGE_SIM)
+assert cosine(_CANON_VEC, _C2_VEC) == pytest.approx(_MERGE_SIM)
+assert cosine(_C1_VEC, _C2_VEC) == pytest.approx(_MERGE_SIM)
+
+# 标记字（丙=规范笔记 / 甲=候选一 / 乙=候选二）：正文互不重叠，查表无歧义
+CANON_BODY = "丙：Letta 用后台 subagent 在会话空闲期整理记忆，配置与成本见官方文档。"
+C1_BODY = (
+    "甲：Letta 于 2025 年推出 sleep-time compute，由后台 subagent 在会话空闲期整理记忆，"
+    "把维护成本移出交互窗口，相关配置与成本见官方文档。"
+)
+# 候选二：纯中文（无数字/拉丁/引号 → 无具体要素）、达标档正文（20–79 字）
+C2_BODY = "乙方案整体感觉还可以接受，运行起来也算稳定可靠，没有更多值得展开的细节内容。"
+_MERGE_SOURCE = "https://github.com/letta-ai/letta"  # MockSearch 首条夹具（来源池内）
+
+assert len(C1_BODY) >= BODY_FULL_CHARS, "候选一必须落在正文完整档（importance 0.95 前提）"
+assert 20 <= len(C2_BODY) < BODY_FULL_CHARS, "候选二必须落在正文达标档"
+assert all("\u4e00" <= ch <= "\u9fff" or ch in "，。" for ch in C2_BODY), (
+    "候选二必须纯中文（保证 has_specifics=False，importance 0.55 前提）"
+)
+
+MERGE_DISTILL_JSON = json.dumps(
+    {
+        "notes": [
+            {
+                "text": C1_BODY,
+                "entities": ["Letta", "MemGPT"],
+                "confidence": "high",
+                "source_urls": [_MERGE_SOURCE],
+            },
+            {
+                "text": C2_BODY,
+                "entities": ["Letta"],
+                "confidence": "medium",
+                "source_urls": [_MERGE_SOURCE],
+            },
+        ],
+        "conflicts": [],
+    },
+    ensure_ascii=False,
+)
+
+
+class _MarkedEmbedding:
+    """按标记字查表返回预置向量：把候选与规范笔记的余弦精确压进 merge 带。
+
+    MockEmbeddingProvider 的 bigram 特征哈希无法精确控形（落不到 0.90–0.95 的
+    窄带），这里按正文包含的标记字返回预置单位向量；未标记文本（如报告素材）
+    返回正交兜底向量，绝不误触 merge / 拒绝阈值。
+    """
+
+    model = "marked-embedding"
+
+    def __init__(self, table: dict[str, list[float]], default: list[float]) -> None:
+        self._table = table
+        self._default = default
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for text in texts:
+            for marker, vector in self._table.items():
+                if marker in text:
+                    out.append(vector)
+                    break
+            else:
+                out.append(self._default)
+        return out
+
+
+def test_loop_merged_candidates_annotate_canonical_note_last_write_wins(
+    tmp_path: Path,
+) -> None:
+    """merged+formation 端到端：merge 带候选全收，规范笔记注写为最后候选的判定。
+
+    锁定现状行为（回归网）：① 0.90–0.95 相似度的候选走 merge 而非近重复拒绝；
+    ② merge 返回规范笔记，formation 注写按候选顺序覆盖——先入库候选一的高分
+    注写（0.95/high）被后入库的候选二（0.55/medium）覆盖；③ 计数口径
+    （formation_stats 与 run-metrics 的 notes_merged）与留痕拓扑不变。
+    """
+    wiki_root = tmp_path / "wiki-data"
+    store = WikiStore(wiki_root)
+    store.save_note(
+        CANON_BODY,
+        note_id="N-0001",
+        title="规范笔记",
+        entities=["Letta"],
+        importance=0.5,  # 预置值：merge（置 None 中转）与注写之后应被最后候选覆盖
+    )
+    strong_turns = [
+        text_turn(PLAN_TEXT),
+        tool_turn([call("web_search", {"query": "agent 记忆"}, id="c1")]),
+        text_turn("已检索到主流方案，研究完成。"),
+        text_turn(MERGE_DISTILL_JSON),
+        text_turn(REPORT_TEXT),
+    ]
+    loop = AgentLoop(
+        QUESTION,
+        router=FakeRouter(ScriptedProvider(strong_turns, model="mock-strong")),
+        llm_config={"strong": {"base_url": "https://mock"}, "cheap": {"base_url": ""}},
+        accountant=TokenAccountant(tmp_path / "tokens.jsonl"),
+        search_provider=MockSearch(),
+        wiki_root=wiki_root,
+        run_dir=tmp_path / "run",
+        embedding=_MarkedEmbedding(
+            {"甲": _C1_VEC, "乙": _C2_VEC, "丙": _CANON_VEC}, default=[0.0, 0.0, 1.0]
+        ),
+        wiki_config={"fts_tokenizer": "trigram"},
+        prior_config={"enabled": False},
+        formation_config={"enabled": True},
+    )
+    events = list(loop.events())
+
+    # 两条候选的相似度都是 0.92：formation 全收（< 0.95），入库动作全是 merged
+    assert loop.formation_stats == {"candidates": 2, "persisted": 2, "rejected": 0}
+    metrics = load_metrics(tmp_path)
+    assert metrics["notes_created"] == 0
+    assert metrics["notes_merged"] == 2
+    assert "记忆形成：候选 2，入库 2，拒绝 0" in read_state(tmp_path)
+
+    # data-note 事件引用的全是规范 ID（merge 命中时返回既有笔记）
+    notes = [e for e in events if e["type"] == "data-note"]
+    assert [e["data"]["id"] for e in notes] == ["N-0001", "N-0001"]
+
+    # 留痕拓扑：两条 merged 记录沿 redirect_to 可达规范笔记，规范笔记唯一 active
+    assert sorted(p.name for p in (wiki_root / "notes").glob("N-*.md")) == [
+        "N-0001.md",
+        "N-0002.md",
+        "N-0003.md",
+    ]
+    active = store.list_notes()
+    assert [n.id for n in active] == ["N-0001"]
+
+    # 最后候选覆盖：importance = 候选二的 0.55（0.15 基础 + 0.25 来源 + 0.10 实体
+    # + 0.05 正文达标档），不是候选一的 0.95、也不是预置的 0.5；extra 同为最后一条
+    canonical = active[0]
+    assert canonical.importance == pytest.approx(0.55)
+    assert canonical.kind == "knowledge"
+    assert canonical.meta.extra["formation_confidence"] == "medium"
+    assert "来源有" in canonical.meta.extra["formation_reason"]
+    assert "具体要素无" in canonical.meta.extra["formation_reason"]
+    assert canonical.meta.extra["merged_from"] == ["N-0002", "N-0003"]

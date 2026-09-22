@@ -16,7 +16,10 @@
    静默改成默认值，所以这里必须显式校验，不能靠它兜底）。
 2. 路径限制：笔记路径一律由 ``tools/fs`` 的沙箱函数读写（safe_read / safe_write），
    客户端传入的 note_id 先过白名单正则再拼路径；写入用的 id 由
-   ``WikiStore.next_note_id()`` 机器生成，形态固定为 N-XXXX。
+   ``WikiStore.next_note_id()`` 机器生成，形态固定为 N-XXXX。修订/取代/失效
+   复用库内既有 id 作为写路径分量，写前另做一次形态复核
+   （``_assert_note_id_writable``：id 必须匹配白名单正则且与落盘文件名一致），
+   库内污染 id（含 ``../`` 或与文件名不一致）一律拒绝写入。
 3. 写前备份：把将被覆盖的原文件复制到 ``wiki-data/.backups/<UTC 时间戳>/``，
    新增（无原文件）时在该目录写一条 manifest 标记 action=created；
    备份任何一步失败都拒绝写入。
@@ -185,6 +188,32 @@ def _is_inside(path: Path, root: Path) -> bool:
         return Path(path).resolve().is_relative_to(Path(root).resolve())
     except OSError:  # pragma: no cover - resolve 失败（循环链接等）一律视为越界
         return False
+
+
+def _assert_note_id_writable(note: Note) -> None:
+    """写路径 id 形态复核（写保护第 2 件的写侧兜底，终审 Important 修复）。
+
+    ``WikiStore._write_note`` 直接拼 ``notes_dir/{meta.id}.md`` 且无形态校验，
+    而 ``_load`` 优先采用 frontmatter 里的 id（``meta.id = meta.id or path.stem``）——
+    手工编辑 / 同步污染可让库内笔记带上任意形态的 id。凡以既有笔记的 id 作为
+    写路径分量的操作（update_memory / supersede / invalidate），写前必须断言：
+
+    1. id 匹配白名单正则（挡 ``../``、路径分隔符——否则 ``save_note`` 会写出沙箱外）；
+    2. id 与落盘文件名一致（挡良性 id≠stem——旧行为会静默写出"新文件"而原文件
+       不动，客户端却收到 ok）。
+
+    不满足即抛 validation_failed 拒绝写入；修复方式是改正 frontmatter id 或文件名。
+    """
+    note_id = str(note.id)
+    stem = note.path.stem
+    if not NOTE_ID_RE.match(note_id) or note_id != stem:
+        raise WikiToolError(
+            "validation_failed",
+            f"笔记 id 形态非法或与文件名不一致，已拒绝写入：id={note_id!r}、"
+            f"文件名={stem}.md（id 必须匹配 {NOTE_ID_RE.pattern} 且与文件名一致；"
+            "请先修复该笔记文件的 frontmatter id 或文件名，再重试本次操作）",
+            note_id=note_id,
+        )
 
 
 def validate_kind(kind: Any) -> str | None:
@@ -990,7 +1019,12 @@ class WikiService:
         return {"ok": True, "count": len(memories), "memories": memories}
 
     def _require_active(self, note_id: str) -> Note:
-        """读一条笔记并断言存在且 active；merged/superseded 指引用 supersede。"""
+        """读一条笔记并断言存在且 active；merged/superseded 指引用 supersede。
+
+        随后做写路径 id 形态复核：update / supersede / invalidate 三条写流程都
+        以这里的 note.id 作为后续 save_note / 备份的路径分量，必须在任何写入
+        （含写前备份）发生之前拦下形态非法或与文件名不一致的污染 id。
+        """
         note = self._load(note_id)
         if note is None:
             raise WikiToolError(
@@ -998,6 +1032,7 @@ class WikiService:
                 f"笔记 {note_id!r} 不存在（wiki 根目录：{self.root}）",
                 note_id=note_id,
             )
+        _assert_note_id_writable(note)
         if note.meta.status != "active":
             raise WikiToolError(
                 "invalid_argument",
@@ -1011,7 +1046,12 @@ class WikiService:
     def _mark_superseded(
         self, note: Note, *, superseded_by: str, now: str, reason: str, prefix: str = "supersede"
     ) -> Note:
-        """把 active 笔记标记为 superseded 并链到目标（墓碑或新笔记）。"""
+        """把 active 笔记标记为 superseded 并链到目标（墓碑或新笔记）。
+
+        本方法直接以 note.id 作为 save_note 的写路径分量，写前再复核一次 id
+        形态（入口处的 _require_active 已查过，这里是纵深防御）。
+        """
+        _assert_note_id_writable(note)
         meta = note.meta
         try:
             marked = self.store.save_note(

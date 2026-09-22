@@ -715,6 +715,11 @@ class AgentLoop:
 
         原地覆写（note_id 传回，created 保留），其余元数据字段透传不变；
         属辅助产物：失败只记 stderr，不推翻已完成的入库。
+
+        注意：此处落盘后不重建 SearchIndex——当前 decision.kind 恒为 "knowledge"
+        （formation MVP 的固定语义，见 formation.py docstring），与入库建索引时的
+        kind 一致，索引无漂移；若 formation 未来赋非 knowledge kind，此处必须
+        触发索引同步（index_note / rebuild），否则检索的 kind 过滤会失真。
         """
         try:
             meta = note.meta

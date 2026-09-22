@@ -961,6 +961,76 @@ class TestMemoryTools:
         assert payload["ok"] is False
         assert (wiki_root / "notes" / "N-0001.md").read_text(encoding="utf-8") == before
 
+    def test_update_rejects_frontmatter_id_with_path_traversal(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """库内污染 id（frontmatter id 含 ../）：写前断言必须拒绝，沙箱外零落盘。
+
+        旧缺陷：_load 优先采用 frontmatter 的 id，save_note 直接拼
+        notes_dir/{id}.md —— 污染 id 会把修订写到 wiki 沙箱之外。
+        """
+        notes_dir = wiki_root / "notes"
+        notes_dir.mkdir(parents=True)
+        (notes_dir / "N-0001.md").write_text(
+            "---\n"
+            "id: ../../escaped\n"
+            'title: "污染笔记"\n'
+            "status: active\n"
+            "---\n"
+            "原正文\n",
+            encoding="utf-8",
+        )
+        payload = service.update_memory("N-0001", "新正文", "原因")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "validation_failed"
+        assert "文件名" in payload["error"]["message"]
+        # 写路径本会逃出 wiki 沙箱（notes/../../escaped.md → wiki-data 外），
+        # 修复后沙箱外无任何文件产生，原文件原样
+        assert not (wiki_root.parent / "escaped.md").exists()
+        raw = (notes_dir / "N-0001.md").read_text(encoding="utf-8")
+        assert "原正文" in raw and "新正文" not in raw
+
+    def test_update_rejects_frontmatter_id_mismatching_filename(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """良性 id≠文件名不一致也必须拒绝：旧行为会静默写出"新文件"而原文件不动。"""
+        _write_note(service, "正文", title="标题")
+        path = wiki_root / "notes" / "N-0001.md"
+        raw = path.read_text(encoding="utf-8")
+        assert "id: N-0001" in raw
+        path.write_text(raw.replace("id: N-0001", "id: N-0099", 1), encoding="utf-8")
+        payload = service.update_memory("N-0001", "新正文", "原因")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "validation_failed"
+        assert "文件名" in payload["error"]["message"]
+        # 没有按 frontmatter id 静默写出新文件，原文件保持原样
+        assert not (wiki_root / "notes" / "N-0099.md").exists()
+        meta, body = parse(path.read_text(encoding="utf-8"))
+        assert meta["id"] == "N-0099" and "新正文" not in body
+
+    def test_supersede_rejects_polluted_id_before_any_write(
+        self, service: WikiService, wiki_root: Path
+    ) -> None:
+        """取代流程的写前断言：污染 id 在写新笔记之前就被拒绝，无半成品状态。"""
+        notes_dir = wiki_root / "notes"
+        notes_dir.mkdir(parents=True)
+        (notes_dir / "N-0001.md").write_text(
+            "---\n"
+            "id: ../../escaped\n"
+            'title: "污染笔记"\n'
+            "status: active\n"
+            "---\n"
+            "原正文\n",
+            encoding="utf-8",
+        )
+        payload = service.supersede_memory("N-0001", "新内容", "原因")
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "validation_failed"
+        # 沙箱外无文件；新笔记（原会先落盘的替代笔记）也未被写出
+        assert not (wiki_root.parent / "escaped.md").exists()
+        assert not (notes_dir / "N-0002.md").exists()
+        assert "原正文" in (notes_dir / "N-0001.md").read_text(encoding="utf-8")
+
     def test_supersede_chains_old_to_new(self, service: WikiService, wiki_root: Path) -> None:
         _write_note(
             service, "GLM-5.3 支持 128k 上下文。", title="上下文长度",

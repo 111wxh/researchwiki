@@ -119,6 +119,27 @@ class FormationSettings:
     near_duplicate_similarity: float = DEFAULT_NEAR_DUPLICATE
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """宽容布尔解析：布尔写成字符串时按内容解析，非法值回退默认。
+
+    ``bool("false")`` 在 Python 里是 True——``enabled = "false"``（TOML 手误加
+    引号）曾因此静默失效：逃生阀拧不动、近重复拒绝照常触发。真布尔原样透传；
+    字符串只认 true/1/yes/on 与 false/0/no/off（大小写、首尾空白不敏感）；
+    其余非法字符串回退 default，不让配置错误打断研究链路（与 dedup_settings /
+    prior_settings 的宽容风格一致）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("false", "0", "no", "off"):
+            return False
+        if text in ("true", "1", "yes", "on"):
+            return True
+        return default
+    return bool(value)
+
+
 def from_config(config: Mapping[str, Any] | None = None) -> FormationSettings:
     """解析 formation 配置：接受完整 config（取 [formation] 段）或直接给段。
 
@@ -133,7 +154,7 @@ def from_config(config: Mapping[str, Any] | None = None) -> FormationSettings:
 
     enabled = section.get("enabled")
     if enabled is not None:
-        settings.enabled = bool(enabled)
+        settings.enabled = _coerce_bool(enabled, settings.enabled)
 
     value = section.get("min_body_chars")
     if value is not None:
@@ -144,7 +165,9 @@ def from_config(config: Mapping[str, Any] | None = None) -> FormationSettings:
 
     value = section.get("require_source_for_knowledge")
     if value is not None:
-        settings.require_source_for_knowledge = bool(value)
+        settings.require_source_for_knowledge = _coerce_bool(
+            value, settings.require_source_for_knowledge
+        )
 
     value = section.get("min_importance_to_persist")
     if value is not None:
