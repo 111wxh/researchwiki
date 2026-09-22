@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from researchwiki.cli import main
+from researchwiki.mcp_server.service import WikiService
 from researchwiki.wiki.entities import EntityRegistry
 from researchwiki.wiki.freshness import FreshnessSettings
 from researchwiki.wiki.frontmatter import SourceRef
@@ -385,8 +386,60 @@ def test_index_param_reports_stale_ids(tmp_path: Path):
         report = lint_wiki(store, index=index)
         assert report.details["index_checked"] is True
         assert report.details["index_stale"] == ["N-0002"]
+        assert "新增" in report.details["index_stale_reason"]
     # 不传 index 时跳过这项附加检查（不影响其它指标）
     assert "index_checked" not in lint_wiki(store).details
+
+
+def test_index_stale_agrees_with_shared_judgement_on_metadata_drift(tmp_path: Path):
+    """P2-F 修复轮 I-3：只改元数据（id 集不变）时 lint 与 health 必须同一结论。
+
+    v1 的 lint 判据只比"store 有、索引没有"的 id 集，于是只改 kind 的漂移下
+    ``health.index.stale=true`` 而 lint 的 ``details.index_stale=[]``——同一系统出现
+    第三个答案。现在两边都走 ``index.index_drift_analysis``。
+    """
+    store = make_store(tmp_path)
+    body = "观测记录\n旧机器：量子退火炉的初代读数甲。"
+    store.save_note(body, note_id="N-0001", title="观测记录", kind="knowledge")
+    with SearchIndex(store.root, tokenizer="trigram") as index:
+        index.rebuild(store)
+        # 只改 kind：正文/标题/status/id 集合全不变（旧口径下正是漏报的形态）
+        store.save_note(body, note_id="N-0001", title="观测记录", kind="user")
+        report = lint_wiki(store, index=index)
+        assert report.details["index_checked"] is True
+        assert report.details["index_stale"] == ["N-0001"]  # 不再是 []
+        assert "索引字段变化" in report.details["index_stale_reason"]
+        # lint 只读：不 rebuild（索引照旧落后）、不动结论与退出码
+        assert report.exit_code() == 0 and report.healthy
+
+    config = {"wiki": {"fts_tokenizer": "trigram"}}
+    service = WikiService(store.root, config=config)
+    index_info = service.health()["index"]
+    assert index_info["stale"] is True  # 与上面的 lint 结论一致
+    assert "索引字段变化" in index_info["stale_reason"]
+    # 索引被 rebuild 之后两边都判新鲜（同一判据、同一方向）
+    with SearchIndex(store.root, tokenizer="trigram") as index:
+        index.rebuild(store)
+        assert lint_wiki(store, index=index).details["index_stale"] == []
+    assert service.health()["index"]["stale"] is False
+
+
+def test_index_lag_skips_broken_or_foreign_index(tmp_path: Path):
+    """索引不可用（替身缺接口 / 查询报错）时跳过附加检查，绝不让 lint 失败。"""
+    store = make_store(tmp_path)
+    store.save_note("断言", note_id="N-0001")
+
+    class NoInterface:
+        pass
+
+    class Exploding:
+        def indexed_fingerprints(self) -> dict[str, tuple[str, str]]:
+            raise RuntimeError("索引坏了")
+
+    for broken in (NoInterface(), Exploding()):
+        report = lint_wiki(store, index=broken)  # type: ignore[arg-type]
+        assert "index_checked" not in report.details
+        assert report.exit_code() == 0
 
 
 # ---- CLI ---------------------------------------------------------------------

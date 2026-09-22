@@ -53,8 +53,12 @@ from researchwiki.wiki.freshness import (
     parse_ts,
 )
 
+# 索引一致性判据与 loop / MCP 路径**共用同一份实现**（P2-F 修复轮 I-3）：
+# index 依赖 store，lint 依赖 index 不构成环（wiki 包不从 lint 反向导入）。
+from researchwiki.wiki.index import index_drift_analysis
+
 if TYPE_CHECKING:  # 仅类型标注用：避免 wiki.index → store → loop.notes 的循环导入
-    from researchwiki.wiki.index import SearchIndex
+    from researchwiki.wiki.index import IndexDrift, SearchIndex
     from researchwiki.wiki.store import Note, WikiStore
 
 # 笔记 ID：N-0001 这类编号（frontmatter 之外的正文里出现即算引用）
@@ -338,10 +342,12 @@ def lint_wiki(
         "freshness_queue": [state.to_dict() for state in pending[:QUEUE_SHOWN]],
         "freshness_queue_total": len(pending),
     }
-    stale = _index_lag(index, {n.id for n in all_notes})
+    stale = _index_lag(store, index)
     if stale is not None:
         details["index_checked"] = True
-        details["index_stale"] = stale
+        details["index_stale"] = stale.note_ids
+        if stale.stale:
+            details["index_stale_reason"] = stale.reason
     # P2-F 健康度补齐（PLAN §3.3 验收第 5 条）：全部为**观测统计**，只读、不写盘、
     # 不进 healthy / exit_code。冲突复用 store.list_conflicts（不另造一套解析）。
     open_conflicts = store.list_conflicts(status="open")
@@ -421,18 +427,22 @@ def _resolve_reference(
     return target.id
 
 
-def _index_lag(index: SearchIndex | None, note_ids: set[str]) -> list[str] | None:
-    """索引落后于 md 的笔记 id 列表；读不到索引内部表时返回 None（跳过检查）。
+def _index_lag(store: WikiStore, index: SearchIndex | None) -> IndexDrift | None:
+    """索引一致性结果（共享判据 ``index.index_drift_analysis``）；读不到索引时返回 None。
 
-    MVP 的 best-effort：SearchIndex 没有公开的"列出已索引 id"接口，
-    这里直接读它持有的连接（缺失就跳过，绝不因索引不可用让 lint 失败）。
+    **P2-F 修复轮 I-3**：v1 只比"store 有、索引没有"的 id 集合，于是"只改元数据
+    （kind/volatility/tombstone 等）"的漂移下 ``health.index.stale=true`` 而 lint 的
+    ``details.index_stale=[]``，同一系统出现第三个答案。现在与 loop / MCP 路径
+    共用同一份判据（三点：id 集合 / status / **索引指纹**），``note_ids`` 是两方向
+    差异的并集（同样含"索引多了"），``stale`` 给出了与 health 一致的结论。
+
+    仍是 best-effort：索引不可用（没有 note_meta 表、连接不可用、替身对象缺接口）
+    时返回 None 跳过这项附加检查，绝不因索引坏掉让 lint 整体失败；只读，不 rebuild，
+    不影响 healthy / exit_code 与其它指标。
     """
-    conn = getattr(index, "_conn", None)
-    if conn is None:
+    if index is None:
         return None
     try:
-        rows = conn.execute("SELECT note_id FROM note_meta").fetchall()
-    except Exception:  # noqa: BLE001 -- 索引库结构异常时跳过这项附加检查
+        return index_drift_analysis(store, index)
+    except Exception:  # noqa: BLE001 -- 索引库结构异常/接口不匹配时跳过这项附加检查
         return None
-    indexed = {str(row[0]) for row in rows}
-    return sorted(note_ids - indexed)

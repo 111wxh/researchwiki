@@ -773,9 +773,25 @@ class SearchIndex:
 # ---- 索引一致性（MCP 与 loop 两条路径共用的唯一判据）-------------------------
 
 
-def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
+@dataclass
+class IndexDrift:
+    """一次索引一致性比对的结果：是否落后 / 原因 / 涉及的 note_id。
+
+    ``note_ids`` 是**两个方向**的差异并集（store 有索引没有的新增、status 变了的、
+    指纹变了的、旧库缺指纹的、索引多出 store 没有的），升序去重；新鲜时为空列表。
+    它是 lint 展示"哪些笔记的索引记录与 md 不一致"用的投影，与 ``stale`` /
+    ``reason`` 出自同一次比对——三者在同一份判据里产生，不会互相矛盾。
+    """
+
+    stale: bool
+    reason: str
+    note_ids: list[str]
+
+
+def index_drift_analysis(store: WikiStore, index: SearchIndex) -> IndexDrift:
     """索引是否落后于 store —— **唯一判据**，供 ``prior.ensure_index_fresh``（loop
-    路径）与 ``mcp_server.service._index_is_stale``（MCP 路径）共用。
+    路径）、``mcp_server.service._index_is_stale``（MCP 路径）与 ``wiki.lint``
+    （健康度）共用。
 
     放在 ``index.py``（而非 prior.py）的理由：这条判据问的是"索引自己记的检索
     视图与 store 现状是否一致"，两个输入（``note_index_hash`` 指纹函数、
@@ -801,10 +817,9 @@ def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
        "不知道索引里是哪版检索视图"。
 
     **只读**：不动 md、不写 index.db、**不 rebuild**——"落后了怎么办"是调用方的
-    决定（两条路径当前都选择整体 rebuild）。返回 ``(是否落后, 原因)``；原因里
-    点名具体 note_id（索引字段变化 / status 变化 / 新增 / 索引多余 / 缺指纹），
-    便于审计，文案与 P2-B 的 ``ensure_index_fresh`` 逐字兼容（陈旧态以
-    "索引落后于 store：" 开头，新鲜态说明"集合、status 与索引指纹均相同"）。
+    决定（loop / MCP 路径当前都选择整体 rebuild，lint 只报告）。原因文案与 P2-B 的
+    ``ensure_index_fresh`` 逐字兼容（陈旧态以"索引落后于 store：" 开头，新鲜态
+    说明"集合、status 与索引指纹均相同"）。
     """
     notes = store.list_notes(status=None)
     store_status = {n.id: n.status for n in notes}
@@ -814,8 +829,10 @@ def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
     if store_status == index_status and all(
         indexed[note_id][1] == store_hash[note_id] for note_id in store_status
     ):
-        return False, (
-            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与索引指纹均相同）"
+        return IndexDrift(
+            False,
+            f"索引与 store 一致（{len(store_status)} 条笔记，集合、status 与索引指纹均相同）",
+            [],
         )
     missing = sorted(set(store_status) - set(index_status))
     extra = sorted(set(index_status) - set(store_status))
@@ -839,7 +856,19 @@ def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
         parts.append(f"旧索引缺指纹（{len(legacy)} 条：{', '.join(legacy)}）")
     if extra:
         parts.append(f"索引多余: {', '.join(extra)}")
-    return True, f"索引落后于 store：{'；'.join(parts)}"
+    affected = sorted({*missing, *changed, *rehashed, *legacy, *extra})
+    return IndexDrift(True, f"索引落后于 store：{'；'.join(parts)}", affected)
+
+
+def index_drift(store: WikiStore, index: SearchIndex) -> tuple[bool, str]:
+    """``index_drift_analysis`` 的二元组投影：``(是否落后, 原因)``。
+
+    保留这个形状是为了兼容既有调用方与任务简报给定的签名；需要"涉及哪些 note_id"
+    （lint 的展示形态）时用 ``index_drift_analysis``——两个投影同源，不会给出
+    互相矛盾的结论。
+    """
+    analysis = index_drift_analysis(store, index)
+    return analysis.stale, analysis.reason
 
 
 def wiki_search(
