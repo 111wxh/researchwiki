@@ -608,3 +608,55 @@ def test_subagent_standalone_run_returns_fixed_schema(tmp_path):
         topic="t", provider=provider2, registry=registry, max_steps=2, token_budget=100_000
     )
     assert sub2.run().findings == "这不是 JSON"
+
+
+def test_subagent_final_step_withholds_tools(tmp_path):
+    """最后一步不提供工具，逼模型收尾输出 JSON。
+
+    真实观测：便宜档模型在能调用工具时会一路调到步数上限、从不主动收尾，
+    于是子 agent 交回的是被截断的半成品（steps 恒等于 max_steps）。
+    这里用一个「给工具就永远调工具、不给工具才作答」的 provider 复现该行为，
+    断言最后一步确实不提供工具，且结构化结果能正常解析。
+    """
+
+    class ToolUntilForcedProvider:
+        model = "mock-cheap"
+        tier = "cheap"
+
+        def __init__(self) -> None:
+            self.tools_seen: list[bool] = []
+
+        def stream(self, messages, *, system=None, tools=None):
+            self.tools_seen.append(bool(tools))
+            if tools:
+                yield StreamEvent(
+                    type="tool_calls",
+                    tool_calls=[call("web_search", {"query": "q"}, id="c1")],
+                )
+                return
+            yield StreamEvent(
+                type="text_delta",
+                delta='{"findings": "收尾结论", "notes": [{"text": "事实", "entities": '
+                '["E"], "confidence": "high"}], "sources": [{"url": "https://x", "title": "t"}]}',
+            )
+
+    provider = ToolUntilForcedProvider()
+    registry = build_sub_registry(
+        RunContext(
+            search_provider=MockSearch(), sources_dir=tmp_path / "s", wiki_root=tmp_path / "w"
+        )
+    )
+    sub = ResearchSubagent(
+        topic="测试主题",
+        provider=provider,
+        registry=registry,
+        max_steps=3,
+        token_budget=100_000,
+    )
+    result = sub.run()
+
+    assert provider.tools_seen == [True, True, False], "只有最后一步不给工具"
+    assert result.steps == 3
+    assert result.findings == "收尾结论"
+    assert [n["text"] for n in result.notes] == ["事实"]
+    assert result.sources == [{"url": "https://x", "title": "t"}]

@@ -31,6 +31,13 @@ SUBAGENT_SYSTEM = (
     '"sources": [{"url": "https://...", "title": "标题"}]}'
 )
 
+# 最后一步专用：不再提供工具，只要求把已有信息整理成结果 JSON
+SUBAGENT_FINAL_SYSTEM = (
+    SUBAGENT_SYSTEM
+    + "\n\n【最后一步】已到步数上限，不能再检索或精读。请立即基于**已经获得的信息**"
+    "输出上述 JSON；尚未查到的内容留空或在 findings 里说明，不要编造。"
+)
+
 
 def extract_json(text: str) -> dict[str, Any] | None:
     """从模型输出提取第一个完整 JSON 对象（容忍 ``` 围栏与前后缀说明文字）。"""
@@ -138,7 +145,7 @@ class ResearchSubagent:
         steps_used = 0
         stopped_by_budget = False
         last_text = ""
-        for _ in range(self.max_steps):
+        for step_index in range(self.max_steps):
             if self.input_tokens >= self.token_budget:
                 stopped_by_budget = True
                 break
@@ -146,7 +153,12 @@ class ResearchSubagent:
             parts: list[str] = []
             tool_calls: list[dict[str, Any]] | None = None
             usage: TokenUsage | None = None
-            for ev in self.provider.stream(messages, system=SUBAGENT_SYSTEM, tools=schemas):
+            # 实测便宜档模型在能调工具时会一路调到上限、从不主动收尾，于是返回的是被
+            # 截断的半成品。最后一步索性不提供工具，逼它基于已有信息输出结论 JSON。
+            is_final_step = step_index == self.max_steps - 1
+            system = SUBAGENT_SYSTEM if not is_final_step else SUBAGENT_FINAL_SYSTEM
+            tools = schemas if not is_final_step else None
+            for ev in self.provider.stream(messages, system=system, tools=tools):
                 if ev.type == "text_delta":
                     parts.append(ev.delta)
                 elif ev.type == "tool_calls" and ev.tool_calls:
