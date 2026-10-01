@@ -272,7 +272,9 @@ def decide_mode(features: PolicyFeatures, *,
                        "记忆覆盖充分且全部 fresh/stable，直接轻量作答")
     else:
         mode = MODE_UPDATE
-        reasons.append("覆盖度不足（命中数或分数低于 simple 门槛）→ 轻量研究")
+        reasons.append(f"覆盖度不足（hit_count={features.hit_count} < "
+                       f"{settings.coverage_min_hits} 或 top_score={features.top_score:.4f} < "
+                       f"{settings.coverage_min_score}）→ 轻量研究")
     # 守卫地板：守卫信号或覆盖不足在判（mode ≠ simple）→ 降级下限 update（PLAN §3.4 红线）。
     guard_floored = mode != MODE_SIMPLE
     if features.budget_remaining_ratio < settings.budget_floor and mode != MODE_SIMPLE:

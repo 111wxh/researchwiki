@@ -200,3 +200,10 @@ def test_budget_downgrade_pure_coverage_to_simple():
     s = policy_settings_from_config({"budget_floor": 0.5})
     d = decide_mode(_feats(budget_remaining_ratio=0.0), settings=s)
     assert d.mode == MODE_SIMPLE
+
+def test_insufficient_coverage_reason_records_values():
+    # 覆盖度不足分支的理由必须嵌入具体数值与阈值（全局红线：决策理由可审计）。
+    d = decide_mode(_feats(hit_count=1, top_score=0.005),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_UPDATE
+    assert "hit_count=1" in d.reasons[0] and "0.0050" in d.reasons[0]
