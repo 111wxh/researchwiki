@@ -54,7 +54,7 @@ class StreamEvent:
 
 class Provider(Protocol):
     model: str
-    tier: Literal["strong", "cheap"]
+    tier: Literal["strong", "cheap", "judge"]
 
     def stream(
         self,
@@ -75,13 +75,13 @@ class MockProvider:
         self,
         script: str | list[str],
         *,
-        tier: Literal["strong", "cheap"] = "strong",
+        tier: Literal["strong", "cheap", "judge"] = "strong",
         model: str = "mock-strong",
         usage: TokenUsage | None = None,
         delay: float = 0.0,
     ) -> None:
         self.script = [script] if isinstance(script, str) else list(script)
-        self.tier: Literal["strong", "cheap"] = tier
+        self.tier: Literal["strong", "cheap", "judge"] = tier
         self.model = model
         self.usage = usage or TokenUsage(input_tokens=1200, output_tokens=180)
         self.delay = delay
@@ -123,12 +123,12 @@ class ScriptedProvider:
         self,
         turns: list[list[StreamEvent]],
         *,
-        tier: Literal["strong", "cheap"] = "strong",
+        tier: Literal["strong", "cheap", "judge"] = "strong",
         model: str = "mock-strong",
         usage: TokenUsage | None = None,
     ) -> None:
         self.turns = [list(turn) for turn in turns]
-        self.tier: Literal["strong", "cheap"] = tier
+        self.tier: Literal["strong", "cheap", "judge"] = tier
         self.model = model
         self.usage = usage or TokenUsage(input_tokens=1200, output_tokens=180)
         self.calls: list[list[Message]] = []

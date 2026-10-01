@@ -44,7 +44,7 @@ class OpenAICompatibleProvider:
         *,
         base_url: str,
         model: str,
-        tier: Literal["strong", "cheap"] = "strong",
+        tier: Literal["strong", "cheap", "judge"] = "strong",
         api_key: str | None = None,
         api_key_env: str | None = None,
         temperature: float | None = None,
@@ -56,7 +56,7 @@ class OpenAICompatibleProvider:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.tier: Literal["strong", "cheap"] = tier
+        self.tier: Literal["strong", "cheap", "judge"] = tier
         self.temperature = temperature
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay

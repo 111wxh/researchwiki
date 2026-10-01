@@ -10,7 +10,7 @@ mode = "mock"
 delay = 0.04
 
 [llm]
-# strong / cheap 两档，OpenAI 兼容协议（POST {base_url}/chat/completions，SSE 流式）。
+# strong / cheap / judge 三档，OpenAI 兼容协议（POST {base_url}/chat/completions，SSE 流式）。
 # base_url 留空 = mock 模式：无需 API key，全链路可跑（router 返回 MockProvider）。
 # key 放到 api_key_env 指定的环境变量（写在项目根 .env 即可，.env 已 gitignore）。
 # 下面是智谱的可用组合；换厂商只改 model / base_url，不动代码，例如：
@@ -30,6 +30,18 @@ api_key_env = "RESEARCHWIKI_STRONG_API_KEY"
 model = "glm-4.5-air"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
+
+[llm.judge]
+# 评测判官（evals/judge.py）：给候选回答按 rubric 打三维分
+# （coverage 覆盖度 / citation 引用相符 / temporal 时效性，各 1–5）。
+# 评审必须强于被测模型——被测用 glm-4.5-air 时 judge 配 glm-4.7；
+# 被测模型升级时 judge 也要跟着换成更强的，否则评分没有区分度。
+# 成本口径：每题一次 judge 调用（一次打齐三维分，记账 step="evals:judge"）。
+# base_url 留空 = mock judge：测试与无 key 场景自动回退 MockProvider，
+# 分数无意义（仅用于管线测试，真实评测必须配强模型）。
+model = "glm-4.7"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "RESEARCHWIKI_JUDGE_API_KEY"
 
 [runtime]
 # 上下文超过窗口该比例触发 compaction（阶段 3）

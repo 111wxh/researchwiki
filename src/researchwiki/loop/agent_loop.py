@@ -151,7 +151,7 @@ def report_system(sources: list[dict[str, Any]], *, forced_reason: str = "") -> 
 # ---- 运行上下文与来源池 ----------------------------------------------------
 
 
-Tier = Literal["strong", "cheap"]
+Tier = Literal["strong", "cheap", "judge"]
 
 
 class TierRouter(Protocol):
