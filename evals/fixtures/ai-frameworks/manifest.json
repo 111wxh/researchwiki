@@ -1,0 +1,132 @@
+{
+  "domain": "ai-frameworks",
+  "provider_note": "fixture-corpus（受控合成语料，事实自洽，不依赖外部世界真实性）",
+  "docs": [
+    {
+      "doc_id": "langchain-core",
+      "title": "langchain-core：核心架构与运行时",
+      "url": "fixture://ai-frameworks/langchain-core",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langchain-core@v2",
+      "title": "langchain-core：核心架构与运行时（修订版）",
+      "url": "fixture://ai-frameworks/langchain-core@v2",
+      "version": "v2"
+    },
+    {
+      "doc_id": "langchain-agents",
+      "title": "langchain-agents：智能体执行循环",
+      "url": "fixture://ai-frameworks/langchain-agents",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langchain-memory",
+      "title": "langchain-memory：对话记忆组件",
+      "url": "fixture://ai-frameworks/langchain-memory",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langchain-retrievers",
+      "title": "langchain-retrievers：检索器家族",
+      "url": "fixture://ai-frameworks/langchain-retrievers",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langgraph",
+      "title": "langgraph：状态图编排",
+      "url": "fixture://ai-frameworks/langgraph",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langchain-versions",
+      "title": "LangChain 版本史",
+      "url": "fixture://ai-frameworks/langchain-versions",
+      "version": "v1"
+    },
+    {
+      "doc_id": "openai-python-sdk",
+      "title": "OpenAI Python SDK：客户端基础",
+      "url": "fixture://ai-frameworks/openai-python-sdk",
+      "version": "v1"
+    },
+    {
+      "doc_id": "openai-python-sdk@v2",
+      "title": "OpenAI Python SDK：客户端基础（修订版）",
+      "url": "fixture://ai-frameworks/openai-python-sdk@v2",
+      "version": "v2"
+    },
+    {
+      "doc_id": "openai-assistants",
+      "title": "OpenAI Assistants API：托管智能体",
+      "url": "fixture://ai-frameworks/openai-assistants",
+      "version": "v1"
+    },
+    {
+      "doc_id": "openai-structured-outputs",
+      "title": "OpenAI Structured Outputs：严格结构化输出",
+      "url": "fixture://ai-frameworks/openai-structured-outputs",
+      "version": "v1"
+    },
+    {
+      "doc_id": "openai-embeddings-api",
+      "title": "OpenAI Embeddings API：文本向量化",
+      "url": "fixture://ai-frameworks/openai-embeddings-api",
+      "version": "v1"
+    },
+    {
+      "doc_id": "openai-versions",
+      "title": "OpenAI SDK 与 API 版本史",
+      "url": "fixture://ai-frameworks/openai-versions",
+      "version": "v1"
+    },
+    {
+      "doc_id": "faiss",
+      "title": "FAISS：向量检索基石库",
+      "url": "fixture://ai-frameworks/faiss",
+      "version": "v1"
+    },
+    {
+      "doc_id": "chroma",
+      "title": "Chroma：轻量嵌入式向量库",
+      "url": "fixture://ai-frameworks/chroma",
+      "version": "v1"
+    },
+    {
+      "doc_id": "milvus",
+      "title": "Milvus：云原生分布式向量库",
+      "url": "fixture://ai-frameworks/milvus",
+      "version": "v1"
+    },
+    {
+      "doc_id": "milvus@v2",
+      "title": "Milvus：云原生分布式向量库（修订版）",
+      "url": "fixture://ai-frameworks/milvus@v2",
+      "version": "v2"
+    },
+    {
+      "doc_id": "embedding-models",
+      "title": "嵌入模型选型",
+      "url": "fixture://ai-frameworks/embedding-models",
+      "version": "v1"
+    },
+    {
+      "doc_id": "rag-architecture",
+      "title": "RAG 架构综述",
+      "url": "fixture://ai-frameworks/rag-architecture",
+      "version": "v1"
+    },
+    {
+      "doc_id": "framework-comparison",
+      "title": "多框架对比：LangChain 与 OpenAI SDK 生态",
+      "url": "fixture://ai-frameworks/framework-comparison",
+      "version": "v1"
+    },
+    {
+      "doc_id": "memory-systems",
+      "title": "记忆系统设计综述",
+      "url": "fixture://ai-frameworks/memory-systems",
+      "version": "v1"
+    }
+  ]
+}
