@@ -243,7 +243,12 @@ def _downgrade(mode: str) -> str:
 
 def decide_mode(features: PolicyFeatures, *,
                 settings: PolicySettings) -> PolicyDecision:
-    """确定性模式判定。规则顺序即优先级：守卫红线 > 覆盖度 > 预算降级 > forced。"""
+    """确定性模式判定。规则顺序即优先级：守卫红线 > 覆盖度 > 预算降级 > forced。
+
+    预算/时间降级受"守卫地板"约束：判定链上任一守卫信号（conflict、零覆盖、stale、
+    低置信、review_due、volatile，含覆盖不足路径）在判时，降级下限为 update——
+    simple 不做 fresh 搜索，不得把守卫信号路由成"无需搜索"（PLAN §3.4 验收红线）。
+    """
     reasons: list[str] = []
     if features.conflict_hits > 0:
         mode = MODE_DEEP
@@ -268,16 +273,31 @@ def decide_mode(features: PolicyFeatures, *,
     else:
         mode = MODE_UPDATE
         reasons.append("覆盖度不足（命中数或分数低于 simple 门槛）→ 轻量研究")
+    # 守卫地板：守卫信号或覆盖不足在判（mode ≠ simple）→ 降级下限 update（PLAN §3.4 红线）。
+    guard_floored = mode != MODE_SIMPLE
     if features.budget_remaining_ratio < settings.budget_floor and mode != MODE_SIMPLE:
-        reasons.append(f"budget_remaining_ratio={features.budget_remaining_ratio:.3f} < "
-                       f"budget_floor={settings.budget_floor} → 模式降一级")
-        mode = _downgrade(mode)
+        candidate = _downgrade(mode)
+        if guard_floored and candidate == MODE_SIMPLE:
+            reasons.append(f"budget_remaining_ratio={features.budget_remaining_ratio:.3f} < "
+                           f"budget_floor={settings.budget_floor} → 守卫地板：降级止于 update")
+            candidate = MODE_UPDATE
+        else:
+            reasons.append(f"budget_remaining_ratio={features.budget_remaining_ratio:.3f} < "
+                           f"budget_floor={settings.budget_floor} → 模式降一级")
+        mode = candidate
     if (settings.time_budget_seconds is not None
             and features.elapsed_seconds > settings.time_budget_seconds
             and mode != MODE_SIMPLE):
-        reasons.append(f"elapsed_seconds={features.elapsed_seconds:.1f} > "
-                       f"time_budget_seconds={settings.time_budget_seconds} → 模式降一级")
-        mode = _downgrade(mode)
+        candidate = _downgrade(mode)
+        if guard_floored and candidate == MODE_SIMPLE:
+            reasons.append(f"elapsed_seconds={features.elapsed_seconds:.1f} > "
+                           f"time_budget_seconds={settings.time_budget_seconds} → "
+                           "守卫地板：降级止于 update")
+            candidate = MODE_UPDATE
+        else:
+            reasons.append(f"elapsed_seconds={features.elapsed_seconds:.1f} > "
+                           f"time_budget_seconds={settings.time_budget_seconds} → 模式降一级")
+        mode = candidate
     forced = settings.forced_mode is not None
     if forced and settings.forced_mode != mode:
         reasons.append(f"forced_mode={settings.forced_mode} 覆盖规则判定 {mode}")

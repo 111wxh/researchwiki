@@ -186,3 +186,17 @@ def test_decision_to_dict_shape():
     assert payload["mode"] == MODE_SIMPLE and payload["forced"] is False
     assert isinstance(payload["features"], dict) and payload["reasons"]
     assert payload["limits"]["max_fresh_searches"] == 0
+
+def test_budget_downgrade_respects_guard_floor():
+    # 守卫信号（stale）在判时，预算降级止于 update：simple 不做 fresh 搜索，
+    # 不得把守卫信号路由成"无需搜索"（PLAN §3.4 验收红线）。
+    s = policy_settings_from_config({"budget_floor": 0.5})
+    d = decide_mode(_feats(stale_hits=1, fresh_hits=2, budget_remaining_ratio=0.0), settings=s)
+    assert d.mode == MODE_UPDATE
+    assert any("守卫地板" in r for r in d.reasons)
+
+def test_budget_downgrade_pure_coverage_to_simple():
+    # 守卫全零且覆盖达标的"覆盖充分"纯路径：simple 不受预算降级影响。
+    s = policy_settings_from_config({"budget_floor": 0.5})
+    d = decide_mode(_feats(budget_remaining_ratio=0.0), settings=s)
+    assert d.mode == MODE_SIMPLE
