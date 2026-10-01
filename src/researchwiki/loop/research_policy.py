@@ -6,8 +6,9 @@ token 预算余量），不引入分类器；每次判定必须带 features + re
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any
 
 from researchwiki.wiki.freshness import (
     FRESHNESS_REVIEW_DUE,
@@ -93,7 +94,8 @@ class PolicySettings:
     enabled: bool = True
     probe_k: int = 8                    # 覆盖度探测检索条数
     limits: Mapping[str, ModeLimits] = field(default_factory=lambda: dict(DEFAULT_LIMITS))
-    conflict_similarity: float = 0.3    # open 冲突与当前问题的 bigram 相似度门槛（同 [verification].similarity_floor 量级）
+    # open 冲突与当前问题的 bigram 相似度门槛（同 [verification].similarity_floor 量级）
+    conflict_similarity: float = 0.3
     coverage_min_hits: int = 2          # simple 要求的最小命中数
     # simple 要求的 top 分数下限。量级标定：RRF k=60 单通道 top1≈1/61≈0.0164，
     # 双通道 top1≈0.0328，再乘 confidence×freshness×importance 因子（0.5–1.0）；

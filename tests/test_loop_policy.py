@@ -113,6 +113,7 @@ def make_loop(
     strong_turns: list[list[StreamEvent]],
     question: str = QUESTION,
     retrieval_config: dict | None = None,
+    run_dir: Path | None = None,
     **kwargs,
 ) -> AgentLoop:
     strong = ScriptedProvider(strong_turns, model="mock-strong")
@@ -125,7 +126,7 @@ def make_loop(
         accountant=TokenAccountant(tmp_path / "tokens.jsonl"),
         search_provider=MockSearch(),
         wiki_root=tmp_path / "wiki-data",
-        run_dir=tmp_path / "run",
+        run_dir=run_dir if run_dir is not None else tmp_path / "run",
         # 检索确定性：dim=512 夹具间可区分；trigram 不探测 vendor DLL（同 test_loop_prior）
         embedding=MockEmbeddingProvider(dim=512),
         wiki_config={"fts_tokenizer": "trigram"},
@@ -370,4 +371,103 @@ def test_policy_json_outcome_backfilled_after_report(tmp_path: Path) -> None:
     assert "新鲜来源不足" in report
     assert "诚实边界" in report and "非引用缺失错误" in report
     # 正文 text-delta 事件仍是纯报告（提示块只落盘、不进流）
+    assert "".join(e["delta"] for e in events if e["type"] == "text-delta") == REPORT_TEXT
+
+
+# ---- 接线点行为断言（终审修复波）：模式限额真的生效，而非只留在 policy.json ----
+
+
+def test_mode_prior_k_reaches_retrieve_priors(tmp_path: Path) -> None:
+    """接线点①：模式限额的 prior_k 真的到达 retrieve_priors（run-metrics 可观测）。
+
+    4 条同题 fresh stable 笔记（active、无重定向，命中数只受 k 截断）：
+    - forced simple（limits.prior_k=3）→ prior_hit_count == 3；
+    - 对照 forced deep（limits.prior_k=5）→ min(4, 5) == 4。
+    两轮共用同一 wiki（蒸馏脚本无笔记，store 在两轮间不变、索引不漂移），
+    run_dir 分开以便各读各的 run-metrics.json。
+    """
+    store = WikiStore(tmp_path / "wiki-data")
+    for i in range(4):
+        store.save_note(
+            f"Zephyr 框架的内存占用约为 2KB（第 {i + 1} 份读数，来源一致）。",
+            title=f"内存占用（读数 {i + 1}）",
+            entities=["Zephyr"],
+            confidence="high",
+            volatility="stable",
+        )
+
+    loop_simple = make_loop(
+        tmp_path,
+        strong_turns=default_turns(),
+        retrieval_config={"enabled": True, "forced_mode": "simple"},
+    )
+    events_simple = list(loop_simple.events())
+    assert events_simple[-1]["type"] == "finish"
+    assert loop_simple.policy_decision.mode == "simple"
+    metrics_simple = load_metrics(tmp_path)
+    # simple 限额 prior_k=3：4 条候选只注入 3 条
+    assert loop_simple.policy_decision.limits.prior_k == 3
+    assert metrics_simple["prior_hit_count"] == 3
+
+    loop_deep = make_loop(
+        tmp_path,
+        strong_turns=default_turns(),
+        retrieval_config={"enabled": True, "forced_mode": "deep"},
+        run_dir=tmp_path / "run-deep",
+    )
+    events_deep = list(loop_deep.events())
+    assert events_deep[-1]["type"] == "finish"
+    assert loop_deep.policy_decision.mode == "deep"
+    # deep 基线对照：prior_k=5 → 候选只有 4 条，全部注入
+    metrics_deep = json.loads((tmp_path / "run-deep" / "run-metrics.json").read_text("utf-8"))
+    assert loop_deep.policy_decision.limits.prior_k == 5
+    assert metrics_deep["prior_hit_count"] == 4
+
+
+def test_effective_max_steps_truncates_act_loop(tmp_path: Path) -> None:
+    """接线点④：生效步数（simple limits.max_steps=3）真的截断 act 循环。
+
+    脚本让模型每轮都调 web_search（simple 的 0 搜索帽只拦 provider 调用，
+    不拦步数推进），forced simple 应在第 3 步以 max_steps 熔断——记账序列
+    是 plan/act:1..3/distill/report，而非构造默认 12 步。熔断观测口径照抄
+    tests/test_loop.py 的 max_steps 先例（记账步数、state.md 含 max_steps、
+    act 任务 done 详情带"熔断"、报告照常产出）。
+    """
+    loop = make_loop(
+        tmp_path,
+        strong_turns=[
+            text_turn(PLAN_TEXT),
+            tool_turn([call("web_search", {"query": "q1"}, id="c1")]),
+            tool_turn([call("web_search", {"query": "q2"}, id="c2")]),
+            tool_turn([call("web_search", {"query": "q3"}, id="c3")]),
+            text_turn(DISTILL_JSON),
+            text_turn(REPORT_TEXT),
+        ],
+        retrieval_config={"enabled": True, "forced_mode": "simple"},
+    )
+    events = list(loop.events())
+
+    assert events[0]["type"] == "start" and events[-1]["type"] == "finish"
+    # 恰好 3 次 act 调用（生效步数 = simple 限额 3，而非构造默认 12）
+    lines = (tmp_path / "tokens.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert [json.loads(line)["step"] for line in lines] == [
+        "plan",
+        "act:1",
+        "act:2",
+        "act:3",
+        "distill",
+        "report",
+    ]
+    assert loop.step_count == 3
+    assert loop.policy_decision.limits.max_steps == 3
+    # 熔断可见（test_loop.py 同口径）：state.md 带 max_steps，act 任务 done 详情带"熔断"
+    assert "max_steps" in load_state(tmp_path)
+    act_done = [
+        e
+        for e in events
+        if e["type"] == "data-task" and e["data"]["title"] == "执行研究（工具调用）"
+        and e["data"]["status"] == "done"
+    ]
+    assert act_done and "熔断" in act_done[0]["data"]["detail"]
+    # 熔断后仍产出完整报告文本（与 start/finish 包裹）
     assert "".join(e["delta"] for e in events if e["type"] == "text-delta") == REPORT_TEXT

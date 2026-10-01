@@ -5,7 +5,6 @@ from researchwiki.loop.research_policy import (
     MODE_DEEP,
     MODE_SIMPLE,
     MODE_UPDATE,
-    ModeLimits,
     PolicyFeatures,
     collect_features,
     decide_mode,
