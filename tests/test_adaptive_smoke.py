@@ -64,6 +64,7 @@ EXPECTED_ROW_KEYS = {
     "citation_coverage",
     "input_tokens_checked",
     "fresh_search_ladder_ok",
+    "cost_gap_ok",
 }
 
 
@@ -136,8 +137,10 @@ def test_mock_matrix_end_to_end(tmp_path, capsys) -> None:
         for mode in ("simple", "update", "deep")
     ]
     assert counts == sorted(counts)
-    # ③ 的行级留痕：mock 矩阵阶梯单调 → 每行盖章 true（断裂时 verify_rows 会判死）
+    # ③ / ② 成本半边的行级留痕：mock 矩阵两项判定都成立 → 每行盖章 true
+    # （断裂时 verify_rows 会判死，mock 硬闸仍有效）
     assert all(row["fresh_search_ladder_ok"] is True for row in rows)
+    assert all(row["cost_gap_ok"] is True for row in rows)
 
     # 每模式独立 wiki 根目录（warm 起跑、互不污染），且副本里确有 stale 种子笔记
     roots = [Path(row["wiki_root"]) for row in rows]
@@ -239,6 +242,55 @@ def test_ladder_assertion_mock_hard_config_soft(tmp_path) -> None:
 
     # 链上不足两个强制模式 → None（无可比较对，不把"未判定"伪装成"已通过"）
     assert adaptive.fresh_search_ladder_ok(make_rows("mock", (0,))) is None
+
+
+def test_cost_cap_hard_and_cost_gap_mock_hard_config_soft(tmp_path) -> None:
+    """断言 ② 拆分（fix-round 2 裁定）：0 帽半边全模式硬闸；成本半边 mock 硬、config 软。
+
+    0 帽半边（simple 零 fresh 搜索）是 loop 的结构性保证（搜索帽 0：达帽即拒、
+    provider 不被调用），与模式判定/模型行为无关 → mock/config 同闸；成本半边
+    （simple.input_tokens < deep.input_tokens）在 config 下只计算 + 留痕
+    （cost_gap_ok）+ 警示，不判死——真实 deep 的 token 量无结构性下界。
+    """
+
+    def make_rows(
+        provider_mode: str, counts: tuple[int, ...], ins: tuple[int, ...]
+    ) -> list[dict[str, Any]]:
+        modes = ("simple", "deep")[: len(counts)]
+        return [
+            {
+                "mode": mode,
+                "provider_mode": provider_mode,
+                "trace_id": f"t{index}",
+                "wiki_root": str(tmp_path),
+                "metrics": {"fresh_search_count": count, "input_tokens": value,
+                            "output_tokens": 0},
+            }
+            for index, (mode, count, value) in enumerate(
+                zip(modes, counts, ins, strict=True)
+            )
+        ]
+
+    # 0 帽半边：config 下 simple 搜了 1 次 → 硬闸失败（结构性保证，不分模式）
+    config_cap = make_rows("config", (1,), (100,))
+    failures = adaptive.verify_rows(config_cap)
+    assert any("fresh_search_count=1" in f and "== 0" in f for f in failures)
+
+    # 成本半边：config 下 simple(100) >= deep(90) → cost_gap_ok False 且不进失败清单
+    config_cost = make_rows("config", (0, 0), (100, 90))
+    assert adaptive.cost_gap_ok(config_cost) is False
+    assert not any("成本对照" in f for f in adaptive.verify_rows(config_cost))
+    # 同样数据在 mock 下 → 成本半边硬闸失败
+    mock_cost = make_rows("mock", (0, 0), (100, 90))
+    assert adaptive.cost_gap_ok(mock_cost) is False
+    assert any("成本对照" in f for f in adaptive.verify_rows(mock_cost))
+    # mock 下 simple 搜了 1 次 → 同样硬闸（0 帽半边 mock 侧回归保护）
+    assert any("fresh_search_count=1" in f for f in adaptive.verify_rows(
+        make_rows("mock", (1,), (100,))
+    ))
+
+    # 缺 deep → None（无可比对，不把"未判定"伪装成"已通过"）
+    assert adaptive.cost_gap_ok(make_rows("config", (0,), (100,))) is None
 
 
 def test_invalid_mode_rejected_by_argparse(tmp_path) -> None:

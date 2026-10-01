@@ -17,8 +17,13 @@
 <run_dir>/policy.json（P3 模式判定留痕），verify_rows 做实断言（③ 按模式分治）：
 
   1. 每行 policy 含 features 与非空 reasons（PLAN §3.4 验收：不允许裸模式字符串）；
-  2. mock 下 simple.input_tokens < deep.input_tokens 且 simple.fresh_search_count == 0
-     （simple 不做 fresh 搜索：帽=0 + 剧本也不给搜索轮）；
+  2. **拆两半（fix-round 2 裁定）**：
+     a) simple.fresh_search_count == 0——全模式硬闸：simple 的搜索帽=0 是 loop 的
+        结构性保证（达帽即拒、provider 不被调用、计数不增长），与模式判定/模型
+        行为无关，mock/config 同闸；
+     b) simple.input_tokens < deep.input_tokens——mock 硬闸；config 只计算、打印
+        警示、落盘留痕（cost_gap_ok 字段）、不判死：真实 deep 的 token 量无结构性
+        下界——act 第 1 步即纯文本收尾时，调用形状退化为与 simple 相同；
   3. simple ≤ update ≤ deep 的 fresh_search_count 单调（矩阵的"检索深度阶梯"）——
      **mock 硬闸；config 只计算、打印警示、落盘留痕（fresh_search_ladder_ok 字段）、
      不判死**：真实模型的搜索次数是在帽内自选的（update 帽 2、deep 帽 4、可选 0），
@@ -84,11 +89,12 @@ store 整体重建（含手工 stale 笔记），检索口径不变、确定性�
    "model", "metrics": {…run-metrics.json 14 字段原文…},
    "policy": {…policy.json 原文（mode/forced/features/reasons/limits/outcome）…},
    "report_chars", "citation_coverage", "input_tokens_checked",
-   "fresh_search_ladder_ok": bool | None}
-fresh_search_ladder_ok 是断言 ③ 的行级留痕值（全部行同值盖章）：链上在场的强制
-模式（simple/update/deep 中实际在跑的）fresh_search_count 单调不减 → true，断裂
-→ false；链上不足两个强制模式 → None（无可比较对，不把"未判定"伪装成"已通过"）。
-mock 下 false 即断言失败；config 下 false 只打印警示、不判死。
+   "fresh_search_ladder_ok": bool | None, "cost_gap_ok": bool | None}
+fresh_search_ladder_ok 是断言 ③ 的行级留痕值、cost_gap_ok 是断言 ② 成本半边的行级
+留痕值（两者全部行同值盖章，语义对齐）：判定成立 → true，不成立 → false；无可比对
+（链上不足两个相关模式）→ None（不把"未判定"伪装成"已通过"）。mock 下 false 即
+断言失败；config 下 false 只打印警示、不判死（② 的 0 帽半边不经过该字段——它是
+全模式硬闸，恒结构性成立）。
 --out 缺省 PROJECT_ROOT/smoke_out/adaptive_{provider}_{ts}.jsonl；传目录
 （如 --out smoke_out）则把默认文件名写进该目录；传 *.jsonl 则按字面路径。
 --json <path> 另存机器可读汇总（含断言结论）。stdout 末段是模式对照表并注明
@@ -424,8 +430,30 @@ def fresh_search_ladder_ok(rows: Sequence[Mapping[str, Any]]) -> bool | None:
     return not ladder_breaks(rows)
 
 
+def cost_gap_ok(rows: Sequence[Mapping[str, Any]]) -> bool | None:
+    """断言 ② 成本半边的行级留痕值：simple.input_tokens < deep.input_tokens。
+
+    与 fresh_search_ladder_ok 语义对齐：True 成立 / False 不成立 / None = simple 或
+    deep 缺席（无可比对，不把"未判定"伪装成"已通过"）。0 帽半边（simple 零 fresh
+    搜索）是结构性保证、全模式硬闸，不经过本函数（见 verify_rows ②）。
+    """
+    by_mode = {str(row.get("mode")): row for row in rows}
+    simple = by_mode.get(MODE_SIMPLE)
+    deep = by_mode.get(MODE_DEEP)
+    if simple is None or deep is None:
+        return None
+    s_in = int((simple.get("metrics") or {}).get("input_tokens") or 0)
+    d_in = int((deep.get("metrics") or {}).get("input_tokens") or 0)
+    return s_in < d_in
+
+
 def verify_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
-    """硬断言 ①②④⑤ + ③ 的 mock 硬闸（详见模块 docstring；空列表 = 全部通过）。"""
+    """硬断言 ①③④⑤ 的硬闸半边 + ② 的拆分（详见模块 docstring；空列表 = 全部通过）。
+
+    ② 拆两半（fix-round 2 裁定）：0 帽半边（simple 零 fresh 搜索）全模式硬闸；
+    成本半边（simple.input_tokens < deep.input_tokens）mock 硬闸、config 只计算
+    （main 警示 + 行级 cost_gap_ok 留痕），不判死。
+    """
     failures: list[str] = []
     if not rows:
         return ["没有任何结果行，无法验证（矩阵至少要跑出一个模式）"]
@@ -447,27 +475,33 @@ def verify_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     by_mode = {str(row.get("mode")): row for row in rows}
     provider_mode = str(rows[0].get("provider_mode"))
 
-    # ② mock 成本对照：simple < deep 且 simple 零 fresh 搜索（config 模式不设此断言：
-    #    真模型各模式成本受真实剧本/搜索影响，只做 ③⑤ 的口径校验）
-    if provider_mode == "mock":
-        simple = by_mode.get(MODE_SIMPLE)
+    # ② 拆两半（fix-round 2 裁定）：
+    #    a) 0 帽半边：simple 零 fresh 搜索——**全模式硬闸**（搜索帽 0 是 loop 的结构性
+    #       保证：达帽即拒、provider 不被调用、计数不增长，与模式判定/模型行为无关，
+    #       mock/config 同闸）；
+    #    b) 成本半边：simple.input_tokens < deep.input_tokens——mock 硬闸；config 只
+    #       计算（main 警示 + 行级 cost_gap_ok 留痕）、不判死：真实 deep 的 token 量
+    #       无结构性下界（act 第 1 步即纯文本收尾时，调用形状退化为与 simple 相同）。
+    simple = by_mode.get(MODE_SIMPLE)
+    if simple is not None:
+        s_searches = int(
+            (simple.get("metrics") or {}).get("fresh_search_count") or 0
+        )
+        if s_searches != 0:
+            failures.append(
+                f"[simple] fresh_search_count={s_searches}，必须 == 0"
+                "（搜索帽=0 是结构性保证：达帽即拒、provider 不被调用——mock/config 同闸）"
+            )
+    if provider_mode == "mock" and simple is not None:
         deep = by_mode.get(MODE_DEEP)
-        if simple is not None and deep is not None:
+        if deep is not None:
             s_in = int((simple.get("metrics") or {}).get("input_tokens") or 0)
             d_in = int((deep.get("metrics") or {}).get("input_tokens") or 0)
             if s_in >= d_in:
                 failures.append(
                     f"mock 成本对照失败：simple.input_tokens={s_in} 必须 < "
-                    f"deep.input_tokens={d_in}（轻量模式的成本优势必须可测得）"
-                )
-        if simple is not None:
-            s_searches = int(
-                (simple.get("metrics") or {}).get("fresh_search_count") or 0
-            )
-            if s_searches != 0:
-                failures.append(
-                    f"mock simple fresh_search_count={s_searches}，必须 == 0"
-                    "（simple 的搜索帽=0：fresh 检索一律不做）"
+                    f"deep.input_tokens={d_in}（轻量模式的成本优势必须可测得；"
+                    "config 模式此半边只留痕警示不判死）"
                 )
 
     # ③ fresh 搜索沿 simple ≤ update ≤ deep 单调——按模式分治（fix-round 裁定）：
@@ -728,11 +762,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("（config 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）")
         return EXIT_RUN_ERROR
 
-    # 断言 ③ 的行级留痕盖章（每行同值，判定内核唯一）：mock 下 false 即硬闸失败；
-    # config 下 false 只打警示不判死——留痕先于 JSONL 写盘，警示与硬闸用的是同一份结论
+    # 断言 ③ / ② 成本半边的行级留痕盖章（每行同值，判定内核唯一）：mock 下 false
+    # 即硬闸失败；config 下 false 只打警示不判死——留痕先于 JSONL 写盘，警示与硬闸
+    # 用的是同一次计算（② 的 0 帽半边是全模式硬闸，不经过留痕字段）
     ladder_ok = fresh_search_ladder_ok(rows)
+    gap_ok = cost_gap_ok(rows)
     for row in rows:
         row["fresh_search_ladder_ok"] = ladder_ok
+        row["cost_gap_ok"] = gap_ok
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
@@ -754,6 +791,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"⚠️ config 模式阶梯非单调（{counts}），已留痕不判死——"
             "真实模型自选搜索次数所致（fresh_search_ladder_ok=false 已写入 JSONL）"
+        )
+    if args.provider == "config" and gap_ok is False:
+        # ② 成本半边在 config 模式只警示不判死（fix-round 2 裁定）：真实 deep 的
+        # token 量无结构性下界，比较留痕供评测复算，不作 forced 阶梯的验收门
+        def input_of(mode: str) -> int:
+            row = next(r for r in rows if r["mode"] == mode)
+            return int((row.get("metrics") or {}).get("input_tokens") or 0)
+
+        print(
+            f"⚠️ config 模式成本对照不成立（simple={input_of(MODE_SIMPLE)}，"
+            f"deep={input_of(MODE_DEEP)}，input_tokens 未严格小于），已留痕不判死——"
+            "真实模型步数自选所致（cost_gap_ok=false 已写入 JSONL）"
         )
     if args.json:
         cws.write_json(
@@ -781,6 +830,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_ASSERT_FAILED
 
     auto_row = next((row for row in rows if row["mode"] == MODE_AUTO), None)
+    if gap_ok is None:
+        cost_text = "② simple 零 fresh 搜索（全模式硬闸）；成本对照无可比对（留痕 None）"
+    elif gap_ok:
+        cost_text = "② simple 零 fresh 搜索（全模式硬闸）且成本 < deep"
+    else:
+        # 走到通过行说明是 config 模式（mock 的成本对照失败在 failures 分支已退出）
+        cost_text = "② simple 零 fresh 搜索（全模式硬闸）；成本对照不成立（config 留痕不判死）"
     if ladder_ok is None:
         ladder_text = "③ fresh 搜索阶梯无可比较对（未判定，留痕 None）"
     elif ladder_ok:
@@ -791,7 +847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("-" * 76)
     print(
         "✓ 断言通过：① 每行 policy 全量带 features+reasons；"
-        "② mock 下 simple 成本 < deep 且 simple 零 fresh 搜索；"
+        f"{cost_text}；"
         f"{ladder_text}；"
         + (
             f"④ auto 守卫红线复验（stale_hits={auto_row['policy']['features']['stale_hits']} "
