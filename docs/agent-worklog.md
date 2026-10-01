@@ -172,9 +172,70 @@
 
 ## 9. P3 · Dynamic Retrieval 会话（2026-10-01）
 
-> 新会话（与第 1–7 节的 2026-09-22 会话无共享上下文）。计划：`docs/superpowers/plans/2026-10-01-p3-dynamic-retrieval.md`（实现 PLAN §3.4），SDD 工作区 `.superpowers/sdd/2026-10-01-p3-dynamic-retrieval/`（gitignored，本节为其完整存档——工作区已按惯例清除，git 历史与本节为唯一记录）。子智能体全部继承会话模型（startplan GLM-5.3-Flash，用户指示）。测试 **703 → 747** 全绿；提交 17 个（`0149446..<worklog>`），全部已推送。
+> 新会话（与第 1–7 节的 2026-09-22 会话无共享上下文）。计划：`docs/superpowers/plans/2026-10-01-p3-dynamic-retrieval.md`（实现 PLAN §3.4），SDD 工作区 `.superpowers/sdd/2026-10-01-p3-dynamic-retrieval/`（gitignored，本节为其完整存档——工作区已按惯例清除，git 历史与本节为唯一记录）。子智能体全部继承会话模型（startplan GLM-5.3-Flash，用户指示）。测试 **703 → 747** 全绿；提交 17 个（`0149446..08a7f23`），全部已推送。
 
-### 9.1 交付物（对照 PLAN §3.4 五项）
+### 9.1 会话准备（监察者）
+
+- 读取 PLAN §3.4（Dynamic Retrieval 规格）与 §2.4 因子表，确认 P3 无任何既有代码；核对 worklog §7 移交三项（①替换门明文化 ②merge 下限 ③F7 护栏）——均非 P3 阻塞，登记为范围外。
+- 派侦察者 `b5b67e42`（Explore，只读）：产出 10 节接口报告——store/index 检索打分链（RRF×confidence×freshness，importance 未进因子）、`memory_recall` 的 "P3 钩子位"（passthrough）、AgentLoop 五个接线点与 `*_config=None=关闭` 约定、tokens.jsonl/run-metrics 14 字段契约、config 键位、cold_warm_smoke 冒烟范式、测试惯例（ScriptedProvider/MockEmbedding/注入时钟）、703 基线。
+- 撰写实施计划（9 任务、逐步 TDD、全局约束、自审记录），落 `docs/superpowers/plans/2026-10-01-p3-dynamic-retrieval.md`（后随 worklog 一并入库 `08a7f23`）。
+- 建 SDD 工作区与台账；预检裁定 R0（main 直推沿用逐交付 push 协议；子智能体不传 model 覆盖）+ 任务对产出→消费冲突扫描表（9 对，全一致）。
+
+### 9.2 逐任务操作与产物
+
+**Task 1 — 策略配置与模式限额表（`loop/research_policy.py` 骨架）**
+- **实现者** `95194f91`：按 brief 逐字转写 `ModeLimits`/`PolicySettings`/`policy_settings_from_config`（缺省=simple(3,1200,0,3,brief,0)/update(5,4000,2,6,standard,1)/deep(5,4000,4,12,full,0) 阶梯；越界夹取；非法 forced_mode 拒绝）+ 3 测试。TDD RED（ModuleNotFoundError）→ 全量 706。产物：`7a0528b`。
+- **评审者** `42327671`：Spec ✅（签名/默认值逐字核对）+ Approved；Minor 4（未用 import、两阈值无夹取、override 裸 TypeError、limits 可变 dict）。
+- **备注**：push 时仓库代理（127.0.0.1:7897）不可用，一次性 `git -c http.proxy= push` 成功；本次会话后续 push 时好时坏（TLS 抖动），均留待补推并最终清零。
+
+**Task 2 — 五因子特征采集 `collect_features`**
+- **实现者** `83cb2434`：`PolicyFeatures`（11 字段+to_dict）+ `collect_features`（探测检索→freshness 三态计数→volatility 排名→低置信→冲突按 `token_similarity ≥ conflict_similarity` 全库扫描）+ 5 测试（PLAN 五类场景种子的特征层）。机械适配 4 处，关键是 **UTC-aware NOW**（naive 时钟会在有 observed_at 的笔记上 aware/naive 相减 TypeError）。706→711。产物：`5ba85e5`。
+- **评审者** `c43f83d2`：Spec ✅ + Approved；4 处适配逐一核实（UTC 一项独立确认必要）；对源核验 `Conflict.question`/`SearchMatch`/`evaluate_freshness` 签名全部成立；Minor 3（hit_count 含 get_note=None 匹配、_VOLATILITY_RANK 词表外 KeyError 等）。
+
+**Task 3 — `decide_mode` 确定性判定（2 修复轮 + 跨任务饱和修复）**
+- **实现者** `a0c5f918`：`PolicyDecision`+`decide_mode`（守卫红线>覆盖度>预算降级>forced，理由全带数值）+ 9 测试。711→720。产物：`1b62586`。
+- **主动申报**：预算降级可穿透守卫（stale 触发的 update 被降到 simple=零 fresh 搜索）→ 监察者裁定 **R1（守卫地板）** → **修复轮 1**：`guard_floored` 钉回 update+理由留痕 + 2 测试。720→722。产物：`421e0e5`。
+- **评审者** `e7d12ce3`：Approved；**穷举守卫×覆盖度×预算×时间×forced 全组合矩阵**核验红线成立（含连续降级不可能落 simple 的证明）；挑出 1 条 Important（plan-mandated）："覆盖度不足"分支理由为静态字符串、缺具体数值 → 监察者裁定 **R2** → **修复轮 2**：f-string 嵌入数值与阈值 + 1 测试。722→723。产物：`f5e884c`。
+- **复审者** `f4db1062`：ADDRESSED，无新破坏（并核实新测试的分支可达性与断言必然性）。
+- **会话尾段（真实冒烟闸④抓到缺口，见 Task 9）**：同一实现者执行 **R3 修复**——守卫信号改全库相关性门控扫描（`list_notes(active)` 全量、排除窗口内 note_id、stale/review_due/低置信 × `token_similarity(title+body[:400])` 门控；docstring 记录真实教训与 PLAN §3.4 依据）+ 2 测试（拥挤窗口 RED 精确复现冒烟缺口：`hit_count=8, stale_hits=0`）。743→745。产物：`ee96667`。
+- **复审者** `75dfffe6`：6 项裁定逐条 ADDRESSED；确认零模型、同一性去重、400 字截断有界、`decide_mode` 未动；O(笔记文件数) 磁盘 I/O 记 deferred（10k+ 优化目标）。
+
+**Task 4 — importance 进检索排名因子（`wiki/index.py`）**
+- **实现者** `07499d81`：`note_meta` 加 `importance REAL` 列 + `_migrate_note_meta` PRAGMA 探测迁移（存量 NULL→因子 0.8 中性）+ `note_index_hash` 扩展第 11 字段（旧行哈希失配→drift→rebuild，docstring 预留约定兑现）+ 打分改四因子全乘 + 3 测试（含按真实 13 列 DDL 复刻旧库）。**自发表扬点**：发现 `0.0` 与 `None` 因子不同（0.5 vs 0.8）若同指纹会互改逃过 drift——显式判 None 而非 `or ""`。723→726。产物：`1e86b9e`。
+- **评审者** `b55d2fb1`：Approved；迁移-on-open、drift→rebuild、NULL 可检索三约束均有代码+测试证据；grep 确认 index.py 是 note_meta 唯一写入方；Minor 2。
+
+**Task 5 — AgentLoop 接线（最重集成任务）**
+- **实现者** `22d80e9e`：五处接线全部落地——①判定先于 Prior 注入（复用 ensure_index_fresh 后同源 store/index，探测幂等）②`run_dir/policy.json`（atomic write，outcome 报告后回填 fresh_source_count/min_fresh_sources）+ state.md `retrieval:` 行 ③prior k/max_chars 被模式限额覆盖 ④搜索帽（超帽返回 `search_budget_exhausted`，不调 provider 不计数）、子代理门（不注册 dispatch_research）、生效步数 ⑤brief 报告后缀 + 诚实缺口块（只落盘不进事件流）；`server/main.py` 两键接线。+ 6 行为测试（legacy 逐字段等价、留痕、搜索帽、stale 不落 simple、回填）。726→732。产物：`f0e24c0`。
+- **评审者** `759cc505`：Approved（50KB diff 分遍审完）；两个聚焦风险核验安全（注册表重建与原构造严格同构不丢工具、ensure_index_fresh 幂等无双重建）；披露的"搜索帽同口径扩到子注册表"核验无双计数、不封堵合法深搜。
+- **终审修复波**由同一实现者执行（见本节末"终审"段）。
+
+**Task 6 — MCP `memory_recall` 升级 budget-aware**
+- **实现者** `0692256f`：`recall` 从 passthrough 升级——特征（budget_remaining_ratio=1.0，docstring 写明 MCP 无 loop 账本）→判定→结果宽度 `min(count, limits.prior_k)` 收窄（results/count/k 同步）→`payload["mode"]`+`policy` 透传；passthrough 基线（缺段/enabled=false）在策略导入**之前**返回（防漂移）；工具签名不变 + 4 测试（含进程内 MCP client 协议面测试）。732→736。产物：`977a1d5`。
+- **评审者** `0faae2b4`：Approved；三个具名风险核验（索引无重复重建、基线零漂移、k<prior_k 不过度收窄）；挑出 1 条 Important（plan-mandated）：simple 收窄断言是条件式（else 空洞通过，核心交付从未被断言）→ 监察者裁定 **R5** → **修复轮**：无条件断言 + 补 enabled=false 逃生阀测试。736→737。产物：`594fa3c`。
+- **复审者** `d0d3b6f7`：ADDRESSED；并复核无条件断言的确定性依据（blake2b 嵌入不按进程加盐、trigram 确定性、top_score 0.0232 ≥ 0.010）。
+
+**Task 7 — config.toml `[retrieval]` 段**
+- **实现者** `8ead50ba`：TOML 段+中文注释（模式阶梯/守卫红线/留痕口径/enabled=false 逃生阀；可选键保持注释态）+ 默认值锁定测试（解析真实 config.toml）。如实记录 TDD 反转（缺段即过——测试的真实职责是锁"注释默认值==代码默认值"）；自检 TOML 与代码默认值全等（含 limits）。737→738。产物：`6561819`。
+- **评审者** `3cb16161`：Approved；逐项对照 research_policy.py 全部 26 个值（四个表含边界）确认零行为漂移；Minor 2（锁定测试仅锁 2 值等）。
+
+**Task 8 — `scripts/adaptive_smoke.py` 同题跨模式对照（2 修复轮）**
+- **实现者** `39efb374`：播种（forced deep 产记忆 + 手工 stale 笔记）→ `copytree` 每模式独立副本（排除 index.db，Windows 锁；首查 ensure_index_fresh 重建）→ simple/update/deep/auto 四行矩阵 → 五道验收闸 + tokens.jsonl 对账（不变量 ⑥）。剧本适配：update 语义化为 plan+一次搜索+收尾+report（plan 轮 tool_calls 会被 loop 静默忽略——对照源码证实）、deep 补一次 MockTransport 离线 fetch 使成本阶梯严格单调；`run_mode_once` 自有实现，**cold_warm_smoke 零改动**（P2 证据脚本冻结）。738→741；mock 自跑 EXIT=0，证据落 `smoke_out/adaptive_mock_*.jsonl`。产物：`5d1827a`。
+- **评审者** `16838bca`：Approved；五闸逐字核验（读 metrics 原文非重算；stale 种子固定 observed_at 非时敏）；三个剧本适配对照 loop/policy/freshness 源码逐一验证；留控制器标记：断言③真实模型下非确定。
+- 监察者裁定 **R4（修复轮 1/2）**：③ config 留痕警示（`fresh_search_ladder_ok`，None=未判定不假绿）→742 `d4c4d86`；② 拆分（0 帽半边 mock/config 同闸硬；成本半边 `cost_gap_ok` config 软）→743 `cb6c592`。判定内核唯一（盖章与闸共用）。
+- **复审者** `37d43319`：两裁定 ADDRESSED；核实盖章先于写盘、子集 run 的 None 语义不假绿不假红；1 条 Minor（mock 成本硬闸内联重算未共用内核，行为无漂移可能）。
+
+**Task 9 — 终验 + 真实冒烟 + 交付记录（监察者执行）**
+- 全量 743 复跑通过；授权真实模型对照（R6，5 个真实 run）。
+- **第一次真实 run：闸④失败（退出码 1，闸门正确拦下）**——auto 误判 simple。取证 `policy.json`：`hit_count=8, stale_hits=0, top_score=0.0145`——seed deep 产的 8 条同题 fresh 笔记把手工 stale 笔记（N-0009）挤出 probe_k=8 窗口，策略没看见它。失败数字留档 `smoke_out/adaptive_config_20261001T080844Z.jsonl`（simple 9360/0、update 16492/2、deep 75059/4、auto(simple) 6899/0）。
+- 裁定 **R3** 并派回 `a0c5f918` 修复（见 Task 3 段）→ **复跑五闸全过**：simple 9,296/0、update 16,271/2、deep 38,068/4、**auto=update**（stale_hits=1 被全库扫描抓到）18,163/2；auto vs deep 输入 token **−52.3%**、时延 −20.2%、citation_coverage 1.0 持平。证据 `adaptive_config_20261001T083359Z.jsonl`。
+- 用户 09-30 遗留的 mcp-memory 文档登记单独成 commit `fa9a07a`（代码目录按边界声明保持未跟踪）；worklog 本节 + 计划文件入库 `08a7f23`。
+
+**终审（全分支）与修复波**
+- **终审者** `7b136d0b`（`0149446..ee96667` 全 178KB diff + 账本 13 条缓还分类）：**With fixes**——代码本身可合入（跨路径一致性、迁移安全、两条红线由本阶段自己的闸抓到并修复、真实证据对账相符）；2 条 Important（worklog 交付记录缺失——即本节；接线①④无行为断言）；Minor 若干含 1 条计划层观察（预算因子结构性惰性）。
+- **修复波**（`22d80e9e` resume，一次打包）：`test_mode_prior_k_reaches_retrieve_priors`（4 条同题笔记，forced simple→prior_hit_count==3，deep 对照==4）+ `test_effective_max_steps_truncates_act_loop`（max_steps=3 熔断，记账序列 plan/act:1..3/distill/report，观测口径照抄 test_loop.py 先例）+ lint 3 条清零（UP035/E501/F401，零运行时影响）。745→747。产物：`6e26195`。
+- **复审者** `a168958b`：3 项全 ADDRESSED；确认两测试走真实产物（run-metrics/tokens.jsonl/state.md/事件）而非 mock 接线，且真正有判别力（无截断时记账序列断言会失败）；修复波范围约束（"除此之外一行不动"）遵守。
+
+### 9.3 交付物（对照 PLAN §3.4 五项）
 
 | 计划交付物 | 产物 | 任务 |
 |---|---|---|
@@ -186,17 +247,17 @@
 
 附加交付（PLAN §2.4 因子表落地）：`wiki/index.py` importance 进排名（RRF×confidence×freshness×importance；旧库 ALTER 迁移 + `note_index_hash` 扩展→drift→rebuild；0.0/None 指纹碰撞规避）；`mcp_server/service.py` `memory_recall` 从 passthrough 升级 budget-aware（"P3 钩子位"兑现）。
 
-### 9.2 验收（对照 §3.4 退出条件，含诚实边界）
+### 9.4 验收（对照 §3.4 退出条件，含诚实边界）
 
 1. **决策留痕**：每次判定 policy.json 全量 features+reasons+limits；冒烟闸①硬性核对（不允许裸模式字符串）。
 2. **simple 低于 deep baseline**：mock 硬闸（4800<5700<6600 input tokens 严格单调）；真实 run simple 9,296 vs deep 38,068（−75.6%），时延 45.3s vs 73.4s。
-3. **守卫红线**：decide_mode 守卫 + 预算降级守卫地板 + **全库相关性门控扫描**（见 9.3 裁定 R3）；冒烟闸④ mock 硬闸，真实 run 曾失败并由此抓出真缺口（见下）。
+3. **守卫红线**：decide_mode 守卫 + 预算降级守卫地板 + **全库相关性门控扫描**（见 9.5 裁定 R3）；冒烟闸④ mock 硬闸，真实 run 曾失败并由此抓出真缺口（见下）。
 4. **质量不劣化**：citation_coverage 1.0（auto/update/simple）vs deep 1.0（真实 n=1）；`enabled=false` 无路由 baseline 保留且经 legacy 等价性测试锁定；正式 QA 对照属评测支线（PLAN §7），不在本阶段口径内。
 5. **总闸（同题不同模式成本下降、质量不劣化）**：真实 run auto（策略自然判定 update）vs deep = 18,163 vs 38,068 input tokens（**−52.3%**）、时延 −20.2%、引用覆盖持平。小样本（n=1），不构成收益结论（§11.1），可重复性留评测支线。
 
 真实证据：`smoke_out/adaptive_config_20261001T080844Z.jsonl`（修复前，闸④失败留档）与 `adaptive_config_20261001T083359Z.jsonl`（修复后，五闸全过）；mock：`adaptive_mock_20261001T075951Z.jsonl`。
 
-### 9.3 关键裁定（全录，工作区已清除，此处为唯一存档）
+### 9.5 关键裁定（全录，工作区已清除，此处为唯一存档）
 
 - **R0 流程**：直接在 main 实施+逐交付 push（用户既定协议）；全部子智能体继承会话模型（用户 2026-10-01 指示），无模型升级阶梯。
 - **R1（Task 3 修复轮 1）**：预算/时间降级不得穿透守卫地板——计划参考代码允许 stale/低置信触发的 update 被降到 simple（零 fresh 搜索），撞 §3.4 红线；裁定任一守卫信号存在时降级下限 update。计划代码让位于计划全局约束。
@@ -206,13 +267,13 @@
 - **R5（Task 6 修复轮）**：simple 收窄断言从条件式改无条件（brief 草稿的 if/else 使核心交付从未被断言）。
 - **R6（Task 9）**：真实模型对照（5 run）授权执行（P2-G 惯例+质量优先政策+键已配）；用户 09-30 遗留的 mcp-memory 文档登记单独成 commit（`fa9a07a`），`mcp-memory/` 代码目录按其边界声明保持未跟踪。
 
-### 9.4 会话统计
+### 9.6 会话统计
 
 | 项 | 数值 |
 |---|---|
 | 子智能体 | **31**（实现侧 15：8 任务派工 + 7 次 resume 修复；评审侧 15：8 任务审 + 6 范围化复审 + 1 终审；前置侦察 1） |
 | 修复轮 | 7 次（T3×2、T6×1、T8×2、跨任务饱和修复×1、终审修复波×1），全部经范围化复审验证 |
-| 提交 | 17 个（`0149446..本节`），全部已推送 origin/main |
+| 提交 | 17 个（`0149446..08a7f23`），全部已推送 origin/main |
 | 测试 | 703 → **747**（策略 26 + loop 接线 8 + MCP 5 + index 3 + smoke 5 等） |
 | 终审结论 | With fixes → 修复波（2 条接线行为断言 + lint 债清零）→ 复审 clean |
 
