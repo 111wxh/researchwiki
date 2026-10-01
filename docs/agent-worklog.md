@@ -167,3 +167,55 @@
 - **零耦合**：Dockerfile 选择性 COPY 不含该目录；主项目 uv venv / uv.lock 未动；其依赖（官方 `mcp` SDK 2.x，Store Python 3.11 用户 site-packages）与主线（uv 3.12 venv，`fastmcp`）分属不同环境。
 - **详细记录、状态与接手指引**：见 [agent-worklog-mcp-memory.md](./agent-worklog-mcp-memory.md)（分支线专用日志，含 DSH 环境事实、验证步骤、移除方法、并入主线的路径）。
 - 接手主线的人**无需**读分支线日志；接手分支线的人**无需**读本日志第 1–7 节。
+
+---
+
+## 9. P3 · Dynamic Retrieval 会话（2026-10-01）
+
+> 新会话（与第 1–7 节的 2026-09-22 会话无共享上下文）。计划：`docs/superpowers/plans/2026-10-01-p3-dynamic-retrieval.md`（实现 PLAN §3.4），SDD 工作区 `.superpowers/sdd/2026-10-01-p3-dynamic-retrieval/`（gitignored，本节为其完整存档——工作区已按惯例清除，git 历史与本节为唯一记录）。子智能体全部继承会话模型（startplan GLM-5.3-Flash，用户指示）。测试 **703 → 747** 全绿；提交 17 个（`0149446..<worklog>`），全部已推送。
+
+### 9.1 交付物（对照 PLAN §3.4 五项）
+
+| 计划交付物 | 产物 | 任务 |
+|---|---|---|
+| `loop/research_policy.py` 策略输入/决策/解释 | `PolicySettings`/`ModeLimits`、`PolicyFeatures`+`collect_features`、`PolicyDecision`+`decide_mode`（守卫红线>覆盖度>预算降级>forced，理由全带数值） | T1–T3 |
+| `loop/agent_loop.py` 模式化检索上限/报告/验证要求 | 判定先于 Prior 注入；`run_dir/policy.json`（outcome 报告后回填）+ state.md 行；prior k/chars 覆盖、fresh 搜索帽、子代理门、生效步数、brief 报告样式、min_fresh_sources 诚实缺口块 | T5 |
+| `config.toml` 模式预算/阈值/最小 fresh source 数 | `[retrieval]` 段（值==代码默认值，零行为漂移；enabled=false=评测 baseline） | T7 |
+| `tests/test_research_policy.py` 五类用例 | 26 条（stable/fresh、volatile/stale、conflict、空库、无答案=零覆盖 + 守卫地板 + 饱和窗口等） | T1–T3+ |
+| `scripts/adaptive_smoke.py` 同题跨模式对照 | simple/update/deep/auto 四行矩阵 + 五道验收闸（②③按 mock 硬/config 留痕分治） | T8 |
+
+附加交付（PLAN §2.4 因子表落地）：`wiki/index.py` importance 进排名（RRF×confidence×freshness×importance；旧库 ALTER 迁移 + `note_index_hash` 扩展→drift→rebuild；0.0/None 指纹碰撞规避）；`mcp_server/service.py` `memory_recall` 从 passthrough 升级 budget-aware（"P3 钩子位"兑现）。
+
+### 9.2 验收（对照 §3.4 退出条件，含诚实边界）
+
+1. **决策留痕**：每次判定 policy.json 全量 features+reasons+limits；冒烟闸①硬性核对（不允许裸模式字符串）。
+2. **simple 低于 deep baseline**：mock 硬闸（4800<5700<6600 input tokens 严格单调）；真实 run simple 9,296 vs deep 38,068（−75.6%），时延 45.3s vs 73.4s。
+3. **守卫红线**：decide_mode 守卫 + 预算降级守卫地板 + **全库相关性门控扫描**（见 9.3 裁定 R3）；冒烟闸④ mock 硬闸，真实 run 曾失败并由此抓出真缺口（见下）。
+4. **质量不劣化**：citation_coverage 1.0（auto/update/simple）vs deep 1.0（真实 n=1）；`enabled=false` 无路由 baseline 保留且经 legacy 等价性测试锁定；正式 QA 对照属评测支线（PLAN §7），不在本阶段口径内。
+5. **总闸（同题不同模式成本下降、质量不劣化）**：真实 run auto（策略自然判定 update）vs deep = 18,163 vs 38,068 input tokens（**−52.3%**）、时延 −20.2%、引用覆盖持平。小样本（n=1），不构成收益结论（§11.1），可重复性留评测支线。
+
+真实证据：`smoke_out/adaptive_config_20261001T080844Z.jsonl`（修复前，闸④失败留档）与 `adaptive_config_20261001T083359Z.jsonl`（修复后，五闸全过）；mock：`adaptive_mock_20261001T075951Z.jsonl`。
+
+### 9.3 关键裁定（全录，工作区已清除，此处为唯一存档）
+
+- **R0 流程**：直接在 main 实施+逐交付 push（用户既定协议）；全部子智能体继承会话模型（用户 2026-10-01 指示），无模型升级阶梯。
+- **R1（Task 3 修复轮 1）**：预算/时间降级不得穿透守卫地板——计划参考代码允许 stale/低置信触发的 update 被降到 simple（零 fresh 搜索），撞 §3.4 红线；裁定任一守卫信号存在时降级下限 update。计划代码让位于计划全局约束。
+- **R2（Task 3 修复轮 2）**："覆盖度不足"分支理由由静态字符串改为嵌入具体数值与阈值——计划参考代码违反计划自身"理由带具体数值"红线。
+- **R3（跨任务修复，真实冒烟闸④抓到）**：**探测窗口饱和缺口**——collect_features 的守卫信号原本只来自 probe_k 探测窗口；真实 run 中 8 条同题 fresh 笔记（seed deep 产物）在 embedding 下把同题 stale 记忆挤出窗口（policy.json 实证：hit_count=8、stale_hits=0），auto 误判 simple。裁定：守卫信号（stale/review_due/低置信）改为**全库扫描 + 相关性门控**（token_similarity(title+body[:400]) ≥ conflict_similarity，排除窗口内已见 note_id），零模型、可复算，与 conflict 全库扫描同口径。修复后真实 run auto 正确路由 update（stale_hits=1）。volatile/hit_count/top_score 保持窗口口径（非免检红线信号）。
+- **R4（Task 8 修复轮 1/2）**：验收闸②③在真实模型下按确定性拆分——0 帽半边（simple 零 fresh 搜索，结构性保证）mock/config 同闸硬；成本差半边与搜索阶梯半边（模型在帽内自选，非策略属性）mock 硬、config 留痕警示（`cost_gap_ok`/`fresh_search_ladder_ok`，None=未判定不假绿）。
+- **R5（Task 6 修复轮）**：simple 收窄断言从条件式改无条件（brief 草稿的 if/else 使核心交付从未被断言）。
+- **R6（Task 9）**：真实模型对照（5 run）授权执行（P2-G 惯例+质量优先政策+键已配）；用户 09-30 遗留的 mcp-memory 文档登记单独成 commit（`fa9a07a`），`mcp-memory/` 代码目录按其边界声明保持未跟踪。
+
+### 9.4 会话统计
+
+| 项 | 数值 |
+|---|---|
+| 子智能体 | **31**（实现侧 15：8 任务派工 + 7 次 resume 修复；评审侧 15：8 任务审 + 6 范围化复审 + 1 终审；前置侦察 1） |
+| 修复轮 | 7 次（T3×2、T6×1、T8×2、跨任务饱和修复×1、终审修复波×1），全部经范围化复审验证 |
+| 提交 | 17 个（`0149446..本节`），全部已推送 origin/main |
+| 测试 | 703 → **747**（策略 26 + loop 接线 8 + MCP 5 + index 3 + smoke 5 等） |
+| 终审结论 | With fixes → 修复波（2 条接线行为断言 + lint 债清零）→ 复审 clean |
+
+**Deferred minors（缓还清单，终审已分类：无阻塞项）**：config 校验加固（conflict_similarity/coverage_min_score 夹取、非 Mapping override 的 TypeError、_VOLATILITY_RANK .get 化）；time_budget_seconds 路径零覆盖（预算因子当前惰性，激活时一并补）；recall 双开索引与全库扫描 O(笔记文件数)（10k+ 笔记优化目标）；默认值锁定测试仅锁 2 值（可固化为全等断言）；杂项命名/重复表达式。**预算因子结构性惰性（判定先于一切模型调用，budget_remaining_ratio 恒 1.0）**为计划层面已知限制，评测期再议 mid-run 重判定。
+
+**P2 移交三项（范围外确认）**：①替换门与相似度带明文化 ②merge 独立下限 ③F7 id 形态护栏——均未在本会话处理，继续悬置（②③触发条件在 P4）。
