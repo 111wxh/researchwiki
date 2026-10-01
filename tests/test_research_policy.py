@@ -1,8 +1,18 @@
 """P3 Dynamic Retrieval：确定性 recall 策略测试。"""
+import datetime as dt
+
 from researchwiki.loop.research_policy import (
-    MODE_DEEP, MODE_SIMPLE, MODE_UPDATE, ModeLimits,
+    MODE_DEEP,
+    MODE_SIMPLE,
+    MODE_UPDATE,
+    ModeLimits,
+    collect_features,
     policy_settings_from_config,
 )
+from researchwiki.wiki.freshness import FreshnessSettings
+from researchwiki.wiki.index import SearchIndex
+from researchwiki.wiki.store import WikiStore
+
 
 def test_default_settings_match_plan_ladder():
     s = policy_settings_from_config(None)
@@ -38,3 +48,78 @@ def test_invalid_forced_mode_rejected():
     import pytest
     with pytest.raises(ValueError):
         policy_settings_from_config({"forced_mode": "turbo"})
+
+
+# ---- 特征采集 collect_features（五因子的具体化） ------------------------------
+
+# 带时区的固定时钟：SearchIndex 的 freshness_factor 会拿 clock() 与落盘的
+# aware 时间戳直接相减，naive datetime 会抛 TypeError（与 test_wiki 的
+# FIXED_NOW 同一约定）。
+NOW = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
+
+def _seed(store: WikiStore, *, body: str, volatility: str = "stable",
+          confidence: str = "high", observed_at: str | None = None,
+          entities: list[str] | None = None, title: str = "笔记") -> None:
+    store.save_note(body, title=title, entities=entities or ["实体"],
+                    volatility=volatility, confidence=confidence,
+                    observed_at=observed_at)
+
+def _index(store: WikiStore) -> SearchIndex:
+    idx = SearchIndex(store.root, clock=lambda: NOW)
+    idx.rebuild(store)
+    return idx
+
+def test_features_on_fresh_stable_hits(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    _seed(store, body="Zephyr 框架的内存占用约为 2KB，发布于 2026-09。")
+    _seed(store, body="Zephyr 的许可证是 Apache 2.0。")
+    feats = collect_features("Zephyr 框架的内存占用是多少", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.hit_count >= 1 and feats.top_score > 0
+    assert feats.stale_hits == 0 and feats.low_confidence_hits == 0
+    assert feats.max_volatility == "stable"
+    assert feats.budget_remaining_ratio == 1.0
+
+def test_features_count_stale_and_low_confidence(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    _seed(store, body="Zephyr 内存占用约 2KB。", volatility="volatile",
+          observed_at="2026-01-01T00:00:00+00:00")   # 半衰期 30 天 → stale
+    _seed(store, body="Zephyr 许可证是 Apache 2.0。", confidence="low")
+    feats = collect_features("Zephyr 内存占用", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.stale_hits >= 1
+    assert feats.low_confidence_hits >= 1
+
+def test_features_conflict_overlap(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    _seed(store, body="Zephyr 内存占用约 2KB。")
+    store.save_conflict("Zephyr 的内存占用到底是多少",
+                        {"text": "2KB", "observed_at": "2026-01-01"},
+                        {"text": "4KB", "observed_at": "2026-09-01"})
+    feats = collect_features("Zephyr 的内存占用是多少", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.conflict_hits == 1
+
+def test_features_empty_wiki(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    feats = collect_features("量子纠错的表面码阈值", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.hit_count == 0 and feats.top_score == 0.0
+    assert feats.max_volatility == "stable" and feats.conflict_hits == 0
+
+def test_features_to_dict_roundtrip(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    _seed(store, body="Zephyr 内存占用约 2KB。")
+    feats = collect_features("Zephyr 内存占用", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW,
+                             budget_remaining_ratio=0.4, elapsed_seconds=1.5)
+    d = feats.to_dict()
+    assert d["budget_remaining_ratio"] == 0.4 and d["elapsed_seconds"] == 1.5
+    assert set(d) >= {"hit_count", "top_score", "fresh_hits", "review_due_hits",
+                      "stale_hits", "volatile_hits", "max_volatility",
+                      "low_confidence_hits", "conflict_hits"}

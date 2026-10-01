@@ -9,6 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
+from researchwiki.wiki.freshness import (
+    FRESHNESS_REVIEW_DUE,
+    FRESHNESS_STALE,
+    FreshnessSettings,
+    evaluate_freshness,
+)
+from researchwiki.wiki.index import SearchIndex
+from researchwiki.wiki.store import WikiStore
+from researchwiki.wiki.verification import token_similarity
+
 MODE_SIMPLE = "simple"
 MODE_UPDATE = "update"
 MODE_DEEP = "deep"
@@ -108,3 +118,93 @@ def policy_settings_from_config(config: Mapping[str, Any] | None) -> PolicySetti
                              if cfg.get("time_budget_seconds") is not None else None),
         forced_mode=forced,
     )
+
+
+# ---- 特征采集 collect_features（五因子的具体化，PLAN §3.4 因子表） -----------
+# 五因子特征语义（对应 PLAN §3.4 因子表；判定输入全部可复算、可落盘）：
+# - coverage   = hit_count + top_score（探测检索命中覆盖度）
+# - freshness  = fresh/review_due/stale_hits（命中记忆时间有效性三态计数）
+# - volatility = volatile_hits + max_volatility（命中实体的变化风险）
+# - uncertainty = low_confidence_hits + conflict_hits（低置信 / open 冲突；
+#   PLAN 的 "unanswered signals" 在本 MVP 映射为：零覆盖→deep、open 冲突相关→deep）
+# - budget     = budget_remaining_ratio + elapsed_seconds（由调用方传入：
+#   loop 用 `1 - input_tokens/token_budget`，MCP recall 传 1.0）
+# 依赖的 wiki 模块导入统一放在文件顶部导入区。
+
+_VOLATILITY_RANK = {"stable": 0, "drifting": 1, "volatile": 2}
+
+
+@dataclass
+class PolicyFeatures:
+    """策略判定的输入特征（全部可复算、可落盘）。"""
+    hit_count: int = 0
+    top_score: float = 0.0
+    fresh_hits: int = 0
+    review_due_hits: int = 0
+    stale_hits: int = 0
+    volatile_hits: int = 0
+    max_volatility: str = "stable"
+    low_confidence_hits: int = 0
+    conflict_hits: int = 0
+    budget_remaining_ratio: float = 1.0
+    elapsed_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hit_count": self.hit_count, "top_score": round(self.top_score, 6),
+            "fresh_hits": self.fresh_hits, "review_due_hits": self.review_due_hits,
+            "stale_hits": self.stale_hits, "volatile_hits": self.volatile_hits,
+            "max_volatility": self.max_volatility,
+            "low_confidence_hits": self.low_confidence_hits,
+            "conflict_hits": self.conflict_hits,
+            "budget_remaining_ratio": round(self.budget_remaining_ratio, 6),
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+        }
+
+
+def _open_conflicts_related(store: WikiStore, question: str,
+                            settings: PolicySettings) -> int:
+    """与当前问题相关的 open 冲突数：确定性 bigram 相似度 ≥ conflict_similarity。"""
+    related = 0
+    for conflict in store.list_conflicts(status="open"):
+        if token_similarity(conflict.question, question) >= settings.conflict_similarity:
+            related += 1
+    return related
+
+
+def collect_features(question: str, store: WikiStore, index: SearchIndex, *,
+                     settings: PolicySettings,
+                     freshness_settings: FreshnessSettings | None = None,
+                     now: Any = None,
+                     budget_remaining_ratio: float = 1.0,
+                     elapsed_seconds: float = 0.0) -> PolicyFeatures:
+    """探测检索 + 五因子特征采集（零模型调用，全部可复算）。"""
+    fresh_cfg = freshness_settings or FreshnessSettings()
+    matches = index.search(question, k=settings.probe_k)
+    feats = PolicyFeatures(budget_remaining_ratio=budget_remaining_ratio,
+                           elapsed_seconds=elapsed_seconds)
+    top = 0.0
+    max_vol = "stable"
+    for m in matches:
+        note = store.get_note(m.note_id)
+        if note is None:
+            continue
+        top = max(top, m.score)
+        state = evaluate_freshness(note, now=now, settings=fresh_cfg)
+        if state.state == FRESHNESS_STALE:
+            feats.stale_hits += 1
+        elif state.state == FRESHNESS_REVIEW_DUE:
+            feats.review_due_hits += 1
+        else:
+            feats.fresh_hits += 1
+        if _VOLATILITY_RANK[note.volatility] > _VOLATILITY_RANK[max_vol]:
+            max_vol = note.volatility
+        if note.volatility == "volatile":
+            feats.volatile_hits += 1
+        if note.confidence == "low":
+            feats.low_confidence_hits += 1
+    feats.hit_count = len(matches)
+    feats.top_score = top
+    feats.max_volatility = max_vol
+    feats.conflict_hits = _open_conflicts_related(store, question, settings)
+    return feats
