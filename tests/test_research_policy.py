@@ -134,6 +134,35 @@ def test_features_to_dict_roundtrip(tmp_path):
                       "stale_hits", "volatile_hits", "max_volatility",
                       "low_confidence_hits", "conflict_hits"}
 
+def test_stale_note_crowded_out_of_probe_window_still_guarded(tmp_path):
+    # 真实冒烟教训：8 条同题 fresh 笔记会把同题 stale 挤出 probe_k=8 窗口；
+    # 守卫信号必须全库扫描兜底，不得被新鲜内容挤出探测窗口（PLAN §3.4 红线）。
+    store = WikiStore(tmp_path / "wiki-data")
+    for i in range(8):
+        _seed(store, body=f"Zephyr 内存占用方案{i}：约 2KB，发布于 2026-09。")
+    _seed(store, body="Zephyr 内存占用约 2KB。", volatility="volatile",
+          observed_at="2026-01-01T00:00:00+00:00")   # volatile 半衰期短 → stale
+    feats = collect_features("Zephyr 内存占用是多少", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.hit_count == 8   # 探测窗口确被 8 条 fresh 占满（饱和场景成立）
+    assert feats.stale_hits >= 1  # 全库扫描兜底：窗口外的同题 stale 仍计入守卫
+
+def test_sweep_relevance_gate_ignores_unrelated_stale(tmp_path):
+    # 相关性门控：全库扫描只计入与问题相关的 stale，无关旧笔记不触发守卫。
+    # （单条无关笔记会被向量通道哈希碰撞召回进探测窗口，故用同题 fresh 饱和
+    # 窗口把它挤出探测窗口，隔离验证 sweep 的门控语义。）
+    store = WikiStore(tmp_path / "wiki-data")
+    for i in range(8):
+        _seed(store, body=f"Zephyr 内存占用方案{i}：约 2KB，发布于 2026-09。")
+    _seed(store, body="中世纪修道院的啤酒酿造工艺与酒花添加时机。",
+          volatility="volatile", observed_at="2026-01-01T00:00:00+00:00")
+    feats = collect_features("Zephyr 内存占用是多少", store, _index(store),
+                             settings=policy_settings_from_config(None),
+                             freshness_settings=FreshnessSettings(), now=NOW)
+    assert feats.hit_count == 8   # 无关 stale 被同题 fresh 挤出探测窗口
+    assert feats.stale_hits == 0  # 相关性门控拦下窗口外的无关旧笔记
+
 
 # ---- 确定性判定 decide_mode（守卫红线 + 预算降级 + 理由） ----------------------
 

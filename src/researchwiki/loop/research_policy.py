@@ -182,7 +182,18 @@ def collect_features(question: str, store: WikiStore, index: SearchIndex, *,
                      now: Any = None,
                      budget_remaining_ratio: float = 1.0,
                      elapsed_seconds: float = 0.0) -> PolicyFeatures:
-    """探测检索 + 五因子特征采集（零模型调用，全部可复算）。"""
+    """探测检索 + 五因子特征采集（零模型调用，全部可复算）。
+
+    守卫信号（stale / review_due / 低置信）在探测窗口之外再做一次**全库扫描 +
+    相关性门控**：对探测窗口未覆盖的 active 笔记，state ∈ {review_due, stale}
+    或 confidence=low 时，须 token_similarity(title + body[:400], question) ≥
+    conflict_similarity 才计入对应计数。理由（真实冒烟教训，PLAN §3.4 红线）：
+    seed deep run 产出的同题 fresh 笔记会把同题 stale 笔记挤出 probe_k 窗口，
+    只看窗口就会把 stale 路由成"无需搜索"的 simple——守卫信号必须全库扫描，
+    不得被新鲜内容挤出探测窗口（open 冲突本就是全库扫描 + 同门槛门控，此处
+    拉齐口径）。hit_count / top_score / volatile_hits / max_volatility 仍为
+    探测窗口口径：覆盖度本来就是窗口量，volatility 是风险信号而非免检红线信号。
+    """
     fresh_cfg = freshness_settings or FreshnessSettings()
     matches = index.search(question, k=settings.probe_k)
     feats = PolicyFeatures(budget_remaining_ratio=budget_remaining_ratio,
@@ -210,6 +221,27 @@ def collect_features(question: str, store: WikiStore, index: SearchIndex, *,
     feats.hit_count = len(matches)
     feats.top_score = top
     feats.max_volatility = max_vol
+    # 守卫信号全库扫描（真实冒烟教训，PLAN §3.4 红线）：stale/review_due/低置信
+    # 不得被同题 fresh 内容挤出 probe_k 窗口——遍历窗口未覆盖的 active 笔记，
+    # 相关性门控通过才计数（与 open 冲突的全库扫描同口径；volatile 不扫，它
+    # 是覆盖/风险信号而非免检红线信号）。
+    seen = {m.note_id for m in matches}
+    for note in store.list_notes(status="active"):
+        if note.id in seen:
+            continue
+        state = evaluate_freshness(note, now=now, settings=fresh_cfg)
+        if (state.state not in (FRESHNESS_STALE, FRESHNESS_REVIEW_DUE)
+                and note.confidence != "low"):
+            continue
+        if token_similarity(f"{note.title} {note.body[:400]}",
+                            question) < settings.conflict_similarity:
+            continue
+        if state.state == FRESHNESS_STALE:
+            feats.stale_hits += 1
+        elif state.state == FRESHNESS_REVIEW_DUE:
+            feats.review_due_hits += 1
+        if note.confidence == "low":
+            feats.low_confidence_hits += 1
     feats.conflict_hits = _open_conflicts_related(store, question, settings)
     return feats
 
