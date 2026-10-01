@@ -8,7 +8,8 @@
 
 与 test_mcp.py 的差别只有一处：CONFIG 显式带 ``retrieval = {enabled = true}``，
 让 recall 走判定路径；retrieval 段缺席时的 passthrough 基线由
-test_mcp.py::test_recall_annotates_memory_state 锁定，这里不重复。
+test_mcp.py::test_recall_annotates_memory_state 锁定，``enabled=false`` 逃生阀
+另见本文件 test_recall_keeps_passthrough_when_retrieval_disabled。
 零真实网络（embedding 走 mock）、tmp_path 隔离；笔记直接用 ``store.save_note``
 落盘，recall 内部的 search 会按共享判据（index_drift）发现索引落后并重建。
 """
@@ -74,16 +75,21 @@ def test_recall_reports_mode_features_reasons(service: WikiService, store: WikiS
 
 
 def test_recall_simple_mode_narrows_results(service: WikiService, store: WikiStore) -> None:
-    """simple 模式（prior_k=3）收窄召回宽度；update/deep 尊重调用方 k。"""
+    """simple 模式（prior_k=3）收窄召回宽度（无条件断言，fix round 1）。
+
+    5 条笔记全 fresh stable 且覆盖达标（hit_count=5 ≥ coverage_min_hits=2、
+    top_score≈0.023 ≥ coverage_min_score=0.010），simple 判定是确定性的：
+    mock embedding 用 hashlib（不按进程加盐）、FTS trigram 确定性、freshness
+    因子恒 fresh——无随机性可逃，条件式 else 分支只会空洞通过，故删除。
+    """
     for i in range(5):
         store.save_note(f"Zephyr 知识条目 {i}：官方规格 {i}。", entities=["Zephyr"])
-    payload = service.recall("Zephyr 知识条目", k=5)  # 全 fresh stable → simple
+    payload = service.recall("Zephyr 知识条目", k=5)
     assert payload["ok"] is True
-    if payload["mode"] == "simple":
-        assert payload["count"] <= 3  # simple 模式限额 prior_k=3
-        assert payload["k"] <= 3
-    else:
-        assert payload["count"] <= 5
+    assert payload["mode"] == "simple"
+    assert payload["count"] <= 3  # simple 模式限额 prior_k=3
+    assert payload["k"] <= 3
+    assert payload["policy"]["forced"] is False
 
 
 def test_recall_with_conflict_routes_deep_and_still_returns_results(
@@ -117,3 +123,16 @@ def test_mcp_tool_surface_unchanged(server: FastMCP, store: WikiStore) -> None:
     hit = payload["results"][0]
     # 每条结果维持既有标注字段（P1-A 契约逐字段不变）
     assert {"note_id", "title", "snippet", "score", "match_type", "status", "kind"} <= set(hit)
+
+
+def test_recall_keeps_passthrough_when_retrieval_disabled(
+    wiki_root: Path, store: WikiStore
+) -> None:
+    """enabled=false 逃生阀（fix round 1 补测）：判定关闭时保持 passthrough 基线。"""
+    service = WikiService(wiki_root, config={**CONFIG, "retrieval": {"enabled": False}})
+    store.save_note("Zephyr 内存占用约 2KB。", entities=["Zephyr"])
+    payload = service.recall("Zephyr 内存占用", k=5)
+    assert payload["ok"] is True
+    assert payload["mode"] == "passthrough"
+    assert "policy" not in payload
+    assert payload["count"] == 1  # 不收窄：结果条数维持 search 原样
