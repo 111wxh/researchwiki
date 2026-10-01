@@ -42,7 +42,8 @@ frontmatter、``index_note`` 失败后的补偿等）都会让 MCP 路径必然�
 memory_* 记忆接口（P1-A）
 ------------------------
 九个 memory_* 工具是"面向 Agent 的外置记忆"语义层：store（显式写入）/ search
-（kind 过滤检索）/ recall（动态召回钩子位，MVP 为结构化透传）/ update（原地修订，
+（kind 过滤检索）/ recall（动态召回，P3 起 budget-aware：模式判定 + 召回宽度
+收窄 + policy 透传；retrieval 段缺席时保持 passthrough 基线）/ update（原地修订，
 必须留 reason + 备份）/ supersede（新内容替代旧记忆，新旧 ID 沿链可达）/
 invalidate（判定失效，自动生成墓碑笔记而非新增状态——"superseded 必须沿链可达
 active"的不变量与状态机都留给 P2）/ timeline（版本史）/ conflicts（冲突台账）/
@@ -767,11 +768,19 @@ class WikiService:
         kind: str | None = None,
         include_tombstones: bool = False,
     ) -> dict[str, Any]:
-        """动态召回入口（P3 的钩子位）：MVP = search + 重定向跟随 + 结构化透传。
+        """动态召回入口（P3 budget-aware）：先判模式，再按模式收窄召回宽度。
 
-        P3 将升级为 budget-aware 动态召回（按 token 预算与 importance 挑选记忆），
-        当前为结构化透传：在 search 结果上为每条记忆标注 status / observed_at /
-        kind（附 importance），让调用方按记忆状态自行取舍，不做预算裁剪。
+        - 判定与 loop 路径共用同一份确定性策略（``loop/research_policy``）：
+          探测检索 → collect_features → decide_mode，features + reasons 随
+          payload 透传（"不允许只有模式字符串"的验收红线在 MCP 侧同样成立）。
+        - ``budget_remaining_ratio`` 恒传 1.0：MCP 侧没有 loop 的 token 账本，
+          预算因子只在研究 loop 内生效；本方法只承担模式判定与召回宽度收窄
+          （simple 收窄到 ``limits.prior_k``，update/deep 同样不超过 prior_k）。
+        - ``retrieval`` 配置段缺席或 ``enabled=false`` 时保持 passthrough
+          （返回体带 ``"mode": "passthrough"``、无 ``policy`` 键，与 P1-A 逐字段
+          一致）——这是评测基线路径。
+        - 每条结果维持既有标注字段（status / observed_at / kind / importance，
+          P1-A 契约逐字段不变），收窄只裁结果条数，不改条目内容。
 
         ``include_tombstones`` 与 ``search`` 同语义（缺省 False = 墓碑不进召回）。
         """
@@ -786,7 +795,54 @@ class WikiService:
             item["observed_at"] = note.meta.observed_at
             item["kind"] = note.meta.kind
             item["importance"] = note.meta.importance
-        payload["mode"] = "passthrough"
+        retrieval_cfg = self.config.get("retrieval")
+        if not retrieval_cfg:  # 段缺席 / 空段 → 逃生阀：保持透传（评测基线）
+            payload["mode"] = "passthrough"
+            return payload
+        # 与 loop 路径同款延迟导入：不在模块层建立 mcp_server → loop 的静态依赖
+        # （分层约定：loop/* 不依赖 mcp_server，这里也只在策略函数上共用实现）。
+        from researchwiki.loop.research_policy import (
+            collect_features,
+            decide_mode,
+            policy_settings_from_config,
+        )
+        from researchwiki.wiki.freshness import from_config as freshness_from_config
+
+        settings = policy_settings_from_config(retrieval_cfg)
+        if not settings.enabled:
+            payload["mode"] = "passthrough"
+            return payload
+        # 探测索引按模块约定"每次调用新建 SearchIndex"，并用与 search 相同的
+        # 共享判据（_index_is_stale → _sync_index）保证与 store 同新鲜度：
+        # search 刚同步过、这里通常判新鲜零重建，仅兜并发写入的竞态。
+        with self._open_index() as index:
+            stale_reason = self._index_is_stale(index)
+            self._sync_index(index, stale=stale_reason is not None)
+            features = collect_features(
+                payload["query"],  # search 已归一（strip），与本次检索同源
+                self.store,
+                index,
+                settings=settings,
+                freshness_settings=freshness_from_config(self.config),
+                # MCP 侧没有 loop 的 token 账本：预算余量恒 1.0（见 docstring）
+                budget_remaining_ratio=1.0,
+            )
+        decision = decide_mode(features, settings=settings)
+        # 召回宽度收窄：simple 限额 prior_k=3 是主要生效点；update/deep 的
+        # prior_k=5 通常不小于调用方 k，收窄只在超出模式限额时裁剪。
+        width = min(
+            int(payload["count"]) if payload["results"] else k,
+            decision.limits.prior_k,
+        )
+        payload["results"] = payload["results"][:width]
+        payload["count"] = len(payload["results"])
+        payload["k"] = width
+        payload["mode"] = decision.mode
+        payload["policy"] = {
+            "features": decision.features.to_dict(),
+            "reasons": decision.reasons,
+            "forced": decision.forced,
+        }
         return payload
 
     @_structured_errors
