@@ -208,3 +208,79 @@ def collect_features(question: str, store: WikiStore, index: SearchIndex, *,
     feats.max_volatility = max_vol
     feats.conflict_hits = _open_conflicts_related(store, question, settings)
     return feats
+
+
+# ---- 确定性判定 decide_mode（守卫红线 + 预算降级 + 理由） ----------------------
+
+@dataclass
+class PolicyDecision:
+    """decide_mode 的输出：模式 + 判定输入特征 + 理由（落盘留痕）+ 该模式限额。"""
+    mode: str
+    features: PolicyFeatures
+    reasons: list[str]
+    limits: ModeLimits
+    forced: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode, "forced": self.forced,
+            "features": self.features.to_dict(), "reasons": list(self.reasons),
+            "limits": {
+                "prior_k": self.limits.prior_k,
+                "prior_max_chars": self.limits.prior_max_chars,
+                "max_fresh_searches": self.limits.max_fresh_searches,
+                "max_steps": self.limits.max_steps,
+                "subagents": self.limits.subagents,
+                "report_style": self.limits.report_style,
+                "min_fresh_sources": self.limits.min_fresh_sources,
+            },
+        }
+
+
+def _downgrade(mode: str) -> str:
+    return {MODE_DEEP: MODE_UPDATE, MODE_UPDATE: MODE_SIMPLE, MODE_SIMPLE: MODE_SIMPLE}[mode]
+
+
+def decide_mode(features: PolicyFeatures, *,
+                settings: PolicySettings) -> PolicyDecision:
+    """确定性模式判定。规则顺序即优先级：守卫红线 > 覆盖度 > 预算降级 > forced。"""
+    reasons: list[str] = []
+    if features.conflict_hits > 0:
+        mode = MODE_DEEP
+        reasons.append(f"open_conflict_hits={features.conflict_hits} → 冲突需完整研究回路重新调查")
+    elif features.hit_count == 0:
+        mode = MODE_DEEP
+        reasons.append("memory_hit_count=0 → 无记忆覆盖，走完整研究")
+    elif features.stale_hits > 0 or features.low_confidence_hits > 0:
+        mode = MODE_UPDATE
+        reasons.append(f"stale_hits={features.stale_hits}, low_confidence_hits="
+                       f"{features.low_confidence_hits} → 旧记忆不可免检，需 fresh verification")
+    elif features.review_due_hits > 0 or features.volatile_hits > 0:
+        mode = MODE_UPDATE
+        reasons.append(f"review_due_hits={features.review_due_hits}, "
+                       f"volatile_hits={features.volatile_hits} → 变化风险需少量 fresh 核验")
+    elif (features.hit_count >= settings.coverage_min_hits
+          and features.top_score >= settings.coverage_min_score):
+        mode = MODE_SIMPLE
+        reasons.append(f"hit_count={features.hit_count} ≥ {settings.coverage_min_hits} 且 "
+                       f"top_score={features.top_score:.4f} ≥ {settings.coverage_min_score} → "
+                       "记忆覆盖充分且全部 fresh/stable，直接轻量作答")
+    else:
+        mode = MODE_UPDATE
+        reasons.append("覆盖度不足（命中数或分数低于 simple 门槛）→ 轻量研究")
+    if features.budget_remaining_ratio < settings.budget_floor and mode != MODE_SIMPLE:
+        reasons.append(f"budget_remaining_ratio={features.budget_remaining_ratio:.3f} < "
+                       f"budget_floor={settings.budget_floor} → 模式降一级")
+        mode = _downgrade(mode)
+    if (settings.time_budget_seconds is not None
+            and features.elapsed_seconds > settings.time_budget_seconds
+            and mode != MODE_SIMPLE):
+        reasons.append(f"elapsed_seconds={features.elapsed_seconds:.1f} > "
+                       f"time_budget_seconds={settings.time_budget_seconds} → 模式降一级")
+        mode = _downgrade(mode)
+    forced = settings.forced_mode is not None
+    if forced and settings.forced_mode != mode:
+        reasons.append(f"forced_mode={settings.forced_mode} 覆盖规则判定 {mode}")
+        mode = settings.forced_mode
+    return PolicyDecision(mode=mode, features=features, reasons=reasons,
+                          limits=settings.limits[mode], forced=forced)

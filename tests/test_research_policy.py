@@ -6,7 +6,9 @@ from researchwiki.loop.research_policy import (
     MODE_SIMPLE,
     MODE_UPDATE,
     ModeLimits,
+    PolicyFeatures,
     collect_features,
+    decide_mode,
     policy_settings_from_config,
 )
 from researchwiki.wiki.freshness import FreshnessSettings
@@ -123,3 +125,64 @@ def test_features_to_dict_roundtrip(tmp_path):
     assert set(d) >= {"hit_count", "top_score", "fresh_hits", "review_due_hits",
                       "stale_hits", "volatile_hits", "max_volatility",
                       "low_confidence_hits", "conflict_hits"}
+
+
+# ---- 确定性判定 decide_mode（守卫红线 + 预算降级 + 理由） ----------------------
+
+def _feats(**kw) -> PolicyFeatures:
+    base = dict(hit_count=3, top_score=0.03, fresh_hits=3, review_due_hits=0,
+                stale_hits=0, volatile_hits=0, max_volatility="stable",
+                low_confidence_hits=0, conflict_hits=0,
+                budget_remaining_ratio=1.0, elapsed_seconds=0.0)
+    base.update(kw)
+    return PolicyFeatures(**base)
+
+def test_fresh_stable_covered_routes_simple():
+    d = decide_mode(_feats(), settings=policy_settings_from_config(None))
+    assert d.mode == MODE_SIMPLE
+    assert d.reasons and d.limits is not None
+
+def test_stale_never_routes_simple_guard():
+    d = decide_mode(_feats(stale_hits=1, fresh_hits=2),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_UPDATE
+    assert any("stale" in r for r in d.reasons)
+
+def test_low_confidence_never_routes_simple_guard():
+    d = decide_mode(_feats(low_confidence_hits=1),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_UPDATE
+
+def test_conflict_routes_deep():
+    d = decide_mode(_feats(conflict_hits=1),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_DEEP
+
+def test_empty_wiki_routes_deep():
+    d = decide_mode(_feats(hit_count=0, top_score=0.0, fresh_hits=0),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_DEEP
+
+def test_volatile_hits_route_update():
+    d = decide_mode(_feats(volatile_hits=1, max_volatility="volatile"),
+                    settings=policy_settings_from_config(None))
+    assert d.mode == MODE_UPDATE
+
+def test_budget_downgrade_one_level():
+    s = policy_settings_from_config({"budget_floor": 0.5})
+    d = decide_mode(_feats(conflict_hits=1, budget_remaining_ratio=0.3), settings=s)
+    assert d.mode == MODE_UPDATE      # deep → update
+    assert any("budget" in r for r in d.reasons)
+
+def test_forced_mode_pins_but_logs_features():
+    s = policy_settings_from_config({"forced_mode": "simple"})
+    d = decide_mode(_feats(conflict_hits=1), settings=s)
+    assert d.mode == MODE_SIMPLE and d.forced is True
+    assert d.features.conflict_hits == 1 and d.reasons  # 照常留痕
+
+def test_decision_to_dict_shape():
+    d = decide_mode(_feats(), settings=policy_settings_from_config(None))
+    payload = d.to_dict()
+    assert payload["mode"] == MODE_SIMPLE and payload["forced"] is False
+    assert isinstance(payload["features"], dict) and payload["reasons"]
+    assert payload["limits"]["max_fresh_searches"] == 0
