@@ -14,12 +14,16 @@
             auto 不带 forced_mode（自然判定，守卫红线复验的载体）。
 
 每次 run 收集 <run_dir>/run-metrics.json（PLAN §4.4，14 字段契约不动）与
-<run_dir>/policy.json（P3 模式判定留痕），verify_rows 做实五道硬断言：
+<run_dir>/policy.json（P3 模式判定留痕），verify_rows 做实断言（③ 按模式分治）：
 
   1. 每行 policy 含 features 与非空 reasons（PLAN §3.4 验收：不允许裸模式字符串）；
   2. mock 下 simple.input_tokens < deep.input_tokens 且 simple.fresh_search_count == 0
      （simple 不做 fresh 搜索：帽=0 + 剧本也不给搜索轮）；
-  3. simple ≤ update ≤ deep 的 fresh_search_count 单调（矩阵的"检索深度阶梯"）；
+  3. simple ≤ update ≤ deep 的 fresh_search_count 单调（矩阵的"检索深度阶梯"）——
+     **mock 硬闸；config 只计算、打印警示、落盘留痕（fresh_search_ladder_ok 字段）、
+     不判死**：真实模型的搜索次数是在帽内自选的（update 帽 2、deep 帽 4、可选 0），
+     硬闸度量的是"模型服从度"而非策略正确性；PLAN 验收里"fresh search 次数下降"
+     属于"策略 vs 无路由 baseline"的对照，不属于 forced 阶梯（fix-round 裁定）；
   4. 播种含 stale 记忆时 auto.policy.mode != simple（守卫红线复验：stale 在判，
      simple 不做 fresh 搜索，不得把守卫信号路由成"无需搜索"）；
   5. input_tokens_checked == metrics.input_tokens（tokens.jsonl 按 trace_id 经
@@ -79,14 +83,19 @@ store 整体重建（含手工 stale 笔记），检索口径不变、确定性�
   {"mode", "question", "trace_id", "wiki_root", "run_dir", "provider_mode",
    "model", "metrics": {…run-metrics.json 14 字段原文…},
    "policy": {…policy.json 原文（mode/forced/features/reasons/limits/outcome）…},
-   "report_chars", "citation_coverage", "input_tokens_checked"}
+   "report_chars", "citation_coverage", "input_tokens_checked",
+   "fresh_search_ladder_ok": bool | None}
+fresh_search_ladder_ok 是断言 ③ 的行级留痕值（全部行同值盖章）：链上在场的强制
+模式（simple/update/deep 中实际在跑的）fresh_search_count 单调不减 → true，断裂
+→ false；链上不足两个强制模式 → None（无可比较对，不把"未判定"伪装成"已通过"）。
+mock 下 false 即断言失败；config 下 false 只打印警示、不判死。
 --out 缺省 PROJECT_ROOT/smoke_out/adaptive_{provider}_{ts}.jsonl；传目录
 （如 --out smoke_out）则把默认文件名写进该目录；传 *.jsonl 则按字面路径。
 --json <path> 另存机器可读汇总（含断言结论）。stdout 末段是模式对照表并注明
 "小样本冒烟，不构成收益结论"（PLAN §11.1）。
 
 ── 怎么跑 ─────────────────────────────────────────────────────────────
-  # 零 key 零网络：mock 剧本自证全矩阵与五道硬断言
+  # 零 key 零网络：mock 剧本自证全矩阵与硬断言（③ 为 mock 硬闸）
   uv run --no-sync python scripts/adaptive_smoke.py --provider mock --out smoke_out
   # 真实对照：走 config.toml 的 strong/cheap + 真实搜索/embedding（真实费用）
   uv run --no-sync python scripts/adaptive_smoke.py --provider config --out smoke_out
@@ -382,8 +391,41 @@ def run_mode_once(
 # ---- 硬断言（verify_rows：返回失败原因列表，空 = 全部通过）---------------------
 
 
+def ladder_breaks(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """断言 ③ 的判定内核：fresh 搜索沿 simple ≤ update ≤ deep 的断裂描述列表。
+
+    只看链上**在场**的强制模式（缺席的模式跳档比较）；链上不足两个 → 空列表
+    （无可比较对）。verify_rows（mock 硬闸）与 main（config 警示 + 行级留痕盖章）
+    共用这一份内核——判定口径只有一份，不会两处漂移。
+    """
+    by_mode = {str(row.get("mode")): row for row in rows}
+    chain = [m for m in FORCED_MODES if m in by_mode]
+    breaks: list[str] = []
+    for lower, upper in zip(chain, chain[1:], strict=False):
+        lo = int((by_mode[lower].get("metrics") or {}).get("fresh_search_count") or 0)
+        hi = int((by_mode[upper].get("metrics") or {}).get("fresh_search_count") or 0)
+        if lo > hi:
+            breaks.append(
+                f"{lower}.fresh_search_count={lo} > {upper}.fresh_search_count={hi}"
+            )
+    return breaks
+
+
+def fresh_search_ladder_ok(rows: Sequence[Mapping[str, Any]]) -> bool | None:
+    """断言 ③ 的行级留痕值（每行同值盖章）：True 单调 / False 断裂 / None 无可比对。
+
+    链上强制模式不足两个时返回 None——没有可比对，"单调"无从谈起，写 true 会
+    把"未判定"伪装成"已通过"。
+    """
+    by_mode = {str(row.get("mode")): row for row in rows}
+    chain = [m for m in FORCED_MODES if m in by_mode]
+    if len(chain) < 2:
+        return None
+    return not ladder_breaks(rows)
+
+
 def verify_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
-    """五道硬断言（详见模块 docstring；任一不满足即非空失败列表）。"""
+    """硬断言 ①②④⑤ + ③ 的 mock 硬闸（详见模块 docstring；空列表 = 全部通过）。"""
     failures: list[str] = []
     if not rows:
         return ["没有任何结果行，无法验证（矩阵至少要跑出一个模式）"]
@@ -428,15 +470,15 @@ def verify_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
                     "（simple 的搜索帽=0：fresh 检索一律不做）"
                 )
 
-    # ③ fresh 搜索沿 simple ≤ update ≤ deep 单调（缺席的模式跳过该档比较）
-    chain = [m for m in FORCED_MODES if m in by_mode]
-    for lower, upper in zip(chain, chain[1:], strict=False):
-        lo = int((by_mode[lower].get("metrics") or {}).get("fresh_search_count") or 0)
-        hi = int((by_mode[upper].get("metrics") or {}).get("fresh_search_count") or 0)
-        if lo > hi:
+    # ③ fresh 搜索沿 simple ≤ update ≤ deep 单调——按模式分治（fix-round 裁定）：
+    #    mock 硬闸（断裂进失败清单）；config 只计算、由 main 打警示、行级留痕
+    #    （fresh_search_ladder_ok），不判死——真实模型在帽内自选搜索次数（update 帽 2、
+    #    deep 帽 4、可选 0），硬闸度量的是"模型服从度"而非策略正确性；PLAN 验收里
+    #    "fresh search 次数下降"属于"策略 vs 无路由 baseline"的对照，不属于 forced 阶梯。
+    if provider_mode == "mock":
+        for break_desc in ladder_breaks(rows):
             failures.append(
-                f"检索深度阶梯断裂：{lower}.fresh_search_count={lo} > "
-                f"{upper}.fresh_search_count={hi}（必须单调不减）"
+                f"检索深度阶梯断裂：{break_desc}（必须单调不减；mock 下为硬闸）"
             )
 
     # ④ 守卫红线复验：播种含 stale 记忆时 auto 不落 simple
@@ -686,6 +728,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("（config 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）")
         return EXIT_RUN_ERROR
 
+    # 断言 ③ 的行级留痕盖章（每行同值，判定内核唯一）：mock 下 false 即硬闸失败；
+    # config 下 false 只打警示不判死——留痕先于 JSONL 写盘，警示与硬闸用的是同一份结论
+    ladder_ok = fresh_search_ladder_ok(rows)
+    for row in rows:
+        row["fresh_search_ladder_ok"] = ladder_ok
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
@@ -695,6 +743,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures = verify_rows(rows)
     print("-" * 76)
     print(format_summary(rows))
+    if args.provider == "config" and ladder_ok is False:
+        # ③ 在 config 模式只警示不判死（fix-round 裁定）：搜索次数由模型在帽内自选
+        def count_of(mode: str) -> int:
+            row = next(r for r in rows if r["mode"] == mode)
+            return int((row.get("metrics") or {}).get("fresh_search_count") or 0)
+
+        chain = [m for m in FORCED_MODES if any(r["mode"] == m for r in rows)]
+        counts = "，".join(f"{m}={count_of(m)}" for m in chain)
+        print(
+            f"⚠️ config 模式阶梯非单调（{counts}），已留痕不判死——"
+            "真实模型自选搜索次数所致（fresh_search_ladder_ok=false 已写入 JSONL）"
+        )
     if args.json:
         cws.write_json(
             Path(args.json),
@@ -721,11 +781,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_ASSERT_FAILED
 
     auto_row = next((row for row in rows if row["mode"] == MODE_AUTO), None)
+    if ladder_ok is None:
+        ladder_text = "③ fresh 搜索阶梯无可比较对（未判定，留痕 None）"
+    elif ladder_ok:
+        ladder_text = "③ fresh 搜索沿模式阶梯单调"
+    else:
+        # 走到通过行说明是 config 模式（mock 的阶梯断裂在 failures 分支已退出）
+        ladder_text = "③ fresh 搜索阶梯非单调（config 留痕不判死）"
     print("-" * 76)
     print(
         "✓ 断言通过：① 每行 policy 全量带 features+reasons；"
         "② mock 下 simple 成本 < deep 且 simple 零 fresh 搜索；"
-        "③ fresh 搜索沿模式阶梯单调；"
+        f"{ladder_text}；"
         + (
             f"④ auto 守卫红线复验（stale_hits={auto_row['policy']['features']['stale_hits']} "
             f"→ mode={auto_row['policy']['mode']} ≠ simple）；"

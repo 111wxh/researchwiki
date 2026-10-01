@@ -63,6 +63,7 @@ EXPECTED_ROW_KEYS = {
     "report_chars",
     "citation_coverage",
     "input_tokens_checked",
+    "fresh_search_ladder_ok",
 }
 
 
@@ -129,12 +130,14 @@ def test_mock_matrix_end_to_end(tmp_path, capsys) -> None:
     assert simple_metrics["input_tokens"] < deep_metrics["input_tokens"]
     assert simple_metrics["fresh_search_count"] == 0
 
-    # 硬断言 ③：fresh 搜索沿 simple ≤ update ≤ deep 单调
+    # 硬断言 ③：fresh 搜索沿 simple ≤ update ≤ deep 单调（mock 下是硬闸）
     counts = [
         by_mode[mode]["metrics"]["fresh_search_count"]
         for mode in ("simple", "update", "deep")
     ]
     assert counts == sorted(counts)
+    # ③ 的行级留痕：mock 矩阵阶梯单调 → 每行盖章 true（断裂时 verify_rows 会判死）
+    assert all(row["fresh_search_ladder_ok"] is True for row in rows)
 
     # 每模式独立 wiki 根目录（warm 起跑、互不污染），且副本里确有 stale 种子笔记
     roots = [Path(row["wiki_root"]) for row in rows]
@@ -201,6 +204,41 @@ def test_mock_matrix_modes_subset(tmp_path) -> None:
     rows = _read_rows(out)
     assert [row["mode"] for row in rows] == ["simple", "deep"]
     assert adaptive.verify_rows(rows) == []
+
+
+def test_ladder_assertion_mock_hard_config_soft(tmp_path) -> None:
+    """断言 ③ 按模式分治（fix-round 裁定）：mock 非单调 → 硬闸；config 同数据 → 不判死。
+
+    判定内核（ladder_breaks / fresh_search_ladder_ok）两模式共用一份：config 的
+    断裂只算出来留痕（false 落盘 + main 打警示），绝不进失败清单——真实模型在帽内
+    自选搜索次数，硬闸度量的是模型服从度而非策略正确性。
+    """
+
+    def make_rows(provider_mode: str, counts: tuple[int, ...]) -> list[dict[str, Any]]:
+        modes = ("simple", "update", "deep")[: len(counts)]
+        return [
+            {
+                "mode": mode,
+                "provider_mode": provider_mode,
+                "trace_id": f"t{index}",
+                "wiki_root": str(tmp_path),
+                "metrics": {"fresh_search_count": count, "input_tokens": 0,
+                            "output_tokens": 0},
+            }
+            for index, (mode, count) in enumerate(zip(modes, counts, strict=True))
+        ]
+
+    broken_mock = make_rows("mock", (0, 2, 1))
+    assert adaptive.fresh_search_ladder_ok(broken_mock) is False
+    assert any("阶梯断裂" in failure for failure in adaptive.verify_rows(broken_mock))
+
+    broken_config = make_rows("config", (0, 2, 1))
+    assert adaptive.fresh_search_ladder_ok(broken_config) is False
+    # 同样的断裂在 config 下不进失败清单（其余断言照常各自判定）
+    assert not any("阶梯" in failure for failure in adaptive.verify_rows(broken_config))
+
+    # 链上不足两个强制模式 → None（无可比较对，不把"未判定"伪装成"已通过"）
+    assert adaptive.fresh_search_ladder_ok(make_rows("mock", (0,))) is None
 
 
 def test_invalid_mode_rejected_by_argparse(tmp_path) -> None:
