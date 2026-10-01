@@ -51,6 +51,14 @@ def test_invalid_forced_mode_rejected():
     with pytest.raises(ValueError):
         policy_settings_from_config({"forced_mode": "turbo"})
 
+def test_default_config_toml_parses_into_settings():
+    import tomllib
+    from pathlib import Path
+    raw = tomllib.loads((Path(__file__).resolve().parents[1] / "config.toml").read_text("utf-8"))
+    s = policy_settings_from_config(raw.get("retrieval"))
+    assert s.enabled is True
+    assert s.limits[MODE_UPDATE].min_fresh_sources == 1
+
 
 # ---- 特征采集 collect_features（五因子的具体化） ------------------------------
 

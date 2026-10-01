@@ -134,3 +134,53 @@ context_chars = 6
 # dry_run = true 是影子模式：判定与分派照跑，但不落任何笔记/台账（先观察再放行）。
 enabled = true
 dry_run = false
+
+[retrieval]
+# 动态检索策略（P3 / RQ3）：不是每个问题都召回同样多、同样深的记忆。
+# run 开始时先做一次探测检索（probe_k 条），从命中里算确定性特征——
+# coverage（命中数/分数）、freshness（fresh/review_due/stale 计数）、
+# volatility（volatile 命中）、uncertainty（低置信命中 + open 冲突相关度）、
+# budget（剩余 token 比例）——按守卫红线 > 覆盖度 > 预算降级的顺序判定模式：
+#   simple → 直接回答或轻量检索（不 fresh 搜索，只读少量 Prior）
+#   update → 读取旧记忆 + 少量 fresh verification
+#   deep   → 预算完整的研究 loop（与 P2 现状等价）
+# 红线：stale / conflict / 低置信旧记忆不得被路由为 simple（无需搜索）。
+# 每次判定写入 run_dir/policy.json（features + reasons + limits），可复算可审计。
+# enabled = false 为逃生阀：行为回到 P2 单一 deep 路径，不判定不留痕。
+enabled = true
+# 探测检索条数（特征来源，不直接等于注入条数）
+probe_k = 8
+# 判定阈值（确定性规则，评测期校准）
+conflict_similarity = 0.3
+coverage_min_hits = 2
+coverage_min_score = 0.010
+budget_floor = 0.15
+# time_budget_seconds = 600   # 可选：判定耗时超它降一级；缺省不启用
+# forced_mode = "simple"      # 可选：冒烟/评测钉死模式（仍记录 features+reasons）
+
+[retrieval.simple]
+prior_k = 3
+prior_max_chars = 1200
+max_fresh_searches = 0
+max_steps = 3
+subagents = false
+report_style = "brief"
+min_fresh_sources = 0
+
+[retrieval.update]
+prior_k = 5
+prior_max_chars = 4000
+max_fresh_searches = 2
+max_steps = 6
+subagents = false
+report_style = "standard"
+min_fresh_sources = 1
+
+[retrieval.deep]
+prior_k = 5
+prior_max_chars = 4000
+max_fresh_searches = 4
+max_steps = 12
+subagents = true
+report_style = "full"
+min_fresh_sources = 0
