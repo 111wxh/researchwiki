@@ -112,9 +112,19 @@ def test_load_qa_rejects_unknown_qtype(tmp_path: Path) -> None:
         load_qa(path)
 
 
-@pytest.mark.parametrize("bad", ["", ["仅一条但整体不是要点列表也行", 2], "要点", []])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        ["仅一条但整体不是要点列表也行", 2],
+        "要点",
+        [],
+        ["只有一条要点"],
+        ["一", "二", "三", "四", "五"],
+    ],
+)
 def test_load_qa_rejects_bad_gold_points(tmp_path: Path, bad: object) -> None:
-    """gold_points 必须是非空字符串列表；单跳题传空列表也报错。"""
+    """gold_points 必须是 2–4 条的非空字符串列表：空/非列表/混型/1 条/5 条均拒。"""
     path = write_qa(tmp_path, valid_line(gold_points=bad))
     with pytest.raises(ValueError, match="gold_points"):
         load_qa(path)
