@@ -26,6 +26,7 @@ from researchwiki.loop.agent_loop import AgentLoop
 from researchwiki.loop.research_run import ResearchRun
 from researchwiki.tools import get_search_provider
 from researchwiki.wiki.embeddings import get_embedding_provider
+from researchwiki.wiki.freshness import from_config as freshness_from_config
 
 # 早于任何读 key 的代码：把项目根的 .env 灌进环境（真实环境变量优先）
 load_env_file()
@@ -147,6 +148,11 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # [verification] 段是它的判定阈值（None = 模块默认值）
         memory_update_config=config.get("memory_update"),
         verification_config=config.get("verification"),
+        # [retrieval] 段（P3 模式判定；None = 不启用，行为同 P2）；
+        # freshness_settings 用完整 config 解析（半衰期回退读 [wiki] 段，
+        # 与 cli lint 同口径）
+        retrieval_config=config.get("retrieval"),
+        freshness_settings=freshness_from_config(config),
         embedding=get_embedding_provider(config, cache_path=wiki_root / "index.db"),
         ).events()
     else:

@@ -26,6 +26,10 @@ MODES = (MODE_SIMPLE, MODE_UPDATE, MODE_DEEP)
 
 _REPORT_STYLES = ("brief", "standard", "full")
 
+# 报告样式后缀（P3 Task 5 接线点）：report_style="brief" 时追加到报告阶段
+# system 提示词末尾的简报约束；standard/full 不追加（现状不变）。
+_REPORT_STYLE_SUFFIX = "限 200 字以内，直接回答，仅列关键结论"
+
 
 @dataclass(frozen=True)
 class ModeLimits:

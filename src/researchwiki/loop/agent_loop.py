@@ -34,6 +34,13 @@ run-metrics 落盘前）把本轮蒸馏入库的候选当**新证据**，与 pla
 显式传入 ``[memory_update]`` 段才启用（server 通路），``enabled = false`` 是
 逃生阀、``dry_run = true`` 是影子模式；未配置（None）时整个阶段不执行，state.md
 与 run 目录逐字段与接入前一致。
+
+模式判定（P3 Dynamic Retrieval）：run 开始时先对同一 store/index 做零模型调用的
+探测检索，五因子特征 → 确定性模式判定（loop/research_policy.py）→ 留痕
+policy.json（features/reasons/outcome）与 state.md 的 retrieval 行，再按模式限额
+约束本轮研究（prior k/max_chars 覆盖、fresh 搜索帽、子代理门、生效步数、报告
+样式）。显式传入 ``[retrieval]`` 段才启用（server 通路），``enabled = false`` 是
+逃生阀（评测基线）；未配置（None）时模式概念不存在，行为逐字节与接入前一致。
 """
 
 from __future__ import annotations
@@ -73,9 +80,11 @@ if TYPE_CHECKING:
     # wiki.store → loop.notes → loop/__init__ → loop.agent_loop 的包初始化顺序会让
     # 模块级「loop 导入 wiki」形成循环导入。
     from researchwiki.loop.memory_update import MemoryUpdateReport
+    from researchwiki.loop.research_policy import PolicyDecision
     from researchwiki.wiki.distiller import CandidateNote
     from researchwiki.wiki.embeddings import EmbeddingProvider
     from researchwiki.wiki.formation import FormationDecision
+    from researchwiki.wiki.freshness import FreshnessSettings
     from researchwiki.wiki.frontmatter import SourceRef
     from researchwiki.wiki.index import SearchIndex
     from researchwiki.wiki.prior import PriorContext
@@ -272,15 +281,36 @@ def _make_sandbox_resolver(ctx: RunContext) -> Callable[[str], Path]:
 
 
 def _register_research_tools(
-    registry: ToolRegistry, ctx: RunContext, *, with_dispatch: bool
+    registry: ToolRegistry,
+    ctx: RunContext,
+    *,
+    with_dispatch: bool,
+    search_limit: int | None = None,
+    search_mode: str | None = None,
 ) -> None:
-    """注册基础研究工具；with_dispatch 控制是否给主循环开放子 agent 派发（防递归）。"""
+    """注册基础研究工具；with_dispatch 控制是否给主循环开放子 agent 派发（防递归）。
+
+    search_limit / search_mode（P3 模式限额，模式判定后重建注册表时传入）：
+    非 None 时 web_search 在 fresh 检索次数达帽后直接返回 search_budget_exhausted，
+    不再调用 provider、search_calls 不增长（与 run-metrics 的 fresh_search_count
+    同一计数口径）。
+    """
     _resolve_in_sandbox = _make_sandbox_resolver(ctx)
 
     def search_handler(args: dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
             raise ValueError("query 不能为空")
+        if search_limit is not None and ctx.search_calls >= search_limit:
+            # 模式搜索帽（P3）：达帽即拒——provider 不被调用、计数不增长
+            return json.dumps(
+                {
+                    "error": "search_budget_exhausted",
+                    "mode": search_mode,
+                    "limit": search_limit,
+                },
+                ensure_ascii=False,
+            )
         max_results = int(args.get("max_results") or 5)
         ctx.search_calls += 1
         hits = ctx.search_provider.search(query, max_results=max_results)
@@ -519,6 +549,8 @@ class AgentLoop:
         embedding: EmbeddingProvider | None = None,
         wiki_config: Mapping[str, Any] | None = None,
         prior_config: Mapping[str, Any] | None = None,
+        retrieval_config: Mapping[str, Any] | None = None,
+        freshness_settings: FreshnessSettings | None = None,
         formation_config: Mapping[str, Any] | None = None,
         memory_update_config: Mapping[str, Any] | None = None,
         verification_config: Mapping[str, Any] | None = None,
@@ -555,6 +587,23 @@ class AgentLoop:
         self.ctx.subagent_factory = self._run_subagent
         self.subagent_budget = subagent_token_budget
         self.subagent_steps = subagent_max_steps
+
+        # P3 模式判定（Dynamic Retrieval）：retrieval_config=None = 未启用（模式
+        # 概念不存在，行为与接入前逐字段一致）；段内 enabled=false 是逃生阀
+        # （_events 跳过判定，同样零痕迹）——与 formation/memory_update 同约定。
+        # research_policy 依赖 wiki 层，延迟导入的原因见 _build_wiki_layer docstring。
+        from researchwiki.loop.research_policy import policy_settings_from_config
+
+        self.policy_settings = (
+            None if retrieval_config is None else policy_settings_from_config(retrieval_config)
+        )
+        # freshness 判定参数（P3 特征采集用；None = 模块默认，由调用方显式传入）
+        self.freshness_settings = freshness_settings
+        # 模式判定结论（_events 开头填充；None = 未启用或未判定）与 run 起始时刻
+        # （elapsed_seconds 特征基准）；_policy_index 是 Prior 禁用时的探测索引兜底
+        self.policy_decision: PolicyDecision | None = None
+        self._policy_index: SearchIndex | None = None
+        self._t0 = self.clock()
 
         # wiki 三层存储（notes/ pages/ conflicts/，与 loop 层既有目录布局互读兼容）：
         # run 内蒸馏走 Distiller（报告素材 → 原子笔记）→ Ingestor（查重合并 + 规范 ID）。
@@ -651,21 +700,22 @@ class AgentLoop:
         # 索引复用 AgentLoop 的 embedding 与 [wiki] 的 tokenizer/半衰期配置，
         # 构造方式同 mcp_server/service.py 的 _open_index；禁用时不建索引（零副作用）。
         self.prior_settings = prior_settings(prior_config)
+        # [wiki] 段归一与索引构造口径保存下来（P3）：Prior 禁用但模式判定开启时，
+        # 探测索引按同一口径打开（见 _probe_index 的兜底路径）。
+        if isinstance(wiki_config, Mapping) and "wiki" in wiki_config:
+            full_cfg: Mapping[str, Any] = wiki_config
+        else:
+            full_cfg = {"wiki": wiki_config or {}}
+        index_settings = wiki_settings(full_cfg)
+        self._index_settings = index_settings
+        self._embedding = embedding
         self.prior_index: SearchIndex | None = None
         if self.prior_settings.enabled:
-            # wiki_config 的既定口径与 dedup_settings 一致：[wiki] 段或完整 config
-            # 皆可（server / smoke 脚本传的是段）；wiki_settings 只认完整 config，
-            # 这里归一后再解析。
-            if isinstance(wiki_config, Mapping) and "wiki" in wiki_config:
-                full_cfg: Mapping[str, Any] = wiki_config
-            else:
-                full_cfg = {"wiki": wiki_config or {}}
-            settings = wiki_settings(full_cfg)
             self.prior_index = SearchIndex(
                 self.wiki_root,
                 embedding=embedding,
-                tokenizer=settings.fts_tokenizer,
-                half_life_days=settings.half_life_days,
+                tokenizer=index_settings.fts_tokenizer,
+                half_life_days=index_settings.half_life_days,
             )
         # formation（RQ1：什么时候应该记住）：显式传入 [formation] 段才启用入库
         # 判定；None = 未配置（脚本 / 既有测试等老调用方），跳过判定照旧入库、
@@ -703,13 +753,112 @@ class AgentLoop:
 
         # 正确性优先：索引落后于 store 就整体 rebuild（性能后优化）
         ensure_index_fresh(self.wiki_store, self.prior_index)
+        # P3 模式限额：判定存在时 prior k/max_chars 用模式限额覆盖 [prior] 段值
+        limits = self.policy_decision.limits if self.policy_decision is not None else None
         self.prior_context = retrieve_priors(
             self.question,
             self.wiki_store,
             self.prior_index,
-            k=self.prior_settings.k,
-            max_chars=self.prior_settings.max_chars,
+            k=limits.prior_k if limits is not None else self.prior_settings.k,
+            max_chars=(
+                limits.prior_max_chars if limits is not None else self.prior_settings.max_chars
+            ),
         )
+
+    # ---- 模式判定（P3 Dynamic Retrieval：探测 → 判定 → 留痕 → 限额）----------
+
+    def _decide_policy_mode(self) -> None:
+        """模式判定：探测检索 → collect_features → decide_mode → policy.json 留痕。
+
+        - 未启用（retrieval_config=None，或段内 enabled=false 逃生阀）→ 不判定、
+          不写 policy.json、state.md 不出现 retrieval 行（与接入前逐字段一致）；
+        - 探测索引复用 Prior 索引（Prior 禁用时按同一构造口径临时打开），
+          先 ensure_index_fresh——探测与随后的 Prior 检索同源、同新鲜度；
+        - 判定先于 Prior 注入与 plan 消息组装：模式限额从第一条消息前就生效；
+        - outcome 字段在报告写盘后由 _backfill_policy_outcome 回填（此时恒 None）。
+        """
+        self.policy_decision = None
+        settings = self.policy_settings
+        if settings is None or not settings.enabled:
+            return
+        from researchwiki.loop.research_policy import collect_features, decide_mode
+        from researchwiki.wiki.prior import ensure_index_fresh
+
+        index = self._probe_index()
+        ensure_index_fresh(self.wiki_store, index)
+        decision = decide_mode(
+            collect_features(
+                self.question,
+                self.wiki_store,
+                index,
+                settings=settings,
+                freshness_settings=self.freshness_settings,
+                # 预算余量：此刻尚未发生任何模型调用，公式照 PLAN 口径给出（=1.0）
+                budget_remaining_ratio=max(
+                    0.0, 1.0 - self.input_tokens / max(1, self.token_budget)
+                ),
+                elapsed_seconds=self.clock() - self._t0,
+            ),
+            settings=settings,
+        )
+        self.policy_decision = decision
+        payload = {
+            "trace_id": self.trace_id,
+            "decided_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            **decision.to_dict(),
+            "outcome": None,  # 报告写盘后回填（fresh 来源核验）
+        }
+        atomic_write_text(
+            self.run_dir / "policy.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def _probe_index(self) -> SearchIndex:
+        """探测检索用的索引：复用 Prior 索引；Prior 禁用时按同一构造口径临时打开。"""
+        if self.prior_index is not None:
+            return self.prior_index
+        from researchwiki.wiki.index import SearchIndex
+
+        self._policy_index = SearchIndex(
+            self.wiki_root,
+            embedding=self._embedding,
+            tokenizer=self._index_settings.fts_tokenizer,
+            half_life_days=self._index_settings.half_life_days,
+        )
+        return self._policy_index
+
+    def _rebuild_registries_for_mode(self) -> None:
+        """模式限额生效点（工具面）：按判定限额重建主/子注册表。
+
+        - subagents=False → 主注册表不注册 dispatch_research（模型工具面里
+          根本看不到该工具，而非调用时报错）；
+        - max_fresh_searches 帽 → web_search 达帽即拒（主/子注册表共用同一
+          ctx 与 search_calls 计数口径，子 agent 的检索同样受帽约束）。
+        __init__ 里的初始注册表保持无限额（legacy 行为）；未判定时不重建。
+        """
+        decision = self.policy_decision
+        if decision is None:
+            return
+        limits = decision.limits
+        main_registry = ToolRegistry()
+        _register_research_tools(
+            main_registry,
+            self.ctx,
+            with_dispatch=limits.subagents,
+            search_limit=limits.max_fresh_searches,
+            search_mode=decision.mode,
+        )
+        sub_registry = ToolRegistry()
+        _register_research_tools(
+            sub_registry,
+            self.ctx,
+            with_dispatch=False,
+            search_limit=limits.max_fresh_searches,
+            search_mode=decision.mode,
+        )
+        self.registry = main_registry
+        self.sub_registry = sub_registry
+        self.tools_schema = main_registry.schemas()
 
     # ---- formation 判定（RQ1：什么时候应该记住）-----------------------------
 
@@ -852,13 +1001,29 @@ class AgentLoop:
         """滚动状态原子重写：阶段推进与每个研究步骤后各写一次。"""
         pct = round(self.input_tokens / self.token_budget * 100, 1) if self.token_budget else 0.0
         digest = self.research_summary or self.plan_text
+        # P3 模式限额：生效步数显示判定后的值（未判定 = 构造参数，输出不变）
+        effective_max_steps = (
+            self.policy_decision.limits.max_steps
+            if self.policy_decision is not None
+            else self.max_steps
+        )
         lines = [
             "# Run 状态",
             "",
             f"- trace_id：{self.trace_id}",
             f"- 问题：{self.question}",
             f"- 阶段：{phase}",
-            f"- 步骤：{self.step_count}/{self.max_steps}（工具调用 {self.tool_calls_count} 次）",
+        ]
+        if self.policy_decision is not None:
+            decision = self.policy_decision
+            first_reason = decision.reasons[0] if decision.reasons else ""
+            lines.append(
+                f"- retrieval: mode={decision.mode} forced={str(decision.forced).lower()}"
+                f" reasons={first_reason}"
+            )
+        lines += [
+            f"- 步骤：{self.step_count}/{effective_max_steps}"
+            f"（工具调用 {self.tool_calls_count} 次）",
             f"- Token：input {self.input_tokens} / output {self.output_tokens}"
             f"（预算 {self.token_budget}，已用 {pct}%）",
             f"- 来源：{len(self.ctx.source_pool.entries)} 个",
@@ -890,6 +1055,13 @@ class AgentLoop:
             self._write_run_metrics_guarded(t_start)
 
     def _events(self) -> Iterator[dict[str, Any]]:
+        # ---- 阶段 -1：模式判定（P3 Dynamic Retrieval：探测 → 判定 → 留痕）----
+        # 先于 Prior 注入与 plan 消息：模式限额（prior k/max_chars 覆盖、fresh
+        # 搜索帽、子代理门、生效步数、报告样式）从本轮第一条消息前就生效。
+        # 探测复用 Prior 段的 store/index（先 ensure_index_fresh，同源同新鲜度）。
+        self._decide_policy_mode()
+        self._rebuild_registries_for_mode()
+
         # ---- 阶段 0：Prior 检索（PLAN §4.2：plan 步骤之前，不污染来源池）----
         self._retrieve_priors()
         plan_content = self.question
@@ -932,9 +1104,14 @@ class AgentLoop:
         ]
         steps_used = 0
         forced = ""
+        # P3 模式限额：生效步数用模式限额覆盖构造参数（未判定 = 原值，行为不变）
+        mode_limits = self.policy_decision.limits if self.policy_decision is not None else None
+        effective_max_steps = (
+            mode_limits.max_steps if mode_limits is not None else self.max_steps
+        )
         if self.input_tokens >= self.token_budget:
             forced = "token_budget"
-        elif self.max_steps <= 0:
+        elif effective_max_steps <= 0:
             forced = "max_steps"
 
         task_act: str | None = None
@@ -944,7 +1121,7 @@ class AgentLoop:
             yield from self._drain_tasks()
 
         while not forced:
-            if steps_used >= self.max_steps:
+            if steps_used >= effective_max_steps:
                 forced = "max_steps"
                 break
             if self.input_tokens >= self.token_budget:
@@ -1124,9 +1301,18 @@ class AgentLoop:
         parts = []
         usage = None
         report_messages = [*history, Message(role="user", content=REPORT_REQUEST)]
+        report_system_text = report_system(sources, forced_reason=self.forced_reason)
+        if (
+            self.policy_decision is not None
+            and self.policy_decision.limits.report_style == "brief"
+        ):
+            # P3 简报样式：报告 system 提示后追加简报约束（standard/full 现状不变）
+            from researchwiki.loop.research_policy import _REPORT_STYLE_SUFFIX
+
+            report_system_text = f"{report_system_text}\n{_REPORT_STYLE_SUFFIX}"
         for ev in self.provider.stream(
             report_messages,
-            system=report_system(sources, forced_reason=self.forced_reason),
+            system=report_system_text,
             tools=None,
         ):
             if ev.type == "text_delta":
@@ -1148,6 +1334,11 @@ class AgentLoop:
             }
 
         atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
+
+        # ---- P3：policy.json outcome 回填 + 诚实缺口提示（报告写盘后）----
+        # 位置同记忆更新的守卫约定：report 已写盘（run 产物已完整），回填失败
+        # 只记 stderr，不推翻本次 run。
+        self._backfill_policy_outcome_guarded()
 
         # ---- 阶段 5：记忆更新（RQ2 闭环：本轮新证据 vs 命中的 Prior）----
         # 位置刻意放这里：report 已写盘（哪怕本阶段出问题，run 的产物已完整），
@@ -1285,6 +1476,55 @@ class AgentLoop:
             self.run_dir / "memory-update.json",
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         )
+
+    # ---- policy.json outcome 回填（P3：fresh 来源核验 + 诚实边界）-----------
+
+    def _backfill_policy_outcome_guarded(self) -> None:
+        """outcome 回填的守卫入口（同记忆更新/run-metrics 的守卫约定）。
+
+        回填是收尾期的辅助产物：报告已写盘，任何失败（读盘/写盘/序列化）都
+        只记 stderr——既不压过流中的原异常，也不打断 finish 之前的事件流。
+        """
+        try:
+            self._backfill_policy_outcome()
+        except Exception as exc:  # noqa: BLE001 -- 辅助产物失败不能推翻本次 run
+            print(
+                f"[agent-loop] policy.json outcome 回填失败（run 产物不受影响）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _backfill_policy_outcome(self) -> None:
+        """报告写盘后回填 policy.json 的 outcome，并按需追加诚实缺口提示块。
+
+        - fresh_source_count = 本轮 SourcePool 计数（Prior URL 从不进池，天然不计；
+          子 agent 来源经 ctx.add_source 汇入，同口径统计）；
+        - min_fresh_sources > 0 且不足时，向 report.md 末尾追加诚实边界提示块
+          （明示"非引用缺失错误"，供评测区分模式约束与引用质量缺陷）。
+          提示块只落盘、不进正文事件流（report_text 与 text-delta 不变）。
+        """
+        decision = self.policy_decision
+        if decision is None:
+            return
+        fresh_source_count = len(self.ctx.source_pool.entries)
+        min_fresh = decision.limits.min_fresh_sources
+        satisfied = fresh_source_count >= min_fresh
+        path = self.run_dir / "policy.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["outcome"] = {
+            "fresh_source_count": fresh_source_count,
+            "min_fresh_sources": min_fresh,
+            "min_fresh_sources_satisfied": satisfied,
+        }
+        atomic_write_text(
+            path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
+        if min_fresh > 0 and not satisfied:
+            gap = (
+                f"> ⚠️ 新鲜来源不足：本轮 fresh source {fresh_source_count} 篇，"
+                f"低于该模式要求下限 {min_fresh}（诚实边界，非引用缺失错误）。"
+            )
+            atomic_write_text(self.run_dir / "report.md", self.report_text + "\n" + gap + "\n")
 
     # ---- 辅助 ----------------------------------------------------------
 
