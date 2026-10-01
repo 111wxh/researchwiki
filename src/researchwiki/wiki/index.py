@@ -19,8 +19,8 @@
 rebuild(store)（全量重建）或 index_note(note)（增量 upsert）。索引存了
 body 快照（供向量命中出摘要与短查询 LIKE），md 改动后需重新 index_note。
 除正文快照外，note_meta 还存一列 ``body_hash``（``note_index_hash``：title/body +
-confidence/volatility/kind/redirect_to/superseded_by/observed_at/created/tombstone
-的 sha256，即"这条索引记录对应哪一版检索视图"的指纹）——``prior.ensure_index_fresh``
+confidence/volatility/kind/redirect_to/superseded_by/observed_at/created/tombstone/
+importance 的 sha256，即"这条索引记录对应哪一版检索视图"的指纹）——``prior.ensure_index_fresh``
 与 ``mcp_server.service._index_is_stale`` **共用** ``index_drift`` 这一个判据
 发现**同 id 原地改写**（memory_update / formation merge / formation 标注回写 kind /
 memory_invalidate 写墓碑标记等入口），只比 status 会静默保留陈旧索引。
@@ -46,6 +46,8 @@ from researchwiki.wiki.store import Note, WikiStore
 
 RRF_K = 60
 CONFIDENCE_FACTOR: Mapping[str, float] = {"high": 1.0, "medium": 0.9, "low": 0.75}
+IMPORTANCE_FLOOR = 0.5    # importance 因子下限：factor = floor + (1-floor)*value
+IMPORTANCE_DEFAULT = 0.6  # 旧数据/显式写入未标 importance 时的中性值
 DEFAULT_HALF_LIFE_DAYS: Mapping[str, float] = {"volatile": 30.0, "drifting": 90.0}  # stable 不衰减
 # 向量通道的最低余弦相似度：正交（0 相似）不算命中，避免"唯一向量也排第一"
 VECTOR_MIN_COSINE = 1e-6
@@ -207,6 +209,21 @@ def _parse_ts(text: str | None) -> datetime | None:
     return parsed
 
 
+def importance_factor(importance: float | None) -> float:
+    """P3 进因子（PLAN §2.4）：温和乘子，避免 importance 线性压制相关性。
+
+    ``factor = IMPORTANCE_FLOOR + (1 - IMPORTANCE_FLOOR) * value``，``value``
+    取 importance（None 视为 IMPORTANCE_DEFAULT）。量级：1.0→1.0、0.6→0.8、
+    0.3→0.65、0.0→0.5——最不重要的笔记也保留一半分数，相关性（RRF）仍是
+    排名的主导项，importance 只做同相关性内的重排。
+    """
+    if importance is None:
+        value = IMPORTANCE_DEFAULT
+    else:
+        value = max(0.0, min(1.0, importance))  # 越界夹取，脏数据不放大失真
+    return IMPORTANCE_FLOOR + (1.0 - IMPORTANCE_FLOOR) * value
+
+
 def _serialize_vector(vec: list[float]) -> bytes:
     """float32 小端打包（sqlite-vec raw bytes 格式，暴力扫描路径复用）。"""
     return struct.pack(f"{len(vec)}f", *vec)
@@ -221,18 +238,20 @@ def note_index_hash(note: Note) -> str:
 
     指纹输入（顺序固定，逐字段以 ``"\\n"`` 连接后取 sha256 hex）：``title``、
     ``body``、``confidence``、``volatility``、``kind``、``redirect_to``、
-    ``superseded_by``、``observed_at``、``created``、``tombstone``——即
-    ``note_fts`` 的两列（title/body）加 ``note_meta`` 里 ``search()`` 实际消费的
-    八个列：confidence / volatility / observed_at / created 进检索打分
-    （``CONFIDENCE_FACTOR`` × ``freshness_factor``），kind 进 kind 过滤，
+    ``superseded_by``、``observed_at``、``created``、``tombstone``、
+    ``importance``——即 ``note_fts`` 的两列（title/body）加 ``note_meta`` 里
+    ``search()`` 实际消费的九个列：confidence / volatility / observed_at /
+    created / importance 进检索打分（``CONFIDENCE_FACTOR`` × ``freshness_factor``
+    × ``importance_factor``），kind 进 kind 过滤，
     redirect_to / superseded_by 进重定向解析（改了就改命中落点与 ``redirected_from``），
     tombstone 则是 P2-F 裁定一引入的**检索可见性**开关（真 = 墓碑，默认被排除）。
 
     因此"只改这些字段、body/title/status 都不变"同样会让索引失真，必须能被
     ``prior.ensure_index_fresh`` 检出——这正是本函数覆盖全部写入字段（而不仅
     正文）的原因；在 ``index_note`` 里新增参与检索的列时，**这里必须同步扩列表**，
-    否则新列会退回"只有 rebuild 才能纠正"的静默陈旧（P2-F 的 tombstone 列就是
-    按这条规矩加进来的：标记变化必须能被一致性检查检出）。
+    否则新列会退回"只有 rebuild 才能纠正"的静默陈旧（P2-F 的 tombstone 列、
+    P3 §2.4 的 importance 列都是按这条规矩加进来的：标记/权重变化必须能被
+    一致性检查检出，旧行的存储哈希随之失配 → rebuild 自动重写）。
 
     ``status`` 不在输入内：它由 ``ensure_index_fresh`` 的独立维度负责，两类原因
     分开报告更好审计。写入位置是 ``note_meta.body_hash`` 列——列名沿用任务简报
@@ -251,6 +270,9 @@ def note_index_hash(note: Note) -> str:
             str(meta.observed_at or ""),
             str(meta.created or ""),
             "1" if meta.tombstone else "0",
+            # importance 不能学上面的 `or ""` 写法：0.0 与 None 的打分因子不同
+            # （0.5 vs 0.8），必须显式判 None，否则两态会被哈希成同一指纹
+            str(meta.importance) if meta.importance is not None else "",
         )
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -351,7 +373,8 @@ class SearchIndex:
             "CREATE TABLE IF NOT EXISTS note_meta ("
             "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
             "volatility TEXT, kind TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
-            "observed_at TEXT, created TEXT, body_hash TEXT, tombstone INTEGER)"
+            "observed_at TEXT, created TEXT, body_hash TEXT, tombstone INTEGER, "
+            "importance REAL)"
         )
         self._migrate_note_meta(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -400,6 +423,14 @@ class SearchIndex:
         ——与 kind 的迁移同理，旧数据里不存在墓碑（该标记是本包新引入的），
         回填 0 语义无损且不触发一次白做的 rebuild。注意 body_hash 仍是 NULL 的
         更旧索引照样会因"缺指纹"整体 rebuild 一次，那是另一条维度的事。
+
+        P3 §2.4 增补 v4 → v5 的 importance 列（检索排名因子，见
+        ``importance_factor``）：ALTER 后**存量行不回填**（留 NULL）。NULL 的
+        语义正好是"未评估"——``importance_factor(None)`` 走中性默认
+        ``IMPORTANCE_DEFAULT``，与 P1 落库前写入的旧笔记行为一致，回填反而
+        无从取值（迁移路径只有连接、没有 store）。哈希清单同步扩了 importance，
+        旧行存储哈希失配 → 首次一致性检查判"索引字段变化"整体 rebuild，
+        rebuild 后即带真实权重（仍未标 importance 的笔记继续走中性默认）。
         """
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(note_meta)")}
         if "kind" not in columns:
@@ -410,6 +441,8 @@ class SearchIndex:
         if "tombstone" not in columns:
             conn.execute("ALTER TABLE note_meta ADD COLUMN tombstone INTEGER")
             conn.execute("UPDATE note_meta SET tombstone = 0 WHERE tombstone IS NULL")
+        if "importance" not in columns:
+            conn.execute("ALTER TABLE note_meta ADD COLUMN importance REAL")
 
     def _ensure_vec_table(self, dim: int) -> bool:
         """惰性建 vec0 表；sqlite-vec 不可用或建表失败返回 False（走暴力扫描）。"""
@@ -446,8 +479,8 @@ class SearchIndex:
         )
         conn.execute(
             "INSERT OR REPLACE INTO note_meta (note_id, title, body, confidence, volatility, "
-            "kind, status, redirect_to, superseded_by, observed_at, created, body_hash, tombstone) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "kind, status, redirect_to, superseded_by, observed_at, created, body_hash, "
+            "tombstone, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 note.id,
                 note.title,
@@ -462,6 +495,7 @@ class SearchIndex:
                 note.meta.created,
                 note_index_hash(note),
                 1 if note.meta.tombstone else 0,
+                note.meta.importance,
             ),
         )
         conn.execute(
@@ -526,7 +560,7 @@ class SearchIndex:
         *,
         include_tombstones: bool = False,
     ) -> list[SearchMatch]:
-        """双通道检索 + RRF 融合 + 置信/新鲜度调节；默认只回 active 笔记。
+        """双通道检索 + RRF 融合 + 置信/新鲜度/重要度调节；默认只回 active 笔记。
 
         命中 merged/superseded 时跟随重定向到最终 active 笔记并在结果上
         标注 redirected_from（值是被命中的那条别名笔记 id）。
@@ -572,6 +606,12 @@ class SearchIndex:
                 half_life_days=self.half_life_days,
                 now=now,
             )
+            # P3 §2.4：importance 温和乘子（None = 未评估 → 中性默认），在
+            # 相关性/置信/新鲜度之后只做同分内的重排，不线性压制 RRF 主序
+            raw_importance = info.get("importance")
+            weight = importance_factor(
+                None if raw_importance is None else float(raw_importance)
+            )
             in_fts, in_vec = note_id in fts_ranked, note_id in vector_ranked
             match_type = "both" if in_fts and in_vec else ("fts" if in_fts else "vector")
             snippet = fts_ranked.get(note_id) or self._body_snippet(info)
@@ -581,7 +621,7 @@ class SearchIndex:
                     note_id=note_id,
                     title=str(info["title"]),
                     snippet=snippet,
-                    score=fused_score * confidence * fresh,
+                    score=fused_score * confidence * fresh * weight,
                     match_type=match_type,
                     redirected_from=None if direct else self._redirect_source.get(note_id),
                 )
@@ -596,15 +636,18 @@ class SearchIndex:
         matches.sort(key=lambda m: (-m.score, m.note_id))
         return matches[:k]
 
-    def _load_meta_map(self) -> dict[str, dict[str, str | None]]:
+    def _load_meta_map(self) -> dict[str, dict[str, str | float | None]]:
         """note_meta 全量快照（检索期用）。``tombstone`` 在这里就归一成 ``"1"``/``"0"``
-        字符串：列本身是 INTEGER，而本字典的值类型统一是 ``str | None``（SQL 里
-        直接 CASE 成文本，省掉 Python 侧的类型抖动）。
+        字符串：列本身是 INTEGER，而打分/过滤消费的是文本标记（SQL 里直接 CASE
+        成文本，省掉 Python 侧的类型抖动）。``importance``（P3 §2.4）是唯一的
+        数值例外：保持 REAL 原生的 ``float | None``，None 即"未评估"，交给
+        ``importance_factor`` 走中性默认。
         """
         rows = self._conn.execute(
             "SELECT note_id, title, confidence, volatility, kind, status, redirect_to, "
             "superseded_by, observed_at, created, body, "
-            "CASE WHEN COALESCE(tombstone, 0) != 0 THEN '1' ELSE '0' END "
+            "CASE WHEN COALESCE(tombstone, 0) != 0 THEN '1' ELSE '0' END, "
+            "importance "
             "FROM note_meta"
         ).fetchall()
         keys = (
@@ -620,6 +663,7 @@ class SearchIndex:
             "created",
             "body",
             "tombstone",
+            "importance",
         )
         return {str(row[0]): dict(zip(keys, row, strict=True)) for row in rows}
 

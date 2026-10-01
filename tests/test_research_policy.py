@@ -12,7 +12,7 @@ from researchwiki.loop.research_policy import (
     policy_settings_from_config,
 )
 from researchwiki.wiki.freshness import FreshnessSettings
-from researchwiki.wiki.index import SearchIndex
+from researchwiki.wiki.index import SearchIndex, importance_factor
 from researchwiki.wiki.store import WikiStore
 
 
@@ -207,3 +207,63 @@ def test_insufficient_coverage_reason_records_values():
                     settings=policy_settings_from_config(None))
     assert d.mode == MODE_UPDATE
     assert "hit_count=1" in d.reasons[0] and "0.0050" in d.reasons[0]
+
+
+# ---- P3 §2.4：importance 进检索排名因子 ---------------------------------------
+
+def test_importance_factor_scale():
+    # 温和乘子：factor = 0.5 + 0.5*value（None 视为中性默认 0.6 → 0.8），越界夹取
+    assert importance_factor(1.0) == 1.0
+    assert abs(importance_factor(0.3) - 0.65) < 1e-9
+    assert abs(importance_factor(None) - 0.8) < 1e-9
+    assert abs(importance_factor(0.0) - 0.5) < 1e-9
+    assert importance_factor(1.5) == 1.0      # 越界夹取
+    assert importance_factor(-1.0) == 0.5
+
+def test_importance_reorders_ranking(tmp_path):
+    store = WikiStore(tmp_path / "wiki-data")
+    # 同题两条：高重要度 vs 低重要度，其余特征一致（confidence/volatility/created 同默认）
+    store.save_note("Zephyr 内存占用约 2KB，来自官方文档。", title="高价值",
+                    entities=["Zephyr"], importance=1.0)
+    store.save_note("Zephyr 内存占用大约 2KB。", title="低价值",
+                    entities=["Zephyr"], importance=0.0)
+    idx = SearchIndex(store.root, clock=lambda: NOW)
+    idx.rebuild(store)
+    hits = idx.search("Zephyr 内存占用", k=2)
+    assert hits[0].note_id != hits[1].note_id
+    high = next(n for n in store.list_notes() if n.title == "高价值")
+    assert hits[0].note_id == high.id   # 高重要度排前
+
+def test_old_index_without_importance_column_rebuilds(tmp_path):
+    # 旧库迁移路径：先用新代码建库，再把 note_meta 降级成"真实旧 schema"
+    # （= index.py 现有 CREATE TABLE note_meta 的列清单，仅缺 importance），
+    # 重新打开时守护迁移补列，rebuild 用新代码重写全部行，search 照常命中。
+    import sqlite3
+    root = tmp_path / "wiki-data"
+    store = WikiStore(root)
+    note = store.save_note("Zephyr 内存占用约 2KB。", entities=["Zephyr"])
+    SearchIndex(root, clock=lambda: NOW).rebuild(store)   # 先按新代码建库（带列）
+    conn = sqlite3.connect(root / "index.db")
+    # 造一个没有 importance 列的旧版 note_meta（列名/列序与 P2 末版 DDL 一致）
+    conn.execute("DROP TABLE note_meta")
+    conn.execute(
+        "CREATE TABLE note_meta ("
+        "note_id TEXT PRIMARY KEY, title TEXT, body TEXT, confidence TEXT, "
+        "volatility TEXT, kind TEXT, status TEXT, redirect_to TEXT, superseded_by TEXT, "
+        "observed_at TEXT, created TEXT, body_hash TEXT, tombstone INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO note_meta (note_id, title, body, confidence, volatility, kind, "
+        "status, redirect_to, superseded_by, observed_at, created, body_hash, tombstone) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (note.id, "t", "Zephyr 内存占用约 2KB。", "medium", "stable", "knowledge",
+         "active", None, None, None, "2026-10-01", "h", 0),
+    )
+    conn.commit()
+    conn.close()
+    idx = SearchIndex(root, clock=lambda: NOW)   # 重新打开：初始化即触发守护迁移
+    columns = {row[1] for row in idx._conn.execute("PRAGMA table_info(note_meta)")}
+    assert "importance" in columns               # 缺列 → ALTER 已补上
+    idx.rebuild(store)          # 迁移 + 重建
+    hits = idx.search("Zephyr 内存占用", k=3)
+    assert hits and hits[0].note_id == note.id
