@@ -280,3 +280,60 @@
 **Deferred minors（缓还清单，终审已分类：无阻塞项）**：config 校验加固（conflict_similarity/coverage_min_score 夹取、非 Mapping override 的 TypeError、_VOLATILITY_RANK .get 化）；time_budget_seconds 路径零覆盖（预算因子当前惰性，激活时一并补）；recall 双开索引与全库扫描 O(笔记文件数)（10k+ 笔记优化目标）；默认值锁定测试仅锁 2 值（可固化为全等断言）；杂项命名/重复表达式。**预算因子结构性惰性（判定先于一切模型调用，budget_remaining_ratio 恒 1.0）**为计划层面已知限制，评测期再议 mid-run 重判定。
 
 **P2 移交三项（范围外确认）**：①替换门与相似度带明文化 ②merge 独立下限 ③F7 id 形态护栏——均未在本会话处理，继续悬置（②③触发条件在 P4）。
+
+---
+
+## 10. 评测支线 MVP 会话（2026-10-01～03，含一次用户暂停/恢复）
+
+> 承接 §9（P3）后的评测支线（PLAN §7.1–7.4），计划：`docs/superpowers/plans/2026-10-01-eval-mvp.md`（入库 `517e9ac`）。SDD 工作区 `.superpowers/sdd/2026-10-01-eval-mvp/`（gitignored，本节为完整存档）。子智能体继承会话模型（用户指示）。测试 747 → **826** 全绿；提交 13 个（`d096b89..<本节>`），全部已推送。
+
+### 10.1 会话准备与口径裁定
+
+- 侦察者 `fcab6ab9`：10 节接口报告（SearchProvider 协议/fetch 快照布局/AgentLoop 关闭开关/gate 脚本指标先例/call_text 单次调用范式/Tier 注解位点/无 [search] 段与 MockSearch 回退路径）。
+- 用户三问（主题域/judge/搜索）未作选择 → 监察者按推荐默认执行（**裁定 R1**，全部可逆，题集人工校验为内置推翻点）：主题域=AI 框架生态、judge=glm-4.7、搜索=受控语料口径。
+- **裁定 R2（关键口径）**：MVP 用**受控合成语料**（`evals/fixtures/ai-frameworks/`，fixture:// URL，3 对时效双版本文档）——无搜索 key 时 MockSearch 答不了具体领域问题，四条件必须同源取材才可比；代价（真实世界时效性弱化）在 manifest.provider_note 与报告头部如实声明。
+- **裁定 R3**：§7.3 Harness 类指标（compaction/checkpoint/2h 压测）范围外（依赖 P4 支撑设施）；MVP 落地成本/速度/质量三类。
+
+### 10.2 逐任务（7 任务 + 终审修复波）
+
+- **T1 语料+题集**（实现者 `1b576578`）：21 篇 md（18+3 对 @v2，442–658 字）+ 30 题（12/9/5/4，时效题 notes 机器可解析）+ `evals/qa.py` 校验器 + 30 测试 → 777（`34d483c`）。评审 `ec2c6563`：Approved，跨文档 30+ 事实串抽验零冲突；1 Important（milvus@v2 修订说明漏报 P99 10→9ms）+ 控制器升级 1 条承载项（Q017 单文档假多跳，裁定污染 multi_hop 效度 1/9）→ 修复轮 `0f9ce0c`：修订说明补报/Q017 改真两跳（embeddings-api×embedding-models）/gold 边界护栏 2 例 → 779。复审 `ea63bab9` 全 ADDRESSED。
+- **T2 语料检索**（`d2a2b7c2`）：`evals/corpus.py` CorpusIndex/FixtureSearch（33 chunk、vector|hybrid、同分 tie-break、calls 计数）+ 10 测试 → 789（`2587ee8`）。评审 `4e2ff7c5`：Approved；切块边界对真实语料实证无损；句号正则避开版本号的设计被点名表扬。
+- **T3 确定性指标**（`f766b78f`）：`evals/metrics.py`（归一 EM/要点命中/拒答启发式/aggregate_rows 缺失语义/percentile 与 gate 脚本逐用例钉死同口径）+ 8 测试 → 797（`e6d4783`）。评审 `6638982f`：Approved；三个具名风险（percentile 同构/%数字保留/refusal 归一长度）全部实证。
+- **T4 judge**（`c475ce15`）：Tier "judge" 9 处纯注解 + `[llm.judge]`（glm-4.7）+ `evals/judge.py`（复用 call_text 与 extract_json、clamp、畸形→None 不编造）+ 8 测试 → 805（`0c2259b`）。评审 `c26303c0`：Approved；extract_json 复用与 bool 先于数字判别被点名。
+- **T5 RAG harness**（`77e6b295`）：`evals/rag_harness.py`（C2/C3 同 harness 同 prompt 仅 mode 不同、300 字统一约束、on_usage 捕获无双记账、空检索口径）+ 6 测试 → 811（`c7937a2`）。评审 `ddfc7ddd`：Approved；双记账风险核验安全。
+- **T6 run_eval 四条件 runner**（`40e0f4e1`，最重集成）：C1 每题一次性 root/C2C3 RAG/C4 seed+copytree 隔离；fixture URL 改写（fixture://→http://fixture.local）+ MockTransport 回放语料（fetch 真实链路写快照）；judge 独立 `-judge` trace 保主 trace 对账；诚实边界三层声明（manifest/模块 docstring/行级 provider_note）+ 4 测试 → 815（`cc7d16a`）。评审 `d96c730c`：Approved，五个具名风险（对账/隔离/URL 链/行契约/seed 幂等）全部实证。
+- **T7 report_eval**（`d90311a0`）：四段报告（分母诚实标注 n/`—¹` 脚注区分未测与测得 0/双 sha256/凭证声明）+ 5 测试 → 820（`602feaa`）。评审 `9e2fe7b5`：Approved 但 1 Important（报告声称"竖线已净化"与代码不符，真实 judge reasons 含 `|` 撑破表格）→ 修复 `f0eb712`（单元格过 `_cell` 对齐声明+测试）。复审 `0bc19f3d`：ADDRESSED。
+- **终审**（`0a5fefef`，全分支 `d096b89..f0eb712`）：**With fixes**——跨任务集成实证健全（行 schema↔aggregate↔报告字段对齐、120 行 mock 产物逐项核验、追踪分离真实）、诚实边界纪律强；4 项 real-run 前必须修 → **修复波**（`40e0f4e1` resume，`2bbf268`）：judge NaN/Infinity 守卫、real 模式 mock judge 硬失败（零落盘）、数字归一化保小数点（2.5.1≠2.51、93.7%≠9.37%——终审把理论债升级为可达债）、错误时部分行落盘（保已付费数据）→ 826。复审 `71d0355a`：4/4 ADDRESSED 零新破坏。
+- **T8 收尾（监察者）**：mock 全链路 30 题×4 条件=120 行跑通（`evals/results/mock_20261003T042816Z/`，EM=0 为 mock 罐头回答的预期——mock 验证管线不验证质量）+ 报告四段齐全；.gitignore（evals/results|reports）；本节。
+
+### 10.3 交付物与验收边界
+
+| PLAN §7.4 要求 | 产物 |
+|---|---|
+| `evals/qa/*.jsonl` | `evals/qa/ai-frameworks.jsonl`（30 题，sha256 入报告）|
+| `evals/fixtures/` | 21 篇受控语料 + manifest（provider_note 声明 fixture-corpus）|
+| `evals/results/*.jsonl` | 逐题原始结果（mock 已产 120 行；real 待题集校验）|
+| `evals/reports/*.md` | mock 口径演示报告（四段/矩阵/凭证声明）|
+| `scripts/run_eval.py` | 四条件 runner（mock|real、--seed-runs、部分行落盘）|
+| `scripts/report_eval.py` | 聚合报告（分母诚实、凭证引用）|
+
+**§7.2 同口径**：四条件同一生成模型/同一 embedding/同题集；长度约束 C2/C3 硬 300 字、C1/C4 brief 样式近似（honest_boundary 声明非硬约束）。**§7.3 落地**：EM/要点命中/拒答率/citation_coverage/judge 三维/tokens/p50/p95/fresh search 次数；**声明范围外**：货币成本与摊销、unsupported claim rate、freshness/conflict 正确率、20 题人工抽检（real run 后）、Harness 类（R3）。**§8 证据四类**：pytest 826/ScriptedProvider 行为测试/mock 全链路/原始凭证路径——齐。
+
+### 10.4 real run 前置清单（移交用户）
+
+1. **题集人工校验**：`evals/qa/ai-frameworks.jsonl` 30 题（主题域/judge/搜索口径三个默认此时可推翻——题集是数据）。
+2. **judge key**：`.env` 加 `RESEARCHWIKI_JUDGE_API_KEY`（glm-4.7 同平台 key 即可；缺 key 时 real 模式会硬失败拒绝启动——终审修复波落地的保护）。
+3. **成本预估**：C1/C4 各 ~30 次完整 loop（P3 实测 deep ≈38k in-tok/次）+ C2/C3 60 次单调用 + judge ~120–200 次 ≈ 数 M in-tok（air 档）+ judge 档；run_eval 启动时有成本警示。
+4. **操作注意**：real run 中途失败会落 `results.partial.jsonl`（已付费行不丢）；judge 成本在 `<trace>-judge` 后缀；真实 results/manifest/报告为付费不可重算凭证——建议运行后移入版本库（当前 .gitignore 忽略整个目录，real run 产物需手动提交或改 ignore 规则）。
+
+### 10.5 会话统计
+
+| 项 | 数值 |
+|---|---|
+| 子智能体 | **22**（侦察 1 + 实现侧 10（7 派工 + 3 resume 修复波/轮）+ 评审侧 11（7 任务审 + 4 复审含终审））|
+| 修复轮 | T1×1、T7×1、终审修复波×1，全部范围化复审验证 |
+| 提交 | 13 个（`d096b89..本节`），全部已推送 |
+| 测试 | 747 → **826**（题集 32 + 检索 10 + 指标 8 + judge 9 + RAG 6 + runner 9 + 报告 6 等）|
+| 终审 | With fixes → 修复波（4 项 real-run 加固）→ 复审 clean |
+
+**Deferred minors**：milvus 定性从句未声明（无 gold 依赖）；qa docstring 笔误；corpus 英文句点空格/# 行剥离（现语料不可触达）；judge 部分 dict 渲染（解析原子性不可达）；run_eval 时间戳碰撞/相对路径/--seed-runs 夹取；report_eval 畸形行退出码。**语料治理规则（终审建议）**：v1→v2 每一处正文差异必须出现在修订说明——扩 100 题前扫描一遍。

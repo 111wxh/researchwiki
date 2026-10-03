@@ -20,3 +20,7 @@ vendor/
 
 # 冒烟运行产物（报告/结果 JSON，本地留档用）
 smoke_out/
+
+# 评测支线本地产物（可由 run_eval/report_eval 重算，不入库）
+evals/results/
+evals/reports/
