@@ -68,7 +68,8 @@ def _mock_rows() -> list[dict[str, Any]]:
     - c1：em {1.0, 0.5}、refusal 1/2、judge n=1（Q001 有 Q002 None）、fresh {2,1}；
     - c2：Q001 em None + judge 有分、Q002 cov None + judge None（RAG 无 fresh 键）；
     - c3：judge n=2（均值 4.5/4.0/3.5）、Q001 理由超长（测截断）；
-    - c4：Q001 em None、fresh {3,0}（测得 0 计入均值，非"未测"）。
+    - c4：Q001 em None、fresh {3,0}（测得 0 计入均值，非"未测"）、Q001 理由含
+      换行与竖线（测明细单元格净化，真实 judge reasons 常见形态）。
     """
     return [
         _row(
@@ -101,7 +102,12 @@ def _mock_rows() -> list[dict[str, Any]]:
         ),
         _row(
             "Q001", "c4", em=None, citation_coverage=0.75,
-            judge={"coverage": 3, "citation": 3, "temporal": 3, "reasons": "理由丁"},
+            judge={
+                "coverage": 3,
+                "citation": 3,
+                "temporal": 3,
+                "reasons": "理由丁：第一段\n第二段|含|竖线",
+            },
             fresh_search_count=3, input_tokens=900, output_tokens=200, latency_ms=300.0,
         ),
         _row(
@@ -244,6 +250,22 @@ def test_detail_table_and_judge_none_rows(generated: dict[str, Any]) -> None:
     q1c3 = next(ln for ln in text.splitlines() if ln.startswith("| Q001 | single_hop | c3 |"))
     assert ("字" * 60 + "…") in q1c3
     assert ("字" * 61) not in text
+
+
+def test_detail_reason_cell_sanitizes_pipes_and_newlines(generated: dict[str, Any]) -> None:
+    """judge 理由含 | 与换行 → 单元格净化后明细表仍是单一表格行。
+
+    真实 judge reasons 常含竖线/换行；裸 | 会把 markdown 表格撑破——
+    竖线须换全角斜杠、换行折成空格（与报告声明"折行折叠、竖线换全角斜杠"一致）。
+    """
+    text = generated["text"]
+    q1c4 = next(ln for ln in text.splitlines() if ln.startswith("| Q001 | single_hop | c4 |"))
+    cells = [c.strip() for c in q1c4.strip().strip("|").split("|")]
+    assert len(cells) == 7, f"裸 | 撑破表格行：{q1c4}"
+    # 换行折成空格、竖线换全角斜杠，原句完整落在最后一个单元格内
+    assert cells[6] == "理由丁：第一段 第二段／含／竖线"
+    # 原始片段（含裸 |）绝不出现在该行
+    assert "第二段|含|竖线" not in q1c4
 
 
 def test_credentials_and_manifest_provenance(generated: dict[str, Any]) -> None:

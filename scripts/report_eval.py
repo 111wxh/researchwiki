@@ -263,7 +263,7 @@ def _render_matrix(rows: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any
         cov = cstats.get(cond)
         fresh_cell = f"{s['fresh_search_mean']:.2f}" if "fresh_search_mean" in s else "—¹"
         cells = [
-            cond,
+            _cell(cond),
             str(s["n"]),
             f"{s['em_mean']:.4f}（n={em_n.get(cond, 0)}）",
             f"{s['refusal_rate']:.4f}",
@@ -296,7 +296,11 @@ def _render_matrix(rows: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any
 
 
 def _render_detail(rows: Sequence[Mapping[str, Any]]) -> list[str]:
-    """逐题明细：qid/qtype/condition/em/refusal/judge 三分/一句话理由（≤60 字）。"""
+    """逐题明细：qid/qtype/condition/em/refusal/judge 三分/理由（截断 60 字 + 净化）。
+
+    理由是唯一自由文本单元格：先 :func:`_truncate` 再过 :func:`_cell`——竖线换
+    全角斜杠、换行折成空格，裸 ``|`` 会把 markdown 表格行撑破。
+    """
     lines = [
         "## 逐题明细",
         "",
@@ -313,7 +317,7 @@ def _render_detail(rows: Sequence[Mapping[str, Any]]) -> list[str]:
                 if all(value is not None for value in scores)
                 else "—"
             )
-            reason_cell = _truncate(str(judge.get("reasons") or "—"))
+            reason_cell = _cell(_truncate(str(judge.get("reasons") or "—")))
         else:
             judge_cell = "—"
             reason_cell = "—"
