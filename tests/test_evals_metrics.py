@@ -57,20 +57,46 @@ def _load_gate_retrieval() -> ModuleType:
 
 def test_normalize_answer_rules() -> None:
     """四步规则：NFKC 全角→半角、英文小写、去中英文标点、删除全部空白。"""
-    # 全角字母/数字/标点折算为半角后统一小写
-    assert normalize_answer("ＬａｎｇＣｈａｉｎ Ｖｅｒｓｉｏｎ １．２") == "langchainversion12"
+    # 全角字母/数字/标点折算为半角后统一小写（数字间的全角小数点折算后保留）
+    assert normalize_answer("ＬａｎｇＣｈａｉｎ Ｖｅｒｓｉｏｎ １．２") == "langchainversion1.2"
     # 英文统一小写（连字符等标点删除）
     assert normalize_answer("LangChain-Agent") == "langchainagent"
-    # 去中英文标点：冒号/叹号/逗号/全角括号/小数点均删，保留汉字、数字、字母
+    # 去中英文标点：冒号/叹号/逗号/全角括号均删，保留汉字、数字、字母
     assert normalize_answer("默认重试：3次！") == "默认重试3次"
     assert normalize_answer("QPS 15,600（峰值）") == "qps15600峰值"
-    # 等值内符号 % 保留（去标点不误伤百分数）
-    assert normalize_answer("准确率 93.7%") == "准确率937%"
+    # 等值内符号 % 与数字间小数点保留（去标点不误伤百分数与小数）
+    assert normalize_answer("准确率 93.7%") == "准确率93.7%"
     # 空白删除：中文排版空格无语义，制表/换行/首尾空白一并处理
     assert normalize_answer("  多  空格\t与\n换行  ") == "多空格与换行"
     # 确定性：排版不同的同一内容归一后一致；下划线按字母数字类保留
     assert normalize_answer("A Ｂ，c") == normalize_answer("a b c") == "abc"
     assert normalize_answer("foo_bar") == "foo_bar"
+
+
+def test_normalize_answer_preserves_decimal_points() -> None:
+    """数字间小数点保留：小数/版本号不被错并，"93.7%" 与 "9.37%" 不再同串。
+
+    - 两侧均为数字的点保留（``2.5.1`` 整段保留——版本号逐段可比）；
+    - 其余位置的点（句号、序号点、非数字邻接）仍删除；
+    - NFKC 已把全角 ``．`` 折算为 ``.``，同一规则覆盖全角输入。
+    """
+    # 小数与版本号逐字保留
+    assert normalize_answer("93.7%") == "93.7%"
+    assert normalize_answer("版本 2.5.1 发布") == "版本2.5.1发布"
+    assert normalize_answer("０．２．２０") == "0.2.20"
+    # "93.7%" 与 "9.37%" 不再归一为同一串（修复前均为 "937%"）
+    assert normalize_answer("93.7%") != normalize_answer("9.37%")
+    # 非数字间的点仍删：句号、序号点、非数字邻接、悬挂点
+    assert normalize_answer("重试。") == "重试"
+    assert normalize_answer("v1.x") == "v1x"
+    assert normalize_answer("a.b.c") == "abc"
+    assert normalize_answer("1.") == "1"
+    assert normalize_answer(".5") == "5"
+    # 要点命中随之收紧：gold 不再被形近数字串意外包含
+    assert point_hit("成功率为 93.7%", "93.7%") is True
+    assert point_hit("成功率为 9.37%", "93.7%") is False
+    assert point_hit("已升到 2.51", "2.5.1") is False
+    assert point_hit("langchain-core 0.2.20 released", "0.2.20") is True
 
 
 # ---------------------------------------------------------------------------

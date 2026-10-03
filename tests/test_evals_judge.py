@@ -101,6 +101,22 @@ def test_judge_answer_malformed_returns_none() -> None:
         assert judge_answer(scripted(text), **JUDGE_KW) is None, text
 
 
+def test_judge_answer_non_finite_scores_returns_none() -> None:
+    """非有限分数（NaN/Infinity；json.loads 默认接受其字面量）按解析失败处理。
+
+    守住"解析失败不抛异常、不编造分数"契约：整个 verdict 走既有 None+warning
+    路径——任何一个维度非有限即整体不可信，不做 clamp、不返回部分分数。
+    """
+    bad_outputs = [
+        '{"coverage": NaN, "citation": 3, "temporal": 5, "reasons": "r"}',
+        '{"coverage": Infinity, "citation": 3, "temporal": 5, "reasons": "r"}',
+        '{"coverage": 4, "citation": -Infinity, "temporal": 5, "reasons": "r"}',
+        '{"coverage": 4, "citation": 3, "temporal": NaN, "reasons": "r"}',
+    ]
+    for text in bad_outputs:
+        assert judge_answer(scripted(text), **JUDGE_KW) is None, text
+
+
 def test_judge_answer_clamps_out_of_range_scores() -> None:
     """越界分数 clamp 到 1–5：6 → 5、0 → 1，不抛错也不编造。"""
     text = '{"coverage": 6, "citation": 0, "temporal": 5, "reasons": "r"}'

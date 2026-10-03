@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from researchwiki.evals.judge import build_judge_provider
 from researchwiki.loop.metrics import sum_tokens_from_jsonl
 from researchwiki.wiki.store import WikiStore
 
@@ -209,3 +210,95 @@ def test_invalid_condition_rejected_by_argparse(tmp_path) -> None:
         run_eval.main([*BASE_ARGS, str(out_root), "--conditions", "c1,c9"])
     assert excinfo.value.code != 0
     assert not out_root.exists()
+
+
+# ---- 终审修复波：real 模式 mock judge 硬失败 + 错误时部分行落盘 -----------------
+
+
+def test_real_mode_rejects_mock_judge(tmp_path) -> None:
+    """real + [llm.judge] 缺失/空 base_url → 启动即退出码 2，不产生任何输出目录。
+
+    --config 指向不存在的文件：load_config 容错为空配置 → judge provider 落
+    MockProvider → 守卫触发。校验发生在创建任何输出目录之前（零落盘）。
+    """
+    out_root = tmp_path / "results"
+    rc = run_eval.main(
+        [
+            "--provider",
+            "real",
+            "--qa",
+            str(QA_PATH),
+            "--fixtures",
+            str(FIXTURES_DIR),
+            "--limit",
+            "2",
+            "--out",
+            str(out_root),
+            "--env-file",
+            "",
+            "--config",
+            str(tmp_path / "missing.toml"),
+        ]
+    )
+    assert rc == run_eval.EXIT_RUN_ERROR
+    assert not out_root.exists(), "校验失败必须在创建输出目录之前退出（零落盘）"
+
+
+def test_mock_judge_guard_validation_layer() -> None:
+    """校验层两态：MockProvider judge → 中文错误文案；配置了 base_url → 放行（None）。
+
+    最小可行做法：只测到校验层——build_judge_provider 有 base_url 时返回的
+    OpenAICompatibleProvider 构造不发起网络请求，全程零网络。
+    """
+    error = run_eval.mock_judge_error(build_judge_provider(None))
+    assert error is not None
+    assert "real 模式要求" in error and "--provider mock" in error
+    ok = run_eval.mock_judge_error(
+        build_judge_provider(
+            {"llm": {"judge": {"model": "glm-4.7", "base_url": "https://x/v1"}}}
+        )
+    )
+    assert ok is None
+
+
+def test_error_writes_partial_results(tmp_path, monkeypatch, capsys) -> None:
+    """注入单题失败：异常退出非 0，已完成行原子落盘 results.partial.jsonl。"""
+    out_root = tmp_path / "results"
+    original = run_eval.run_loop_row
+
+    def flaky(deps, **kwargs):
+        if kwargs["item"].qid == "Q002" and kwargs["condition"] == "c1":
+            raise RuntimeError("注入的 run 失败")
+        return original(deps, **kwargs)
+
+    monkeypatch.setattr(run_eval, "run_loop_row", flaky)
+    rc = run_eval.main(
+        [
+            "--provider",
+            "mock",
+            "--qa",
+            str(QA_PATH),
+            "--fixtures",
+            str(FIXTURES_DIR),
+            "--limit",
+            "2",
+            "--conditions",
+            "c1,c2",
+            "--out",
+            str(out_root),
+            "--env-file",
+            "",
+        ]
+    )
+
+    assert rc == run_eval.EXIT_RUN_ERROR
+    out_dir = next(out_root.glob("mock_*"))
+    partial = out_dir / "results.partial.jsonl"
+    assert partial.is_file(), "异常时已完成行必须先落盘 partial 再退出"
+    rows = [json.loads(line) for line in partial.read_text(encoding="utf-8").splitlines()]
+    assert [r["qid"] for r in rows] == ["Q001", "Q001"]
+    assert {r["condition"] for r in rows} == {"c1", "c2"}
+    # 正式 results.jsonl 不写出（只有 partial）；错误信息注明路径与行数
+    assert not (out_dir / "results.jsonl").exists()
+    printed = capsys.readouterr().out
+    assert "results.partial.jsonl" in printed and "2 行" in printed

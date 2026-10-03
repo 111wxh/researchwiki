@@ -55,9 +55,12 @@ manifest.fixture_url_mapping 与行级 provider_note 声明，各条件内 [n] �
                 入库（cold_warm 同款预期语义，memory_update 无动作可比）。
   real          config.toml 的真实 strong/cheap/judge 档位 + 真实 embedding；
                 检索/fetch 仍走 fixture-corpus（受控语料评测与本模式无关）。
-                会产生真实 API 费用，开始前打印成本警告。真模型蒸馏若没产出
-                可命中的笔记，C4 的 prior_hit_count 可能为 0——这是真实测量
-                结果，不做任何静默补偿。
+                会产生真实 API 费用，开始前打印成本警告。启动时硬校验 judge：
+                [llm.judge] 缺段或 base_url 空（judge 落 MockProvider）即干净
+                报错退出、零落盘——mock judge 的占位分数无意义，不得冒充真实
+                评测；确需管线自证请显式走 --provider mock。真模型蒸馏若没
+                产出可命中的笔记，C4 的 prior_hit_count 可能为 0——这是真实
+                测量结果，不做任何静默补偿。
 
 ── 记账与对账（不变量 ⑥）───────────────────────────────────────────────
 loop 条件：TokenAccountant 指向 <wiki_root>/tokens.jsonl，run 的 input/output
@@ -79,6 +82,8 @@ fresh_search_count 仅 loop 条件携带（RAG 行不写该键，也不写 None�
 metrics.aggregate_rows 的缺失语义）。em/point_hits/refusal 来自
 evals.metrics 纯函数；citation_coverage 用 loop/metrics.compute_citation_
 coverage（RAG source_count=len(hits)，loop 取 run-metrics 落盘值）。
+主循环异常时已累积行先原子写入同目录 ``results.partial.jsonl``（同 schema）
+再退出非 0，错误信息注明部分结果路径与已保存行数。
 --out 缺省 evals/results；结果写 <out>/<provider>_<UTC时间戳>/。
 
 ── 怎么跑 ─────────────────────────────────────────────────────────────
@@ -124,10 +129,11 @@ from researchwiki.evals.metrics import (  # noqa: E402
 from researchwiki.evals.qa import QaItem, load_qa  # noqa: E402
 from researchwiki.evals.rag_harness import run_rag  # noqa: E402
 from researchwiki.llm.accounting import TokenAccountant  # noqa: E402
-from researchwiki.llm.provider import Provider, TokenUsage  # noqa: E402
+from researchwiki.llm.provider import MockProvider, Provider, TokenUsage  # noqa: E402
 from researchwiki.llm.router import ModelRouter  # noqa: E402
 from researchwiki.loop.agent_loop import AgentLoop  # noqa: E402
 from researchwiki.loop.metrics import compute_citation_coverage  # noqa: E402
+from researchwiki.tools import atomic_write_text  # noqa: E402
 from researchwiki.tools.search import SearchHit  # noqa: E402
 from researchwiki.wiki.embeddings import (  # noqa: E402
     MockEmbeddingProvider,
@@ -754,6 +760,22 @@ def _model_info(provider: Any) -> dict[str, str]:
     }
 
 
+def mock_judge_error(judge_provider: Provider) -> str | None:
+    """real 模式的 judge 硬校验：judge provider 为 MockProvider 时返回错误文案。
+
+    [llm.judge] 缺段或 base_url 空时 build_judge_provider 回落 MockProvider——
+    其占位分数无意义，在 real 模式冒充真实评测会污染全部 judge 字段。返回
+    中文错误文案（main 打印后以非 0 退出、零落盘）；真实端点 provider 返回
+    None（放行）。
+    """
+    if isinstance(judge_provider, MockProvider):
+        return (
+            "real 模式要求 [llm.judge].base_url 非空（评审必须强模型）；"
+            "如确需 mock judge 跑管线请用 --provider mock"
+        )
+    return None
+
+
 def _fmt_metric(value: Any) -> str:
     if value is None:
         return "—"
@@ -795,7 +817,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(args.out) / f"{args.provider}_{stamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     config: dict[str, Any] = {}
     if args.provider == "real":
@@ -848,6 +869,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cheap": _model_info(router.get("cheap")),
             "judge": _model_info(judge_provider),
         }
+
+    # real 模式 judge 硬校验（在创建任何输出目录之前：校验失败零落盘）
+    if args.provider == "real":
+        judge_error = mock_judge_error(judge_provider)
+        if judge_error:
+            print(f"✗ {judge_error}")
+            return EXIT_RUN_ERROR
+
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     fixture_dir = Path(args.fixtures)
     index = load_corpus(fixture_dir, embedding=embedding)
@@ -979,8 +1009,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
     except Exception as exc:  # noqa: BLE001 -- 环境/网络问题不作数，明确退出而非裸栈
+        # 部分行落盘（终审修复波）：已累积的结果不随异常蒸发——先原子写入
+        # results.partial.jsonl（同 schema）再退出非 0，错误信息注明路径与行数。
+        partial_path = out_dir / "results.partial.jsonl"
+        atomic_write_text(
+            partial_path,
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        )
         print(f"✗ 运行异常：{type(exc).__name__}: {exc}")
-        print("（real 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）")
+        print(
+            f"（已完成 {len(rows)} 行已部分落盘 {partial_path}；"
+            "real 模式请检查 key / base_url / 网络；mock 模式不应出现本行，视为 bug）"
+        )
         return EXIT_RUN_ERROR
 
     results_path = out_dir / "results.jsonl"
