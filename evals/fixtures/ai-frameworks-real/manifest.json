@@ -1,0 +1,106 @@
+{
+  "domain": "ai-frameworks-real",
+  "provider_note": "real-corpus：真实来源冻结语料（langchain-ai/langchain @ 4cf62a51a8849d4baea15071c5b0e10bf7ea31c8..4a65e827f7d7fd8139a4232f408a005f704dc71b，MIT）；问题为中文生成、语料保留英文原文",
+  "sources": [
+    {
+      "repo": "langchain-ai/langchain",
+      "sha_a": "4cf62a51a8849d4baea15071c5b0e10bf7ea31c8",
+      "sha_b": "4a65e827f7d7fd8139a4232f408a005f704dc71b",
+      "license": "MIT",
+      "sha_a_tag": "langchain==0.3.30",
+      "sha_b_tag": "langchain==1.0.0"
+    }
+  ],
+  "docs": [
+    {
+      "doc_id": "root-readme",
+      "title": "LangChain 仓库根 README（langchain==0.3.30 冻结快照）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/README.md",
+      "version": "v1"
+    },
+    {
+      "doc_id": "root-readme@v2",
+      "title": "LangChain 仓库根 README（langchain==1.0.0 冻结快照）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4a65e827f7d7fd8139a4232f408a005f704dc71b/README.md",
+      "version": "v2"
+    },
+    {
+      "doc_id": "libs-langchain-readme",
+      "title": "LangChain 主包 README（0.3.30：composability 定位）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/libs/langchain/README.md",
+      "version": "v1"
+    },
+    {
+      "doc_id": "libs-langchain-readme@v2",
+      "title": "LangChain Classic README（1.0.0：旧版链与重导出）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4a65e827f7d7fd8139a4232f408a005f704dc71b/libs/langchain/README.md",
+      "version": "v2"
+    },
+    {
+      "doc_id": "libs-core-readme",
+      "title": "LangChain Core README（0.3.30：基抽象与版本策略）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/libs/core/README.md",
+      "version": "v1"
+    },
+    {
+      "doc_id": "libs-core-readme@v2",
+      "title": "LangChain Core README（1.0.0：文档与版本策略改版）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4a65e827f7d7fd8139a4232f408a005f704dc71b/libs/core/README.md",
+      "version": "v2"
+    },
+    {
+      "doc_id": "concepts-architecture",
+      "title": "LangChain 架构与包层次（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/architecture.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-chat-history",
+      "title": "Chat history：对话历史管理（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/chat_history.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-text-splitters",
+      "title": "Text splitters：文档切分策略（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/text_splitters.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-embedding-models",
+      "title": "Embedding models：嵌入模型概念（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/embedding_models.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-vectorstores",
+      "title": "Vector stores：向量存储接口（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/vectorstores.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-tool-calling",
+      "title": "Tool calling：工具调用概念（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/tool_calling.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-structured-outputs",
+      "title": "Structured outputs：结构化输出（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/structured_outputs.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "concepts-rag",
+      "title": "RAG：检索增强生成（0.3.30 概念文档）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4cf62a51a8849d4baea15071c5b0e10bf7ea31c8/docs/docs/concepts/rag.mdx",
+      "version": "v1"
+    },
+    {
+      "doc_id": "langchain-v1-readme",
+      "title": "LangChain v1 主包 README（1.0.0：新 agent 架构）",
+      "url": "https://github.com/langchain-ai/langchain/blob/4a65e827f7d7fd8139a4232f408a005f704dc71b/libs/langchain_v1/README.md",
+      "version": "v2"
+    }
+  ]
+}
