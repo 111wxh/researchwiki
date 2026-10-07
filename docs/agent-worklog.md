@@ -337,3 +337,14 @@
 | 终审 | With fixes → 修复波（4 项 real-run 加固）→ 复审 clean |
 
 **Deferred minors**：milvus 定性从句未声明（无 gold 依赖）；qa docstring 笔误；corpus 英文句点空格/# 行剥离（现语料不可触达）；judge 部分 dict 渲染（解析原子性不可达）；run_eval 时间戳碰撞/相对路径/--seed-runs 夹取；report_eval 畸形行退出码。**语料治理规则（终审建议）**：v1→v2 每一处正文差异必须出现在修订说明——扩 100 题前扫描一遍。
+
+### 10.6 真实层题集补记（2026-10-03 会话，续 §10.4 前置清单第 1 项）
+
+> 用户裁定："题集来源不重要，甚至翻译后注入也行，交付题集文件就行；个人出题过于主观。"据此落地的出题方法论：**人工零出题，gold 全部来自机器可验证的构造物**。
+
+- **交付物**（commits `df94774`+`22002ac`）：`evals/fixtures/ai-frameworks-real/`（15 篇真实英文语料，langchain-ai/langchain 冻结在 `0.3.30`/`1.0.0` 两个 tag SHA，3 对同文件双版本时效对，manifest 逐篇冻结永久链接 + MIT 实测）+ `evals/qa/ai-frameworks-real.jsonl`（30 题：单跳 12/多跳 9/时效 5/无答案 4，中文问题，gold 以英文专名锚点+中文概括双轨）+ `evals/qa/ai-frameworks-real.validation.md`（审计链）+ `tests/test_evals_qa_real.py`（13 例）。测试 826 → **839**。
+- **方法（三层消主观性）**：①时效题 gold 直接来自两 SHA 的版本 diff（零人工）；②每题盲答验证——语料全文+问题（无 gold 无题型提示）交 cheap 档作答，`point_hit` 判 gold，不过修一次再不过丢弃（漏斗：候选 46 → 一次过 34 + 修复 9 过 1 + 未及修复 3 → 池 35 → 选 21 + 时效 5 + 无答案 4 = 30，逐桶可复算）；③无答案题缺席双验证（grep+bigram 零命中 + 盲拒答 4/4）。
+- **溯源验证（评审独立复核）**：SHA=tag 经 `git ls-remote` 实锚；7/15 文档逐行 ⊆ 冻结原文；许可实测 MIT；gold 保真 30/30 独立复算。修复轮解决两处 Important：漏斗数字互斥（重写为逐桶自洽总账）、RQ019 溯源错标（换池 C047 并同协议重验）。
+- **已知边界（real run 报告须注明）**：中文 gold 对英文语料的结构性 EM 上限（含概括要点题 0.333）——跨层（受控 vs 真实）EM 绝对值不可直接比，结论用同题集内条件间差值；消歧规则"以 SHA-B 为准"已声明为评测协议。
+- **Deferred minors**：concepts-architecture H1 披露措辞不精确（"上游无 H1"应为"H1 不在首行"）；词面锚点区分度弱的三题（RQ006/RQ016/RQ007）。
+- real run 前置剩余：judge key（real 模式硬门）、成本知悉；题集人工抽检降级为可选项（机器验证已三层）。
