@@ -371,3 +371,24 @@
 **成本总账（可由入库凭证重算）**：生成（glm-4.5-air，1582 调用）in 4,120,578 / out 575,331；judge（glm-4.7，120 调用）in 88,490 / out 120,044；seed 49,166 in（8 notes）；对账 0/60 不一致（tokens.jsonl 按 trace 复算）。
 
 **诚实结论（n=30，不构成收益结论）**：本语料规模（15 篇冻结文档）下，External Memory warm **未展现质量优势（EM 持平）且更贵（c4 比 c1 多 36% in-tok）**；RAG 同 EM 下成本仅 ~1%、时延 ~6%。记忆的价值信号仅在 judge 时效维度（4.87 最高）。解释边界：①c1/c4 是完整研究 loop（含 search/fetch），与 RAG 的成本差距是结构性的；②一次性 QA 电池不触发记忆的复利场景（跨会话累积/摊销模型 build_cost/reuse）；③P3 自适应策略未参与（评测强制 deep+brief）。此为有价值的负结果基线：正式对照（受控层+扩题+复用序列）待后续。
+
+### 10.8 复用序列实验（2026-10-10，阶段 A+B 合并）
+
+> 用户判定"先不开 P4，先做能让项目被证伪的实验"（生命周期同轨计价/信息权限对等/预注册证伪条件三原则）。spec：`docs/superpowers/specs/2026-10-10-reuse-sequence-eval-design.md`；用户指令监察者全自主执行（无中途关卡，事后审计）。计划 `2026-10-10-reuse-sequence-eval.md`；SDD：T1 题集+事件流 schema（含 R4 gold_override 裁定/R5 接受偏差）、T2 重放 harness（run_eval 零改动复用）、T3 报告与裁决（1 修复轮：部分可评不得出成立+embedding 计量呈现）。测试 839 → **902**。
+
+**实验设计**：四条件重放同一事件时间线（ingest 12 篇→4 簇×4 问含簇内重复对→update 3 对 v2→时效/无答案/更新后重复）；c4 单持久 root 全时间线、查询走 P3 自适应 auto、查询不写记忆；c1 每问一次性 root；RAG update 换 chunk（对 RAG 有利解释）。预注册四条（跑前写死 manifest）：经济性/复用质量/演化价值/反幻觉。
+
+**Real run 结果（n=22 问，四条件，0 错误行，judge glm-4.7）**：
+
+| 维度 | 裁决 | 关键数据 |
+|---|---|---|
+| 经济性 | **成立**（质量臂） | c4 全口径 738,514 vs c2 22,507 tok——成本路径不成立；但可答题 judge cov c4=3.95 vs c2=3.35（**+0.60 ≥ +0.5**）；c4 vs c1 在**第 9 次查询交叉**（此后记忆全程比无记忆便宜） |
+| 复用质量 | **成立** | 4/4 簇内重复对第二次 cov ≥ 第一次；simple 路由率 8/22=0.364（策略真实发生） |
+| 演化价值 | **成立** | 更新后时效题 c4 EM **0.89** vs c2/c3 0.39；judge cov **5.0** vs 3.67/2.33——**supersede 机制转化为答案正确性**（RAG 拿到 v2 chunk 却不知道哪版是现行事实） |
+| 反幻觉 | **证伪** | c4 在 SEQ016 复现 RQ028 编造（cov=1.0）；c1 同样编造；RAG 干净（cov=5） |
+
+**总结论**：经济性=成立、演化价值=成立——未双双证伪，不触发"未证明价值"条款。**记忆架构通过了预注册证伪测试**：它存在 RAG 之外的价值（质量 +0.6、时效演化绝对优势、对无记忆从第 9 问起成本反转），代价是对 RAG 33× 成本与诚实记录的反幻觉缺口（无答案编造）。
+
+**对 P4 的决策输入**（数据→方向）：①演化价值成立 → P4a 维护闭环（merge/refresh/conflict/re-judge）方向被数据支持；②反幻觉证伪 → "未答问题台账"（kind=experience 反幻觉记忆）从假设升级为数据驱动的 P4a 首项；③经济性对 RAG 的差距是结构性的（loop vs 检索），复利叙事应主打"vs 无记忆"与"质量维度"，不与 RAG 拼单次成本。
+
+**产物**：`evals/qa/ai-frameworks-seq.jsonl` + `evals/sequence/scenario.jsonl`（24 事件）+ `scripts/run_sequence.py`/`report_sequence.py` + 凭证（events.jsonl/manifest/报告，sha256 记报告头部）。裁定全录：R4 gold_override（演化判分与摊销解耦）、R5 簇配额偏差、查询只读/语料随 update 切换/索引整体重建（manifest.rulings）。
