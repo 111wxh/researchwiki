@@ -1,0 +1,24 @@
+{"event_id": 0, "kind": "ingest", "doc_ids": ["root-readme", "libs-langchain-readme", "langchain-v1-readme", "concepts-architecture", "libs-core-readme", "concepts-text-splitters", "concepts-embedding-models", "concepts-vectorstores", "concepts-rag", "concepts-tool-calling", "concepts-structured-outputs", "concepts-chat-history"], "note": "t0 全量 ingest：4 簇 12 篇 t0 语料（v1 快照与无版本概念文档，信息权限对等的同批同刻）；3 对 @v2 时效文档不在其中，于 t5 update 到达。簇分组依据见各簇首问 note 与 clusters_from_manifest（spec §3：t0 ingest 全部研究文档）。"}
+{"event_id": 1, "kind": "query", "qid": "SEQ001", "note": "簇1「发行定位与agent演进」首问（相邻问）。分组依据：root-readme、libs-langchain-readme、langchain-v1-readme 三篇 README 层语料——框架定位、composability 主张与 1.0 agent 架构；@v2 对（root-readme@v2、libs-langchain-readme@v2）随 t5 update 到达。本簇问题只依赖本簇 t0 文档。SEQ001 为簇内重复对第 1 次。"}
+{"event_id": 2, "kind": "query", "qid": "SEQ002", "note": "簇1 相邻问：1.0 agent 架构（三条 gold 要点均出自 langchain-v1-readme，update 前可答）。"}
+{"event_id": 3, "kind": "query", "qid": "SEQ003", "note": "簇1 综合问（新题，盲答验证 PASS attempt 1，留痕 evals/qa/ai-frameworks-seq.blind.jsonl；跨 root-readme 与 libs-langchain-readme）。"}
+{"event_id": 4, "kind": "query", "qid": "SEQ001", "note": "簇1 重复问第 2 次——簇内重复对（与 event 1 同题，两次均在 update 前，测记忆摊销）。"}
+{"event_id": 5, "kind": "query", "qid": "SEQ004", "note": "簇2「包架构与Core基抽象」首问。分组依据：concepts-architecture（包层次）+ libs-core-readme（Core 抽象与版本策略），@v2 对 libs-core-readme@v2 随 t5 update 到达。SEQ004 同时是更新后重复对第 1 次（t6 将重问，langchain_core.beta 事实仅存于 v1 快照）。"}
+{"event_id": 6, "kind": "query", "qid": "SEQ005", "note": "簇2 综合问（复用 RQ016，跨 concepts-architecture 与 libs-core-readme）。SEQ005 为簇内重复对第 1 次。"}
+{"event_id": 7, "kind": "query", "qid": "SEQ006", "note": "簇2 综合问（新题，盲答验证 PASS attempt 2，留痕 evals/qa/ai-frameworks-seq.blind.jsonl；跨包层次与 Core README）。"}
+{"event_id": 8, "kind": "query", "qid": "SEQ005", "note": "簇2 重复问第 2 次——簇内重复对（与 event 6 同题，两次均在 update 前，测记忆摊销）。"}
+{"event_id": 9, "kind": "query", "qid": "SEQ007", "note": "簇3「RAG数据链路」首问。分组依据：concepts-text-splitters（切分）→ concepts-embedding-models（嵌入）→ concepts-vectorstores（向量存储）→ concepts-rag（检索增强）的数据通路四篇，无 @v2 对。本簇问题只依赖本簇 t0 文档。"}
+{"event_id": 10, "kind": "query", "qid": "SEQ008", "note": "簇3 综合问（复用 RQ015，跨 embedding-models 与 vectorstores）。SEQ008 为簇内重复对第 1 次。"}
+{"event_id": 11, "kind": "query", "qid": "SEQ009", "note": "簇3 综合问（复用 RQ021，跨 vectorstores 与 rag）。"}
+{"event_id": 12, "kind": "query", "qid": "SEQ008", "note": "簇3 重复问第 2 次——簇内重复对（与 event 10 同题，两次均在 update 前，测记忆摊销）。"}
+{"event_id": 13, "kind": "query", "qid": "SEQ010", "note": "簇4「模型接口与对话上下文」首问。分组依据：concepts-tool-calling 与 concepts-structured-outputs（两类模型输出接口）+ concepts-chat-history（对话上下文管理，与工具调用同处消息流语境）。本簇问题只依赖本簇 t0 文档。SEQ010 为簇内重复对第 1 次。"}
+{"event_id": 14, "kind": "query", "qid": "SEQ011", "note": "簇4 综合问（复用 RQ013，跨 tool-calling 与 structured-outputs）。"}
+{"event_id": 15, "kind": "query", "qid": "SEQ012", "note": "簇4 相邻问（复用 RQ011；本编号原配新综合问盲答两次未过已按协议丢弃，递补记录见题集 notes）。"}
+{"event_id": 16, "kind": "query", "qid": "SEQ010", "note": "簇4 重复问第 2 次——簇内重复对（与 event 13 同题，两次均在 update 前，测记忆摊销）。"}
+{"event_id": 17, "kind": "update", "doc_ids": ["root-readme@v2", "libs-langchain-readme@v2", "libs-core-readme@v2"], "note": "t5 update：v2 替换 v1——3 对双 SHA 时效文档（langchain 0.3.30→1.0.0）到达。RAG 侧 v2 chunk 替换 v1（取对 RAG 最有利解释）；记忆侧走 P2 memory-update 机制（supersede/merge/conflict）。"}
+{"event_id": 18, "kind": "query", "qid": "SEQ013", "note": "t6 时效问：libs-langchain-readme v1/v2 对，gold=v2 口径（update 后提问）。"}
+{"event_id": 19, "kind": "query", "qid": "SEQ014", "note": "t6 时效问：root-readme v1/v2 对，gold=v2 口径（update 后提问）。"}
+{"event_id": 20, "kind": "query", "qid": "SEQ015", "note": "t6 时效问：libs-core-readme v1/v2 对，gold=v2 口径（update 后提问）。"}
+{"event_id": 21, "kind": "query", "qid": "SEQ016", "note": "t6 无答案问（反幻觉基线：不加任何反幻觉功能，纯基线测量）。"}
+{"event_id": 22, "kind": "query", "qid": "SEQ017", "note": "t6 无答案问（预注册反幻觉探针：spec 判定表以 RQ028 编造为 c4 反幻觉证伪条件）。"}
+{"event_id": 23, "kind": "query", "qid": "SEQ004", "note": "t6 更新后重复问——更新后重复对第 2 次（与 event 5 同题：update 前后各问一次，测记忆演化——beta 事实在 v2 快照中已被移除，检验 supersede 是否转化为答案正确性）。"}
