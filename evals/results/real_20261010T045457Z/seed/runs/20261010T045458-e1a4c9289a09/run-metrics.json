@@ -1,0 +1,16 @@
+{
+  "trace_id": "e1a4c9289a09",
+  "prior_hit_count": 0,
+  "prior_note_ids": [],
+  "prior_context_chars": 0,
+  "fresh_search_count": 4,
+  "fresh_fetch_count": 1,
+  "source_count": 6,
+  "notes_created": 8,
+  "notes_merged": 0,
+  "notes_superseded": 0,
+  "input_tokens": 49166,
+  "output_tokens": 6522,
+  "latency_ms": 96674,
+  "citation_coverage": 1.0
+}

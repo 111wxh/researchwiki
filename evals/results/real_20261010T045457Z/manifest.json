@@ -1,0 +1,54 @@
+{
+  "gate": "run_eval",
+  "generated_at": "2026-10-10T04:54:58+00:00",
+  "provider_mode": "real",
+  "model": {
+    "strong": {
+      "model": "glm-4.5-air",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    "cheap": {
+      "model": "glm-4.5-air",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    "judge": {
+      "model": "glm-4.7",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    }
+  },
+  "qa_path": "D:\\WorkSpace\\Project\\自进化研究Wiki智能体\\evals\\qa\\ai-frameworks-real.jsonl",
+  "qa_sha256": "70bc0d753ce042fb5a9dd726edd4903d0e1c38d0b0730cab15b31bd5e062fb98",
+  "qa_count": 30,
+  "limit": null,
+  "fixtures_dir": "D:\\WorkSpace\\Project\\自进化研究Wiki智能体\\evals\\fixtures\\ai-frameworks-real",
+  "corpus_provider_note": "real-corpus：真实来源冻结语料（langchain-ai/langchain @ 4cf62a51a8849d4baea15071c5b0e10bf7ea31c8..4a65e827f7d7fd8139a4232f408a005f704dc71b，MIT）；问题为中文生成、语料保留英文原文",
+  "fixture_url_mapping": "loop 条件（C1/C4）的检索命中 URL 经 fixture://<domain>/<doc_id> → http://fixture.local/<domain>/<doc_id>.md 改写后由 httpx.MockTransport 本地回放语料 markdown（fetch_url 真实链路写 sources/ 快照），来源池记录改写后 URL；RAG 条件（C2/C3）不经 fetch，记录原始 fixture:// URL。各条件内报告 [n] 引用编号与来源池一一对应、自洽。",
+  "conditions": [
+    "c1",
+    "c2",
+    "c3",
+    "c4"
+  ],
+  "condition_notes": {
+    "c1": "C1 无 Memory（每题一次性 root，prior/记忆更新/formation 关闭）",
+    "c2": "C2 Vector RAG（run_rag mode=vector，300 字硬约束）",
+    "c3": "C3 Hybrid RAG（run_rag mode=hybrid，300 字硬约束）",
+    "c4": "C4 ExternalMemory warm（seed 播种 + 每题副本，prior/记忆更新/formation 开）"
+  },
+  "retrieval_config_loop": {
+    "enabled": true,
+    "forced_mode": "deep",
+    "deep": {
+      "report_style": "brief"
+    }
+  },
+  "honest_boundary": "C2/C3 的 300 字约束来自 RAG_SYSTEM（硬约束）；C1/C4 的报告长度经 brief 样式近似对齐（retrieval_config 强制 deep + deep.report_style=brief，深检索限额不变），非硬约束——agent 条件的回答结构与 RAG 不同，长度对齐是近似口径。",
+  "seed": {
+    "question": "tool calling和structured outputs在AI应用中有什么区别和联系？",
+    "runs": 1,
+    "root": "evals\\results\\real_20261010T045457Z\\seed"
+  },
+  "rag_tokens_path": "evals\\results\\real_20261010T045457Z\\tokens.jsonl",
+  "judge_trace_suffix": "-judge",
+  "embedding_model": "embedding-3"
+}
