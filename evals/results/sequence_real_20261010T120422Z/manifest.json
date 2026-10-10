@@ -1,0 +1,201 @@
+{
+  "gate": "run_sequence",
+  "generated_at": "2026-10-10T13:54:45+00:00",
+  "spec_path": "docs/superpowers/specs/2026-10-10-reuse-sequence-eval-design.md",
+  "plan_path": "docs/superpowers/plans/2026-10-10-reuse-sequence-eval.md",
+  "pre_registered": [
+    {
+      "dimension": "经济性",
+      "成立需要": "c4-auto 累计成本在 ≤22 问内 ≤ c2 同期，或 judge cov 优势 ≥+0.5",
+      "证伪条件": "全程 c4 累计 > c2 且无任何质量维度优势"
+    },
+    {
+      "dimension": "复用质量",
+      "成立需要": "重复问第二次 judge cov ≥ 第一次且 simple 路由发生（率 >0）",
+      "证伪条件": "simple 路由率为 0 或复用后质量下降"
+    },
+    {
+      "dimension": "演化价值",
+      "成立需要": "更新后时效题 c4 优于 c2/c3",
+      "证伪条件": "c4 时效题无优势（supersede 未转化为答案正确性）"
+    },
+    {
+      "dimension": "反幻觉",
+      "成立需要": "（测量，无成立条件）",
+      "证伪条件": "c4 重演 RQ028 编造"
+    }
+  ],
+  "provider_mode": "real",
+  "model": {
+    "strong": {
+      "model": "glm-4.5-air",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    "cheap": {
+      "model": "glm-4.5-air",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    "judge": {
+      "model": "glm-4.7",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    }
+  },
+  "scenario_path": "D:\\WorkSpace\\Project\\自进化研究Wiki智能体\\evals\\sequence\\scenario.jsonl",
+  "scenario_sha256": "a708b880056b3d071444f5f9f4825356dcf3b44dc129482d3cdad4ebc5cde47a",
+  "event_count": 24,
+  "qa_path": "D:\\WorkSpace\\Project\\自进化研究Wiki智能体\\evals\\qa\\ai-frameworks-seq.jsonl",
+  "qa_sha256": "6d2498c18fc980b83ef14fd0e789a0865e7f9492068718d474ad9e2a5929ed06",
+  "fixtures_dir": "D:\\WorkSpace\\Project\\自进化研究Wiki智能体\\evals\\fixtures\\ai-frameworks-real",
+  "corpus_provider_note": "real-corpus：真实来源冻结语料（langchain-ai/langchain @ 4cf62a51a8849d4baea15071c5b0e10bf7ea31c8..4a65e827f7d7fd8139a4232f408a005f704dc71b，MIT）；问题为中文生成、语料保留英文原文",
+  "fixture_url_mapping": "loop 条件（C1/C4）的检索命中 URL 交 fetch_url 抓取；real 语料的原始 http(s) URL 与 fixture:// 语料改写后的 fixture.local URL 一律由 httpx.MockTransport（make_corpus_fetch_transport）按 manifest 回放本地 docs/<doc_id>.md（零网络，fetch_url 真实链路写 sources/ 快照）；RAG 条件（C2/C3）不经 fetch，行级 hit_urls 记录检索命中的原始 URL。",
+  "conditions": [
+    "c1",
+    "c2",
+    "c3",
+    "c4"
+  ],
+  "condition_notes": {
+    "c1": "C1 无 Memory（每题一次性 root，prior/记忆更新/formation 关闭）",
+    "c2": "C2 Vector RAG（run_rag mode=vector，300 字硬约束）",
+    "c3": "C3 Hybrid RAG（run_rag mode=hybrid，300 字硬约束）",
+    "c4": "C4 ExternalMemory warm（seed 播种 + 每题副本，prior/记忆更新/formation 开）"
+  },
+  "retrieval_config": {
+    "c4_query": {
+      "enabled": true,
+      "probe_k": 8,
+      "conflict_similarity": 0.3,
+      "coverage_min_hits": 2,
+      "coverage_min_score": 0.01,
+      "budget_floor": 0.15,
+      "simple": {
+        "prior_k": 3,
+        "prior_max_chars": 1200,
+        "max_fresh_searches": 0,
+        "max_steps": 3,
+        "subagents": false,
+        "report_style": "brief",
+        "min_fresh_sources": 0
+      },
+      "update": {
+        "prior_k": 5,
+        "prior_max_chars": 4000,
+        "max_fresh_searches": 2,
+        "max_steps": 6,
+        "subagents": false,
+        "report_style": "standard",
+        "min_fresh_sources": 1
+      },
+      "deep": {
+        "prior_k": 5,
+        "prior_max_chars": 4000,
+        "max_fresh_searches": 4,
+        "max_steps": 12,
+        "subagents": true,
+        "report_style": "full",
+        "min_fresh_sources": 0
+      }
+    },
+    "c4_query_note": "auto 自适应（不设 forced_mode）；real 接 config [retrieval] 段",
+    "c1_query": {
+      "enabled": true,
+      "forced_mode": "deep",
+      "deep": {
+        "report_style": "brief"
+      }
+    },
+    "c1_query_note": "与 run_eval C1 同口径（forced deep + brief）",
+    "c4_study": {
+      "enabled": true,
+      "forced_mode": "deep"
+    },
+    "c4_study_note": "ingest/update 的 study run：forced deep 完整研究（构建成本）"
+  },
+  "rulings": {
+    "query_readonly": true,
+    "query_readonly_note": "query 事件的 loop formation/memory_update 均为 None（不蒸馏、不触发 supersede）；只有 ingest/update 的 study run 开 formation+memory_update。",
+    "search_corpus_switches_with_update": [
+      "c1",
+      "c2",
+      "c3",
+      "c4"
+    ],
+    "search_corpus_switches_note": "四条件共用同一语料状态机（ingest 扩集、update 后 @v2 替换 base v1），c1 查询时同样能搜到当前语料。",
+    "index_full_rebuild": true,
+    "index_full_rebuild_note": "ingest/update 事件按当前文档集整体重建 CorpusIndex；c2/c3 行记 embedding_calls（重建嵌入的 chunk 数，零 LLM 成本，in/out tok 恒 0）；c2/c3 运行时共享同一索引实例，构建成本按条件镜像入账（per-condition 曲线可比性优先）。",
+    "study_synthetic_question": true,
+    "study_synthetic_question_note": "ingest/update 的 study run 用 study_question() 由文档标题拼装的合成研究问题驱动（非评测题、不判分）；mock 模式蒸馏剧本覆盖该事件时段会出现的题集题目（run_eval 播种同款），real 模式由真实模型蒸馏。",
+    "c1_retrieval_unchanged": true,
+    "c1_retrieval_unchanged_note": "c1 保持 run_eval 口径（forced deep + brief），成本曲线可与 real run 对齐；c4 query 改 auto 属预注册口径差异（spec §2）。"
+  },
+  "corpus_timeline": [
+    {
+      "event_id": 0,
+      "kind": "ingest",
+      "doc_ids": [
+        "root-readme",
+        "libs-langchain-readme",
+        "langchain-v1-readme",
+        "concepts-architecture",
+        "libs-core-readme",
+        "concepts-text-splitters",
+        "concepts-embedding-models",
+        "concepts-vectorstores",
+        "concepts-rag",
+        "concepts-tool-calling",
+        "concepts-structured-outputs",
+        "concepts-chat-history"
+      ],
+      "doc_set_after": [
+        "root-readme",
+        "libs-langchain-readme",
+        "langchain-v1-readme",
+        "concepts-architecture",
+        "libs-core-readme",
+        "concepts-text-splitters",
+        "concepts-embedding-models",
+        "concepts-vectorstores",
+        "concepts-rag",
+        "concepts-tool-calling",
+        "concepts-structured-outputs",
+        "concepts-chat-history"
+      ]
+    },
+    {
+      "event_id": 17,
+      "kind": "update",
+      "doc_ids": [
+        "root-readme@v2",
+        "libs-langchain-readme@v2",
+        "libs-core-readme@v2"
+      ],
+      "doc_set_after": [
+        "langchain-v1-readme",
+        "concepts-architecture",
+        "concepts-text-splitters",
+        "concepts-embedding-models",
+        "concepts-vectorstores",
+        "concepts-rag",
+        "concepts-tool-calling",
+        "concepts-structured-outputs",
+        "concepts-chat-history",
+        "root-readme@v2",
+        "libs-langchain-readme@v2",
+        "libs-core-readme@v2"
+      ]
+    }
+  ],
+  "row_schema": {
+    "公共键": "condition/event_id/event_kind/qid/in_tok/out_tok/latency_ms/em/point_hits/refusal/citation_coverage/judge/gold_source/trace_id",
+    "loop 行（c1/c4 query 与 c4 study）追加": "fresh_search_count/wiki_root/run_dir",
+    "c4 loop 行追加": "policy_mode（run_dir/policy.json 的 P3 判定 mode）",
+    "RAG query 行追加": "hit_urls（检索命中 URL——update 后 v2 命中可审计）",
+    "索引行（c2/c3 ingest/update）追加": "embedding_calls（重建嵌入 chunk 数，零 LLM 成本）",
+    "非 query 行": "em/point_hits/refusal/citation_coverage/judge 均为 None（不评分）；c1 不产行",
+    "gold_override": "演化正确性 diff-gold——override 事件行 gold_source=override，em/point_hits/judge 按 override 要点判"
+  },
+  "rag_tokens_path": "evals\\results\\sequence_real_20261010T120422Z\\tokens.jsonl",
+  "judge_trace_suffix": "-judge",
+  "embedding_model": "embedding-3",
+  "c4_root": "evals\\results\\sequence_real_20261010T120422Z\\c4"
+}
