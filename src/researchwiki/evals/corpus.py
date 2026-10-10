@@ -197,18 +197,33 @@ class CorpusIndex:
 
 
 def load_corpus(
-    fixture_dir: str | Path, *, embedding: EmbeddingProvider | None = None
+    fixture_dir: str | Path,
+    *,
+    embedding: EmbeddingProvider | None = None,
+    doc_ids: Sequence[str] | None = None,
 ) -> CorpusIndex:
     """读 manifest → 逐篇 markdown → 切段 → 建索引。
 
     manifest.docs 是事实来源：doc_id 对应 ``docs/<doc_id>.md``，url/title 直接
     取 manifest，两版本时效文档都入库（不做去重）；embedding 缺省
     MockEmbeddingProvider（确定性 bigram 哈希，零网络）。
+
+    ``doc_ids``：可选文档集过滤（缺省 None = 全部 manifest 文档，行为不变）——
+    序列重放 harness 按事件时间线建子集索引用；传入时仅索引列出的 doc_id
+    （顺序仍按 manifest 定义序），不在 manifest 中的名字抛 ``ValueError``。
     """
     root = Path(fixture_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    docs = manifest["docs"]
+    if doc_ids is not None:
+        wanted = list(doc_ids)
+        known = {str(doc["doc_id"]) for doc in docs}
+        unknown = [d for d in wanted if d not in known]
+        if unknown:
+            raise ValueError(f"doc_ids 不在语料 manifest 中：{'、'.join(unknown)}")
+        docs = [doc for doc in docs if str(doc["doc_id"]) in set(wanted)]
     chunks: list[CorpusChunk] = []
-    for doc in manifest["docs"]:
+    for doc in docs:
         doc_id = str(doc["doc_id"])
         raw = (root / "docs" / f"{doc_id}.md").read_text(encoding="utf-8")
         # 去 `# 标题` 行（标题经 manifest.title 单独保存，不入正文重复计分）
