@@ -397,30 +397,36 @@ def test_curve_cumulative_policy_and_judge_aggregation(
 ) -> None:
     """曲线表逐事件累计 in_tok 正确（含 study/索引行）、c4 query 行标注 policy、
     judge 列按 -judge trace 从两类 tokens.jsonl 聚合（c1/c4 ← wiki_root，
-    c2/c3 ← <out>/tokens.jsonl）。"""
+    c2/c3 ← <out>/tokens.jsonl）；embedding 列累计索引行 embedding_calls
+    （spec §1 计量入账——c2/c3 e0=12、e5 update 后 27，c1/c4 恒 0）。"""
     text = generated["text"]
     assert (
         "| 事件 | c4 策略 | c1 累计 in | c2 累计 in | c3 累计 in | c4 累计 in "
+        "| c1 累计 emb | c2 累计 emb | c3 累计 emb | c4 累计 emb "
         "| c1 judge | c2 judge | c3 judge | c4 judge |" in text
     )
     expected_rows = [
-        "| e0/ingest | — | 0 | 0 | 0 | 1000 | 0 | 0 | 0 | 0 |",
-        "| e1/query/SEQ001 | simple | 200 | 50 | 60 | 1080 | 300 | 300 | 300 | 300 |",
-        "| e2/query/SEQ001 | simple | 400 | 100 | 120 | 1120 | 600 | 600 | 600 | 600 |",
-        "| e3/query/SEQ009 | simple | 600 | 150 | 180 | 1190 | 900 | 900 | 900 | 900 |",
-        "| e4/query/SEQ016 | simple | 800 | 200 | 240 | 1260 | 1200 | 1200 | 1200 | 1200 |",
-        "| e5/update | — | 800 | 200 | 240 | 1760 | 1200 | 1200 | 1200 | 1200 |",
-        "| e6/query/SEQ013 | simple | 1000 | 250 | 300 | 1850 | 1500 | 1500 | 1500 | 1500 |",
-        "| e7/query/SEQ009 | simple | 1200 | 300 | 360 | 1910 | 1800 | 1800 | 1800 | 1800 |",
-        "| e8/query/SEQ004 | update | 1400 | 350 | 420 | 1970 | 2100 | 2100 | 2100 | 2100 |",
+        "| e0/ingest | — | 0 | 0 | 0 | 1000 | 0 | 12 | 12 | 0 | 0 | 0 | 0 | 0 |",
+        "| e1/query/SEQ001 | simple | 200 | 50 | 60 | 1080 | 0 | 12 | 12 | 0 | 300 | 300 | 300 | 300 |",
+        "| e2/query/SEQ001 | simple | 400 | 100 | 120 | 1120 | 0 | 12 | 12 | 0 | 600 | 600 | 600 | 600 |",
+        "| e3/query/SEQ009 | simple | 600 | 150 | 180 | 1190 | 0 | 12 | 12 | 0 | 900 | 900 | 900 | 900 |",
+        "| e4/query/SEQ016 | simple | 800 | 200 | 240 | 1260 | 0 | 12 | 12 | 0 | 1200 | 1200 | 1200 | 1200 |",
+        "| e5/update | — | 800 | 200 | 240 | 1760 | 0 | 27 | 27 | 0 | 1200 | 1200 | 1200 | 1200 |",
+        "| e6/query/SEQ013 | simple | 1000 | 250 | 300 | 1850 | 0 | 27 | 27 | 0 | 1500 | 1500 | 1500 | 1500 |",
+        "| e7/query/SEQ009 | simple | 1200 | 300 | 360 | 1910 | 0 | 27 | 27 | 0 | 1800 | 1800 | 1800 | 1800 |",
+        "| e8/query/SEQ004 | update | 1400 | 350 | 420 | 1970 | 0 | 27 | 27 | 0 | 2100 | 2100 | 2100 | 2100 |",
     ]
     for row in expected_rows:
         assert row in text, f"缺曲线行：{row}"
-    # 合计行：主 in_tok / judge 累计（judge 不在主 in_tok 内，单列呈现）
-    assert "| 合计（全程） | — | 1400 | 350 | 420 | 1970 | 2100 | 2100 | 2100 | 2100 |" in text
-    # 条件总账：行数 / 主 / judge / 全口径 / out / latency p50 p95（手算锚点）
-    assert "| c1 | 7 | 1400 | 2100 | 3500 | 140 | 400 | 670 |" in text
-    assert "| c4 | 9 | 1970 | 2100 | 4070 | 265 | 150 | 920 |" in text
+    # 合计行：主 in_tok / embedding / judge 累计（judge 与 embedding 均不在主 in_tok 内）
+    assert (
+        "| 合计（全程） | — | 1400 | 350 | 420 | 1970 | 0 | 27 | 27 | 0 "
+        "| 2100 | 2100 | 2100 | 2100 |" in text
+    )
+    # 条件总账：行数 / 主 / judge / 全口径 / out / 累计 embedding_calls / p50 p95
+    assert "| c1 | 7 | 1400 | 2100 | 3500 | 140 | 0 | 400 | 670 |" in text
+    assert "| c2 | 9 | 350 | 2100 | 2450 | 70 | 27 | 50 | 50 |" in text
+    assert "| c4 | 9 | 1970 | 2100 | 4070 | 265 | 0 | 150 | 920 |" in text
 
     # judge 聚合口径直查：loop 行走 wiki_root/tokens.jsonl，RAG 行走出 tokens.jsonl，
     # 非 query 行（study/索引）不聚合 judge
@@ -453,6 +459,9 @@ def test_amortization_build_cost_and_no_crossing(generated: dict[str, Any]) -> N
     assert "4070" in text and "2450" in text and "3500" in text
     # 预注册摊销口径（build_cost/reuse_count + query_cost）在第 N 次查询后的值
     assert "| 7 | SEQ004 | e8/query/SEQ004 | 581.4 | 350.0 | 360.0 | 500.0 |" in text
+    # embedding 口径声明（c2/c3 真金 embedding 成本不因不折算而被隐没）
+    assert "embedding 调用次数" in text
+    assert "c2=27、c3=27" in text
 
 
 # ---- 预注册逐条裁决（主 fixture：三态之"成立"+"未证伪"）------------------------
@@ -467,6 +476,10 @@ def test_verdicts_hold_with_data_citations(generated: dict[str, Any]) -> None:
     assert "裁决：成立" in eco
     assert "4070" in eco and "2450" in eco  # c4/c2 全口径累计
     assert "+2.33" in eco and "4.17" in eco and "1.83" in eco  # cov 均值差路径
+    # embedding 口径声明（spec §1 计量入账——c2/c3 的 embedding_calls 来自行数据）
+    assert "embedding 调用次数" in eco
+    assert "c2=27、c3=27" in eco
+    assert "不折算货币" in eco and "不含 embedding tokens" in eco
 
     reuse = _verdict_section(text, "复用质量")
     assert "裁决：成立" in reuse
@@ -527,6 +540,40 @@ def test_verdicts_falsified_scenario(tmp_path: Path) -> None:
     # spec §4 结论条款：经济性与演化价值双双证伪
     assert "双双证伪" in text
     assert "未证明存在 RAG 之外的价值" in text
+
+
+# ---- 复用质量部分对 judge 缺失 → 不可判定（修复 1 + 修复 3）--------------------
+
+
+def test_reuse_undetermined_when_pairs_partially_evaluable(tmp_path: Path) -> None:
+    """变体 C：两个簇内重复对中一个的 judge 缺失 → 复用质量不可判定（注明 N/M
+    可评估），绝不把缺失对合并进有利结论出"成立"。
+
+    顺带覆盖修复 3：把 e5 的 update 行改写为 query 行（时间线无 update 事件），
+    repeat_pairs 应按"全部 query 对=簇内对"识别出 SEQ001 与 SEQ009 两对——
+    无 update 事件不再整表丢弃重复对。
+    """
+    results_dir = tmp_path / DIR_NAME
+    results_dir.mkdir()
+    rows = _base_rows(results_dir)
+    for row in rows:
+        if row["event_id"] == 5:
+            row["event_kind"] = "query"  # 抹掉 update 事件（qid 为空不影响行识别）
+    next(
+        r for r in rows if r["condition"] == "c4" and r["event_id"] == 7
+    )["judge"] = None  # SEQ009 对的第二侧 judge 缺失
+    _write_fixture(results_dir, rows)
+    out_dir = tmp_path / "reports_c"
+    rc = report_sequence.main(["--results", str(results_dir), "--out", str(out_dir)])
+    assert rc == 0
+    text = (out_dir / f"{DIR_NAME}.md").read_text(encoding="utf-8")
+
+    reuse = _verdict_section(text, "复用质量")
+    assert "裁决：不可判定" in reuse
+    assert "1/2" in reuse  # N/M 可评估注明
+    # 缺失侧 judge cov 显示 "—"（不是 0，也不显示"否"冒充下降）
+    assert "| SEQ009 | e3 | 4.0 | e7 | — | — |" in reuse
+    assert "| SEQ001 | e1 | 3.0 | e2 | 4.0 | 是 |" in reuse
 
 
 # ---- 裁决三态之"不可判定"（c4 judge 全缺 + 无 simple 路由）---------------------
@@ -602,6 +649,18 @@ def test_credentials_and_bad_inputs_exit_2(
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
     assert report_sequence.main(["--results", str(noqa), "--out", str(out)]) == 2
+    # 预注册对比锚点缺失（events 无 c4 行）→ 干净退出码 2，非裸 KeyError
+    noc4 = tmp_path / "sequence_mock_noc4"
+    noc4.mkdir()
+    rows = [r for r in _base_rows(noc4) if r["condition"] != "c4"]
+    (noc4 / "events.jsonl").write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+    _write_qa(noc4)
+    _write_tokens(noc4, rows)
+    _write_manifest(noc4)
+    assert report_sequence.main(["--results", str(noc4), "--out", str(out)]) == 2
 
     assert not list(out.glob("*.md"))
     assert capsys.readouterr().out  # 坏输入有友好报错输出

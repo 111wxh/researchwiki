@@ -32,14 +32,20 @@
   经济性：c4 全口径累计 ≤ c2 → 成立；否则可答题 judge cov 均值差（c4−c2）≥+0.5
     → 成立；否则仅当复用质量与演化价值**双双证伪**（=无任何质量维度优势）→
     证伪；其余（含质量维度不可判定）→ 不可判定。
-  复用质量：有可评重复对（两侧 judge cov 齐）且任一对下降 → 证伪；simple 路由
-    率 =0 → 证伪（预注册原文）；全部可评对第二次 ≥ 第一次且率 >0 → 成立；
-    无簇内重复对或对侧 judge 缺失且率 >0 → 不可判定。
+  复用质量：任一可评重复对（两侧 judge cov 齐）第二次 < 第一次 → 证伪；simple
+    路由率 =0 → 证伪（预注册原文）；**全部**簇内对可评且无一下降且率 >0 → 成立；
+    部分/全部对 judge 缺失 → 不可判定（注明 N/M 可评估——缺失对不并入有利结论）。
   演化价值：c4 时效题 judge cov 或 EM 均值同时优于 c2 与 c3 → 成立；四项均值
     齐且 c4 对 c2/c3 全不占优 → 证伪；数据不齐（judge 缺失/条件缺行）→ 不可
     判定。
   反幻觉（测量项，无成立条件）：c4 无答案题任一 judge cov ≤1 → 证伪（编造
     信号）；无行或 judge 全缺 → 不可判定；否则 → 未证伪（测量）。
+
+── embedding 口径（spec §1 计量入账）──────────────────────────────────
+c2/c3 的 ingest/update 索引行携带 embedding_calls（重建嵌入的 chunk 数，零 LLM
+成本）；曲线表与条件总账单列累计呈现。真实成本与 embedding 单价相关，报告**不
+折算货币**；全口径 in_tok 不含 embedding tokens（两口径并列、不混算）——缺失
+该列会让 c2/c3 显得人为便宜、偏差方向不利于 c4，故必须呈现。
 
 ── 怎么跑 ─────────────────────────────────────────────────────────────
   uv run --no-sync python scripts/report_sequence.py --results evals/results/sequence_mock_20261010T090000Z
@@ -228,7 +234,7 @@ def build_curve(
         elif row.get("qid") and not events[index_of[eid]]["qid"]:
             events[index_of[eid]]["qid"] = str(row["qid"])
 
-    cum = {c: {"main": 0, "judge": 0} for c in conditions}
+    cum = {c: {"main": 0, "judge": 0, "emb": 0} for c in conditions}
     curve: list[dict[str, Any]] = []
     for event in events:
         for i in by_event.get(event["event_id"], []):
@@ -236,6 +242,7 @@ def build_curve(
             if cond in cum:
                 cum[cond]["main"] += int(rows[i].get("in_tok") or 0)
                 cum[cond]["judge"] += judge_toks[i][0]
+                cum[cond]["emb"] += int(rows[i].get("embedding_calls") or 0)
         policy = None
         if event["kind"] == "query":
             for i in by_event.get(event["event_id"], []):
@@ -258,24 +265,33 @@ def condition_totals(
     conditions: Sequence[str],
     judge_toks: Sequence[tuple[int, int]],
 ) -> dict[str, dict[str, Any]]:
-    """条件总账：行数 / 主 in_tok / judge in_tok / 全口径 / 主 out_tok / latency 列表。"""
+    """条件总账：行数 / 主 in_tok / judge in_tok / 全口径 / 主 out_tok /
+    累计 embedding_calls（spec §1 计量入账）/ latency 列表。"""
     totals: dict[str, dict[str, Any]] = {}
     for i, row in enumerate(rows):
         cond = str(row.get("condition") or "")
         acc = totals.setdefault(
             cond,
-            {"rows": 0, "main_in": 0, "judge_in": 0, "main_out": 0, "latencies": []},
+            {
+                "rows": 0, "main_in": 0, "judge_in": 0,
+                "main_out": 0, "embedding": 0, "latencies": [],
+            },
         )
         acc["rows"] += 1
         acc["main_in"] += int(row.get("in_tok") or 0)
         acc["judge_in"] += judge_toks[i][0]
         acc["main_out"] += int(row.get("out_tok") or 0)
+        acc["embedding"] += int(row.get("embedding_calls") or 0)
         latency = _numeric(row.get("latency_ms"))
         if latency is not None:
             acc["latencies"].append(latency)
     for cond in conditions:  # 声明了但零行的条件也给空账（—）
         totals.setdefault(
-            cond, {"rows": 0, "main_in": 0, "judge_in": 0, "main_out": 0, "latencies": []}
+            cond,
+            {
+                "rows": 0, "main_in": 0, "judge_in": 0,
+                "main_out": 0, "embedding": 0, "latencies": [],
+            },
         )
     return totals
 
@@ -303,15 +319,17 @@ def repeat_pairs(
         by_qid.setdefault(qid, []).append(eid)
     intra: list[dict[str, int]] = []
     straddle: list[dict[str, int]] = []
-    if update_id is not None:
-        for qid, eids in by_qid.items():
-            if len(eids) < 2:
-                continue
-            first, second = eids[0], eids[1]
-            if second < update_id:
-                intra.append({"qid": qid, "first": first, "second": second})
-            elif first < update_id < second:
-                straddle.append({"qid": qid, "first": first, "second": second})
+    for qid, eids in by_qid.items():
+        if len(eids) < 2:
+            continue
+        first, second = eids[0], eids[1]
+        if update_id is None:
+            # 无 update 事件：全部重复对按簇内对识别（防潜在缺陷——整表丢弃）
+            intra.append({"qid": qid, "first": first, "second": second})
+        elif second < update_id:
+            intra.append({"qid": qid, "first": first, "second": second})
+        elif first < update_id < second:
+            straddle.append({"qid": qid, "first": first, "second": second})
     return intra, straddle, update_id
 
 
@@ -552,17 +570,24 @@ def compute_verdicts(stats: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     elif simple_rate is not None and stats["c4_query_n"] > 0 and simple_rate == 0.0:
         reuse_state = VERDICT_FALSIFIED
         reuse_why = f"simple 路由率 = 0（c4 query 共 {stats['c4_query_n']} 行无一 simple）"
-    elif evaluable and all(
-        (p["second_cov"] or 0.0) >= (p["first_cov"] or 0.0) for p in evaluable
-    ) and simple_rate is not None and simple_rate > 0:
+    elif (
+        len(evaluable) == len(pair_rows)
+        and simple_rate is not None
+        and simple_rate > 0
+    ):
+        # 全部簇内对可评（declined 为空 ⟺ 全部第二次 ≥ 第一次）才允许成立——
+        # 部分对 judge 缺失不并入有利结论（证据缺失 → 不可判定）
         reuse_state = VERDICT_HOLD
         reuse_why = (
-            f"{len(evaluable)}/{len(pair_rows)} 个簇内重复对可评且第二次 judge cov 全部 ≥ 第一次，"
-            f"simple 路由率 = {simple_rate:.3f} > 0"
+            f"{len(evaluable)}/{len(pair_rows)} 个簇内重复对全部可评且第二次 judge cov "
+            f"全部 ≥ 第一次，simple 路由率 = {simple_rate:.3f} > 0"
         )
     else:
         reuse_state = VERDICT_UNDETERMINED
-        reuse_why = "重复对 judge cov 缺失（无可评对）且无法确认 simple 路由 >0"
+        reuse_why = (
+            f"簇内重复对 judge cov 缺失（{len(evaluable)}/{len(pair_rows)} 可评估）"
+            "——缺失对不并入有利结论，无法确认全部复用不掉分"
+        )
 
     # ---- 演化价值 ---------------------------------------------------------------
     temporal: Mapping[str, Mapping[str, Any]] = stats["temporal"]
@@ -730,11 +755,12 @@ def _render_curve(results_dir: Path, stats: Mapping[str, Any]) -> list[str]:
         "",
         f"条件总账（主 in_tok 含 ingest/update 事件行；judge 成本按 `{JUDGE_SUFFIX}` "
         "trace 从两类 tokens.jsonl 聚合——loop 行的 wiki_root 记账与 RAG 记账 "
-        "manifest.rag_tokens_path，**不在主 in_tok 内**）：",
+        "manifest.rag_tokens_path，**不在主 in_tok 内**；embedding_calls 为索引重建"
+        "嵌入调用数，spec §1 计量入账，真实成本与单价相关、报告不折算货币）：",
         "",
         "| 条件 | 行数 | 主 in_tok | judge in_tok | 全口径（主+judge） | 主 out_tok "
-        "| latency p50 (ms) | latency p95 (ms) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| 累计 embedding_calls | latency p50 (ms) | latency p95 (ms) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for cond in conditions:
         acc = totals[cond]
@@ -742,18 +768,24 @@ def _render_curve(results_dir: Path, stats: Mapping[str, Any]) -> list[str]:
         lines.append(
             f"| {_cell(cond)} | {acc['rows']} | {acc['main_in']} | {acc['judge_in']} "
             f"| {acc['main_in'] + acc['judge_in']} | {acc['main_out']} "
+            f"| {acc['embedding']} "
             f"| {percentile(lat, 50):.0f} | {percentile(lat, 95):.0f} |"
         )
     lines.extend(
         [
             "",
             "逐事件累计（行=事件序；c4 策略=query 事件的 P3 policy_mode 标注；"
-            "c1 在 ingest/update 事件无行、累计不变）：",
+            "emb=累计 embedding_calls（索引行）；c1 在 ingest/update 事件无行、"
+            "累计不变）：",
             "",
         ]
     )
     header = ["事件"] + (["c4 策略"] if "c4" in conditions else [])
-    header += [f"{c} 累计 in" for c in conditions] + [f"{c} judge" for c in conditions]
+    header += (
+        [f"{c} 累计 in" for c in conditions]
+        + [f"{c} 累计 emb" for c in conditions]
+        + [f"{c} judge" for c in conditions]
+    )
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "---|" * len(header))
     for entry in stats["curve"]:
@@ -761,15 +793,33 @@ def _render_curve(results_dir: Path, stats: Mapping[str, Any]) -> list[str]:
         if "c4" in conditions:
             cells.append(_cell(entry["policy"]) if entry["policy"] else "—")
         cells.extend(str(entry["cum"][c]["main"]) for c in conditions)
+        cells.extend(str(entry["cum"][c]["emb"]) for c in conditions)
         cells.extend(str(entry["cum"][c]["judge"]) for c in conditions)
         lines.append("| " + " | ".join(cells) + " |")
-    final = stats["curve"][-1]["cum"] if stats["curve"] else {c: {"main": 0, "judge": 0} for c in conditions}
+    final = (
+        stats["curve"][-1]["cum"]
+        if stats["curve"]
+        else {c: {"main": 0, "judge": 0, "emb": 0} for c in conditions}
+    )
     cells = ["合计（全程）"] + (["—"] if "c4" in conditions else [])
     cells += [str(final[c]["main"]) for c in conditions]
+    cells += [str(final[c]["emb"]) for c in conditions]
     cells += [str(final[c]["judge"]) for c in conditions]
     lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
     return lines
+
+
+def _embedding_note(stats: Mapping[str, Any]) -> str:
+    """embedding 口径声明（经济性/摊销小节共用；spec §1 计量入账、不折算货币）。"""
+    totals: Mapping[str, Mapping[str, Any]] = stats["totals"]
+    return (
+        "- 口径声明：c2/c3 累计含 embedding 调用次数"
+        f"（c2={totals.get('c2', {}).get('embedding', 0)}、"
+        f"c3={totals.get('c3', {}).get('embedding', 0)}）——spec §1 计量入账；"
+        "真实成本与 embedding 单价相关，报告不折算货币；全口径 in_tok 不含 "
+        "embedding tokens（两口径并列、不混算）。"
+    )
 
 
 def _render_amortization(stats: Mapping[str, Any]) -> list[str]:
@@ -789,6 +839,7 @@ def _render_amortization(stats: Mapping[str, Any]) -> list[str]:
         "- 预注册摊销口径 `build_cost/reuse_count + query_cost`：第 N 次查询后 "
         f"c4 摊销/问 =（build_cost {build_cost} + c4 query 主累计 + c4 judge 累计）/ N"
         "（全口径含 judge，数值上等于 c4 全口径累计 / N；c2/c3/c1 无构建成本，均值=累计/N）",
+        _embedding_note(stats),
         "- 交叉点（全口径累计，judge 计入）：",
     ]
     for target, name in (("c2", "c2（Vector RAG）"), ("c1", "c1（无 Memory）")):
@@ -839,7 +890,10 @@ def _render_verdicts(
 ) -> list[str]:
     """预注册逐条裁决：四条小节（每条 裁决 + 预注册原文 + 数据引用）+ 总结论。"""
     verdicts = compute_verdicts(stats)
-    update_cell = f"e{stats['update_id']}" if stats["update_id"] is not None else "—"
+    if stats["update_id"] is not None:
+        update_desc = f"update（e{stats['update_id']}）后"
+    else:
+        update_desc = "时间线无 update 事件"
     lines = [
         "## 预注册逐条裁决",
         "",
@@ -853,6 +907,12 @@ def _render_verdicts(
     cov4 = stats["cov_answerable"].get("c4", {})
     cov2 = stats["cov_answerable"].get("c2", {})
     totals = stats["totals"]
+
+    def _acc(cond: str) -> Mapping[str, Any]:
+        """条件总账兜底（main 已校验 c4/c2 存在；直调 build_report 时防裸 KeyError）。"""
+        return totals.get(cond) or {"main_in": 0, "judge_in": 0}
+
+    t4, t2 = _acc("c4"), _acc("c2")
     lines.extend(
         [
             "### 预注册判定·经济性",
@@ -860,13 +920,14 @@ def _render_verdicts(
             f"**裁决：{eco['state']}**",
             "",
             *_prereg_lines(manifest, "经济性"),
-            f"- 数据引用：c4 全程累计（主 {totals['c4']['main_in']} + judge "
-            f"{totals['c4']['judge_in']}）= {totals['c4']['main_in'] + totals['c4']['judge_in']} tok，"
-            f"c2 同期 = {totals['c2']['main_in'] + totals['c2']['judge_in']} tok"
-            f"（主 {totals['c2']['main_in']} + judge {totals['c2']['judge_in']}）——曲线见上节。",
+            f"- 数据引用：c4 全程累计（主 {t4['main_in']} + judge "
+            f"{t4['judge_in']}）= {t4['main_in'] + t4['judge_in']} tok，"
+            f"c2 同期 = {t2['main_in'] + t2['judge_in']} tok"
+            f"（主 {t2['main_in']} + judge {t2['judge_in']}）——曲线见上节。",
             f"- 数据引用：可答题（排除无答案题）judge cov 均值 c4={_fmt(cov4.get('cov'))}"
             f"（n={cov4.get('cov_n', 0)}）vs c2={_fmt(cov2.get('cov'))}"
             f"（n={cov2.get('cov_n', 0)}）——均值差见裁决理由。",
+            _embedding_note(stats),
             f"- 裁决理由：{eco['why']}",
             "",
         ]
@@ -881,8 +942,13 @@ def _render_verdicts(
             f"**裁决：{reuse['state']}**",
             "",
             *_prereg_lines(manifest, "复用质量"),
-            f"簇内重复对（同 qid 两次查询都在 update 事件 {update_cell} 之前，"
-            f"n={len(stats['intra'])}）——预注册只按这些对判定：",
+            (
+                f"簇内重复对（同 qid 两次查询都在 update 事件 e{stats['update_id']} 之前，"
+                f"n={len(stats['intra'])}）——预注册只按这些对判定："
+                if stats["update_id"] is not None
+                else f"簇内重复对（时间线无 update 事件，全部重复对按簇内对识别，"
+                f"n={len(stats['intra'])}）——预注册只按这些对判定："
+            ),
             "",
             "| qid | 第 1 次 | judge cov | 第 2 次 | judge cov | 第二次 ≥ 第一次 |",
             "|---|---|---|---|---|---|",
@@ -891,7 +957,10 @@ def _render_verdicts(
     for pair in stats["intra"]:
         first = _judge_cov(_row_at(stats["rows"], "c4", pair["first"]))
         second = _judge_cov(_row_at(stats["rows"], "c4", pair["second"]))
-        holds = "是" if (first is not None and second is not None and second >= first) else "否"
+        if first is not None and second is not None:
+            holds = "是" if second >= first else "否"
+        else:
+            holds = "—"  # judge 缺失：不可判，不显示"否"冒充下降
         lines.append(
             f"| {_cell(pair['qid'])} | e{pair['first']} | {_fmt(first, 1)} "
             f"| e{pair['second']} | {_fmt(second, 1)} | {holds} |"
@@ -931,7 +1000,7 @@ def _render_verdicts(
             f"**裁决：{evo['state']}**",
             "",
             *_prereg_lines(manifest, "演化价值"),
-            f"时效题（qtype=temporal、update（{update_cell}）后、gold_source=base，"
+            f"时效题（qtype=temporal、{update_desc}、gold_source=base，"
             f"n={len(stats['temporal_qids'])} 题："
             f"{'、'.join(sorted(stats['temporal_qids'])) or '—'}）：",
             "",
@@ -1110,6 +1179,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_BAD_INPUT
     if not rows:
         print(f"✗ {events_path} 为空（0 行），无法聚合报告")
+        return EXIT_BAD_INPUT
+    # 预注册裁决的对比锚点：c4（被测对象）与 c2（经济性基线）缺任一即无法对表
+    present = {str(r.get("condition") or "") for r in rows}
+    missing_anchors = sorted({"c4", "c2"} - present)
+    if missing_anchors:
+        print(
+            f"✗ events.jsonl 缺预注册对比锚点条件：{'、'.join(missing_anchors)}"
+            "——经济性裁决需要 c4 vs c2 两条件行，拒绝出报告"
+        )
         return EXIT_BAD_INPUT
 
     report = build_report(results_dir, rows, manifest, qa_types=qa_types)
