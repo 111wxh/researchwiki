@@ -6,7 +6,9 @@
     {"event_id": 0, "kind": "ingest|query|update",
      "doc_ids": ["doc-a", ...],   # 仅 ingest / update 携带
      "qid": "SEQ001",             # 仅 query 携带
-     "note": "..."}
+     "note": "...",
+     "gold_override": ["..."]}    # 仅 query 可选：判分要点覆盖（演化正确性
+                                  # diff-gold，重复对第二次按 v2 口径判）
 
 时间线语义（spec §3）：
 
@@ -21,7 +23,8 @@
 
 1. 行级 schema：合法 JSON 对象；kind 白名单；event_id 从 0 连续递增（文件行序
    即时间线顺序）；query 必须带 qid 且不带 doc_ids；ingest/update 必须带
-   doc_ids 且不带 qid；
+   doc_ids 且不带 qid；gold_override 仅允许 query 事件携带，出现时必须为
+   非空列表且每条是非空字符串（显式 null 视同缺省）；
 2. query 的 qid ∈ 题集（题集经 :func:`researchwiki.evals.qa.load_qa` 加载复用）；
 3. qid 恰出现 1 次或 2 次；出现 2 次必须"分居 update 两侧"（更新后重复对）
    或"同在 update 前"（簇内重复对）——同在 update 后非法；重复对的两次事件
@@ -62,7 +65,10 @@ class SeqEvent:
     - kind：事件类型，取值见 :data:`EVENT_KINDS`；
     - doc_ids：ingest/update 携带的文档集（query 事件为空 tuple）；
     - qid：query 携带的题目编号（其余事件为空串）；
-    - note：备注（重复对的两次事件必须写明重复对类型；各簇首问写明簇分组依据）。
+    - note：备注（重复对的两次事件必须写明重复对类型；各簇首问写明簇分组依据）；
+    - gold_override：可选判分要点覆盖（仅 query 事件；演化正确性 diff-gold——
+      更新后重复对的第二次回答按 v2 口径 gold 判，预注册"复用质量"只按簇内
+      重复对评估，故该字段只应出现在重复对的后一次事件上；缺省无此键）。
     """
 
     event_id: int
@@ -70,10 +76,12 @@ class SeqEvent:
     doc_ids: tuple[str, ...] = ()
     qid: str = ""
     note: str = ""
+    gold_override: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        # doc_ids 归一化为 tuple：frozen dataclass 里保持真正不可变且可哈希
+        # doc_ids / gold_override 归一化为 tuple：frozen dataclass 里保持真正不可变且可哈希
         object.__setattr__(self, "doc_ids", tuple(self.doc_ids))
+        object.__setattr__(self, "gold_override", tuple(self.gold_override))
 
 
 def _fail(lineno: int, reason: str) -> ValueError:
@@ -126,6 +134,19 @@ def _parse_event_line(lineno: int, raw: str) -> SeqEvent:
     if not isinstance(note, str):
         raise _fail(lineno, "note 必须是字符串")
 
+    # gold_override（可选，演化正确性 diff-gold）：仅 query 事件可携带，出现时
+    # 必须为非空列表且每条是非空字符串；显式 null 视同缺省（无此键）
+    raw_override = obj.get("gold_override")
+    gold_override: tuple[str, ...] = ()
+    if raw_override is not None:
+        if kind != "query":
+            raise _fail(lineno, f"{kind} 事件不应携带 gold_override（判分要点覆盖只属于 query）")
+        if not isinstance(raw_override, list) or not raw_override:
+            raise _fail(lineno, "gold_override 必须是非空字符串列表")
+        if any(not isinstance(p, str) or not p.strip() for p in raw_override):
+            raise _fail(lineno, "gold_override 的每个要点都必须是非空字符串")
+        gold_override = tuple(raw_override)
+
     # kind 与携带字段的对应关系：文档集只属于 ingest/update，qid 只属于 query
     if kind == "query":
         if doc_ids:
@@ -139,7 +160,8 @@ def _parse_event_line(lineno: int, raw: str) -> SeqEvent:
             raise _fail(lineno, f"{kind} 事件必须携带非空 doc_ids")
 
     return SeqEvent(
-        event_id=event_id, kind=kind, doc_ids=tuple(doc_ids), qid=qid, note=note
+        event_id=event_id, kind=kind, doc_ids=tuple(doc_ids), qid=qid, note=note,
+        gold_override=gold_override,
     )
 
 

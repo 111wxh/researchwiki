@@ -16,7 +16,8 @@
   query 题目来源文档（notes「来源：」段）必须在首个引用它的 query 之前 ingest
   或 update；event_id 从 0 连续递增；kind 白名单；query 不带 doc_ids；
   ingest/update 不带 qid；非无答案题必须有可解析的来源段；重复对两次事件
-  note 必须写明重复对类型；
+  note 必须写明重复对类型；gold_override 仅允许 query 事件携带且为非空
+  字符串列表（演化正确性 diff-gold，审查裁定 R4）；
 - SeqEvent：frozen dataclass，doc_ids 归一化为 tuple；
 - clusters_from_manifest：15 篇语料每篇恰归入一簇、v1/v2 对同簇；
 - 真实场景文件 + 真实题集全过校验器；题集占比硬口径断言
@@ -175,10 +176,18 @@ def test_seqevent_normalizes_doc_ids_to_tuple() -> None:
 
 
 def test_seqevent_defaults() -> None:
-    """doc_ids/qid/note 缺省值：空 tuple / 空串。"""
+    """doc_ids/qid/note/gold_override 缺省值：空 tuple / 空串。"""
     event = SeqEvent(event_id=2, kind="query", qid="SEQ001")
     assert event.doc_ids == ()
     assert event.note == ""
+    assert event.gold_override == ()
+
+
+def test_seqevent_normalizes_gold_override_to_tuple() -> None:
+    """gold_override 传入 list 时归一化为 tuple。"""
+    event = SeqEvent(event_id=3, kind="query", qid="SEQ001", gold_override=["a", "b"])
+    assert event.gold_override == ("a", "b")
+    assert isinstance(event.gold_override, tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +415,75 @@ def test_update_makes_v2_doc_available_for_temporal_query(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# gold_override（演化正确性 diff-gold：重复对的第二次可按 v2 口径判分）
+# ---------------------------------------------------------------------------
+
+def test_accepts_gold_override_on_later_pair_event(tmp_path) -> None:
+    """更新后重复对的第二次事件携带 gold_override（v2 口径 diff-gold）→ 合法。"""
+    rows = [
+        {"event_id": 0, "kind": "ingest", "doc_ids": ["doc-a", "doc-b"], "note": "ingest"},
+        {"event_id": 1, "kind": "query", "qid": "SEQ004",
+         "note": "更新后重复对第 1 次（update 前问）"},
+        {"event_id": 2, "kind": "update", "doc_ids": ["doc-a@v2"], "note": "v2 替换 v1"},
+        {"event_id": 3, "kind": "query", "qid": "SEQ002", "note": "时效问（update 后）"},
+        {"event_id": 4, "kind": "query", "qid": "SEQ004", "note": "更新后重复对第 2 次",
+         "gold_override": ["docs.example.com/policy", "v1 快照表述已移除"]},
+    ]
+    events = load_scenario(make_scenario_file(tmp_path, rows), make_qa_file(tmp_path),
+                           make_manifest_file(tmp_path))
+    overridden = [e for e in events if e.gold_override]
+    assert len(overridden) == 1
+    assert overridden[0].qid == "SEQ004"
+    assert overridden[0].event_id == 4
+    assert overridden[0].gold_override == ("docs.example.com/policy", "v1 快照表述已移除")
+
+
+def test_rejects_gold_override_on_ingest(tmp_path) -> None:
+    """gold_override 只允许出现在 query 事件 → ingest 携带即 ValueError 带行号。"""
+    rows = base_scenario_rows()
+    rows[0]["gold_override"] = ["some-point"]
+    err = load_fail_case(tmp_path, rows)
+    assert "gold_override" in str(err)
+    assert "第 1 行" in str(err)
+
+
+def test_rejects_gold_override_on_update(tmp_path) -> None:
+    """update 事件携带 gold_override → ValueError。"""
+    rows = base_scenario_rows()
+    rows[4]["gold_override"] = ["some-point"]
+    err = load_fail_case(tmp_path, rows)
+    assert "gold_override" in str(err)
+    assert "第 5 行" in str(err)
+
+
+def test_rejects_empty_gold_override(tmp_path) -> None:
+    """gold_override 出现时必须为非空列表 → 空列表 ValueError。"""
+    rows = base_scenario_rows()
+    rows[5]["gold_override"] = []
+    err = load_fail_case(tmp_path, rows)
+    assert "gold_override" in str(err)
+    assert "第 6 行" in str(err)
+
+
+def test_rejects_gold_override_with_non_string_point(tmp_path) -> None:
+    """gold_override 的每个要点都必须是非空字符串 → 非字符串元素 ValueError。"""
+    rows = base_scenario_rows()
+    rows[5]["gold_override"] = ["合法要点", 42]
+    err = load_fail_case(tmp_path, rows)
+    assert "gold_override" in str(err)
+    assert "第 6 行" in str(err)
+
+
+def test_rejects_gold_override_with_blank_point(tmp_path) -> None:
+    """gold_override 的要点为空白字符串 → ValueError。"""
+    rows = base_scenario_rows()
+    rows[5]["gold_override"] = ["   "]
+    err = load_fail_case(tmp_path, rows)
+    assert "gold_override" in str(err)
+    assert "第 6 行" in str(err)
+
+
+# ---------------------------------------------------------------------------
 # clusters_from_manifest（真实 manifest）
 # ---------------------------------------------------------------------------
 
@@ -526,6 +604,28 @@ def test_real_scenario_ingest_covers_all_t0_docs(real_events) -> None:
     assert all(d.endswith("@v2") for d in updates[0].doc_ids)
     assert not any(d.endswith("@v2") for d in ingests[0].doc_ids)
     assert len(ingests[0].doc_ids) == 12
+
+
+def test_real_ev23_carries_v2_gold_override(real_events) -> None:
+    """审查裁定 R4：SEQ004 的第二次（ev23）单列演化正确性——携带 v2 口径
+    gold_override（diff-gold，取自 libs-core-readme@v2 原文），note 注明判分
+    口径；全流仅此一事件携带 override。"""
+    overridden = [e for e in real_events if e.gold_override]
+    assert len(overridden) == 1
+    ev = overridden[0]
+    assert ev.event_id == 23
+    assert ev.kind == "query"
+    assert ev.qid == "SEQ004"
+    assert len(ev.gold_override) in (2, 3)
+    assert all(p.strip() for p in ev.gold_override)
+    assert "演化正确性判分" in ev.note
+    assert "gold=v2 口径" in ev.note
+    # 可判定性 sanity：至少一条要点命中 @v2 原文（URL 逐字要点）
+    v2_text = (DOCS_DIR / "libs-core-readme@v2.md").read_text(encoding="utf-8")
+    assert any(point_hit(v2_text, p) for p in ev.gold_override), ev.gold_override
+    # update 在 ev23 之前（演化判分的时点前提）
+    update_id = next(e.event_id for e in real_events if e.kind == "update")
+    assert update_id < ev.event_id
 
 
 # ---------------------------------------------------------------------------

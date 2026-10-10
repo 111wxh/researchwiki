@@ -21,4 +21,4 @@
 {"event_id": 20, "kind": "query", "qid": "SEQ015", "note": "t6 时效问：libs-core-readme v1/v2 对，gold=v2 口径（update 后提问）。"}
 {"event_id": 21, "kind": "query", "qid": "SEQ016", "note": "t6 无答案问（反幻觉基线：不加任何反幻觉功能，纯基线测量）。"}
 {"event_id": 22, "kind": "query", "qid": "SEQ017", "note": "t6 无答案问（预注册反幻觉探针：spec 判定表以 RQ028 编造为 c4 反幻觉证伪条件）。"}
-{"event_id": 23, "kind": "query", "qid": "SEQ004", "note": "t6 更新后重复问——更新后重复对第 2 次（与 event 5 同题：update 前后各问一次，测记忆演化——beta 事实在 v2 快照中已被移除，检验 supersede 是否转化为答案正确性）。"}
+{"event_id": 23, "kind": "query", "qid": "SEQ004", "note": "t6 更新后重复问——更新后重复对第 2 次（与 event 5 同题：update 前后各问一次，测记忆演化——beta 事实在 v2 快照中已被移除，检验 supersede 是否转化为答案正确性）。演化正确性判分：gold=v2 口径（diff-gold，取自 @v2 原文；预注册「复用质量」只按 4 个簇内重复对评估，本次回答不计入复用摊销）。", "gold_override": ["docs.langchain.com/oss/python/release-policy", "docs.langchain.com/oss/python/versioning", "Releases 与 Versioning 策略页"]}
