@@ -604,5 +604,5 @@ def test_guard_block_precedes_prior_and_does_not_consume_top_k(tmp_path: Path) -
     assert guard_pos < prior_pos
     # 配额：Prior 块恰好 1 条（护栏不占 [prior].top_k、也不把注入条数撑大）
     assert len(loop.prior_context.hits) == 1
-    assert plan_message.count("### [") == 1  # Prior 条目格式 "### [n] ..."
+    assert plan_message.count("### [") == 1  # Prior 条目格式 "### [P-n] ..."（护栏块无编号）
     assert plan_message.count(UNANSWERED_GUARD_HEADER) == 1

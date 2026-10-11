@@ -338,9 +338,15 @@ def _header(count: int) -> str:
 
 
 def _format_block(pos: int, hit: PriorHit) -> str:
-    """单条 Prior 的 markdown 块（含全部注入字段；redirected_from 仅在链存在时列出）。"""
+    """单条 Prior 的 markdown 块（含全部注入字段；redirected_from 仅在链存在时列出）。
+
+    条目编号用 ``[P-n]`` 前缀（P2 移交碰撞修复，task-19）：报告正文里
+    ``[n]`` 是本轮 fresh 来源的引用编号，Prior 条目行若也用 ``[n]``，两种
+    编号在 plan 消息里同形态共存容易被混淆——``P-`` 前缀让"历史 Prior 条目"
+    与"来源引用"一眼可分。
+    """
     lines = [
-        f"### [{pos}] {hit.note_id} {hit.title}".rstrip(),
+        f"### [P-{pos}] {hit.note_id} {hit.title}".rstrip(),
         f"- note_id: {hit.note_id}",
         f"- title: {hit.title}",
         f"- 置信度: {hit.confidence}",

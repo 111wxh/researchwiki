@@ -805,6 +805,13 @@ class SearchIndex:
     # ---- 生命周期 ----
 
     def close(self) -> None:
+        """关闭底层 SQLite 连接（幂等：sqlite3 的 close 可安全重复调用）。
+
+        AgentLoop 的 run 收尾（``events()`` 的 try/finally →
+        ``_close_indexes_guarded``）负责调用；MCP 门面持有的服务级索引生命
+        周期归门面管。连接关闭后再检索/重建会抛 sqlite3.ProgrammingError
+        ——run 结束后 loop 对象不应再被用于检索。
+        """
         self._conn.close()
 
     def __enter__(self) -> SearchIndex:

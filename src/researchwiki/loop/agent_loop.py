@@ -1084,6 +1084,9 @@ class AgentLoop:
         run-metrics.json 恰好落盘一次：正常结束、中途异常、生成器被 close 三种
         关闭路径都经 try/finally 写一次（数据取当时实况）；落盘自身失败不抛出，
         既不压过流中的原异常，也不让已写出 report.md 的 run 在收尾时崩掉。
+        索引连接同走这条 finally（P2 移交泄漏修复）：Prior 索引与模式探测索引
+        是两个独立 SQLite 连接，run 结束后统一关闭——server 通路与直接调用
+        通路共用本生成器，一处收尾两路覆盖。
         """
         t_start = self.clock()
         yield {"type": "start"}
@@ -1091,6 +1094,27 @@ class AgentLoop:
             yield from self._events()
         finally:
             self._write_run_metrics_guarded(t_start)
+            self._close_indexes_guarded()
+
+    def _close_indexes_guarded(self) -> None:
+        """run 收尾关闭 wiki 索引连接（P1 移交的 SearchIndex 连接泄漏修复）。
+
+        SearchIndex 由本 loop 自建自管（``_build_wiki_layer`` 的 Prior 索引、
+        ``_probe_index`` 的探测索引，指向同一 index.db 的两个独立连接），
+        store / ingestor 不持有它——run 结束后统一关闭，不留泄漏连接。
+        与 ``_write_run_metrics_guarded`` 同口径：清理自身失败只记 stderr，
+        不抛出（不得压过流中的原异常，也不得让已完成的 run 在收尾时崩掉）。
+        """
+        for index in (self.prior_index, self._policy_index):
+            if index is None:
+                continue
+            try:
+                index.close()
+            except Exception as exc:  # noqa: BLE001 -- 收尾清理不得推翻本次 run
+                print(
+                    f"[agent-loop] 索引连接关闭失败：{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     def _events(self) -> Iterator[dict[str, Any]]:
         # ---- 阶段 -1：模式判定（P3 Dynamic Retrieval：探测 → 判定 → 留痕）----

@@ -30,6 +30,15 @@ from researchwiki.wiki.frontmatter import NoteMeta, SourceRef, dump, parse
 
 CONFLICT_ID_RE = re.compile(r"^C-(\d+)$")
 
+# 写入 id 形态护栏（P2 移交 F7，task-19）：落盘文件名由 id 决定
+# （``notes_dir/{meta.id}.md``），形态失控会同时破坏重定向链、外部引用与
+# 检索可见性。``{4,}`` 允许 5+ 位——``next_note_id`` 的 ``%04d`` 在编号溢出
+# 万位后自然变宽，护栏只挡畸形态、不挡正常溢出。路径安全（../ 等）由上层
+# 门面（mcp_server.service 的 NOTE_ID_RE / _assert_note_id_writable）负责，
+# 这里管的是**形态契约**：内部生成（N-%04d / C-%04d）与外部传入同守。
+NOTE_ID_FORM_RE = re.compile(r"^N-\d{4,}$")
+CONFLICT_ID_FORM_RE = re.compile(r"^C-\d{4,}$")
+
 # mark_source_changed 的去重记账键：``{url: 最近一次为该 URL 标记过的 new_content_hash}``。
 # 存在 note extra 里（不新增类型化 frontmatter 字段，与 formation_reason /
 # update_reasons 同处 extra，round-trip 不丢）；**按 URL 分槽**——笔记常引用多个
@@ -220,6 +229,13 @@ class WikiStore:
         return self._write_note(meta, body)
 
     def _write_note(self, meta: NoteMeta, body: str) -> Note:
+        if not NOTE_ID_FORM_RE.match(meta.id):
+            # 写入咽喉（save_note / save_meta 共用）：id 决定落盘文件名，
+            # 畸形态（note-1 / N1 / 空串 / 位数不足）一律拒绝、零落盘。
+            raise ValueError(
+                f"note id 形态非法：{meta.id!r}"
+                f"（须匹配 {NOTE_ID_FORM_RE.pattern}，形如 N-0001）"
+            )
         path = self.notes_dir / f"{meta.id}.md"
         atomic_write_text(path, dump(meta.to_dict(), body))
         return Note(id=meta.id, title=meta.title, body=body, meta=meta, path=path)
@@ -487,7 +503,11 @@ class WikiStore:
         conflict_id: str | None = None,
         trace_id: str = "",
     ) -> Conflict:
-        """登记一条冲突（status=open），双方证据任意结构（note_id + 摘录 + 来源等）。"""
+        """登记一条冲突（status=open），双方证据任意结构（note_id + 摘录 + 来源等）。
+
+        显式传入的 ``conflict_id`` 与自动生成的 ``C-%04d`` 同守形态护栏
+        （``^C-\\d{4,}$``）：id 决定落盘文件名，畸形态一律 ValueError、零落盘。
+        """
         conflict = Conflict(
             id=conflict_id or self.next_conflict_id(),
             question=question,
@@ -496,6 +516,11 @@ class WikiStore:
             status="open",
             created=datetime.now(UTC).isoformat(timespec="seconds"),
         )
+        if not CONFLICT_ID_FORM_RE.match(conflict.id):
+            raise ValueError(
+                f"conflict id 形态非法：{conflict.id!r}"
+                f"（须匹配 {CONFLICT_ID_FORM_RE.pattern}，形如 C-0001）"
+            )
         self._write_conflict(conflict, trace_id=trace_id)
         return conflict
 
