@@ -652,10 +652,12 @@ class MaintenanceRunner:
         """
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         needs_newline = False
-        if self.ledger_path.exists():
+        if self.ledger_path.is_file():
             with self.ledger_path.open("rb") as f:
-                f.seek(-1, 2)  # 末字节
-                needs_newline = f.read(1) != b"\n"
+                f.seek(0, 2)  # 末尾
+                if f.tell() > 0:  # 空文件（外部 touch/损坏）无从谈"末行缺换行"
+                    f.seek(-1, 2)
+                    needs_newline = f.read(1) != b"\n"
         line = json.dumps(record.to_dict(), ensure_ascii=False)
         with self.ledger_path.open("a", encoding="utf-8") as f:
             if needs_newline:
