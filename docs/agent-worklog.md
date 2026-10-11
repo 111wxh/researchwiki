@@ -392,3 +392,37 @@
 **对 P4 的决策输入**（数据→方向）：①演化价值成立 → P4a 维护闭环（merge/refresh/conflict/re-judge）方向被数据支持；②反幻觉证伪 → "未答问题台账"（kind=experience 反幻觉记忆）从假设升级为数据驱动的 P4a 首项；③经济性对 RAG 的差距是结构性的（loop vs 检索），复利叙事应主打"vs 无记忆"与"质量维度"，不与 RAG 拼单次成本。
 
 **产物**：`evals/qa/ai-frameworks-seq.jsonl` + `evals/sequence/scenario.jsonl`（24 事件）+ `scripts/run_sequence.py`/`report_sequence.py` + 凭证（events.jsonl/manifest/报告，sha256 记报告头部）。裁定全录：R4 gold_override（演化判分与摊销解耦）、R5 簇配额偏差、查询只读/语料随 update 切换/索引整体重建（manifest.rulings）。
+
+## 11. P4 · Continual Memory 会话（2026-10-11）
+
+> 用户指令"P4"开工。PLAN.md §3.5 为 spec、复用序列实验三条决策输入定优先级（未答问题台账=数据驱动首项）。计划 `docs/superpowers/plans/2026-10-11-p4-continual-memory.md`（commit bf8deeb）；SDD 串行 T15–T22（8 实现者 + 9 评审 + 3 修复轮 + 1 终审后修复波），监察者全自主。测试 **902 → 1068**；P4 代码 13 commits（`72aa228..320d34c`），25 文件 +11,110 行。终审（全分支 22 commits）**CLEAN**：0 Critical/Important、7 Minor 全部延期。
+
+**交付面**（对 PLAN.md §3.5 逐条）：
+
+| 块 | 内容 |
+|---|---|
+| T15 未答问题台账 | `wiki/ledger.py`：run 收尾确定性判定（no_notes / below_min_fresh）→ kind=experience 反幻觉记忆（importance 0.8）；Prior 前独立护栏块（复用 verification 同一把尺，guard_similarity 0.4）。复用序列实验反幻觉证伪的直接回应。 |
+| T16 consolidation 选择器 | `plan_consolidation` 四规则（merge/refresh/rejudge/conflict）+ `consolidate --dry-run/--json`；merge 独立下限 0.5 明文化（P2 移交裁定），0.6–0.8 灰区规定进配置注释；dry-run 零写盘（目录逐字节+mtime 双快照测试）。 |
+| T17 maintenance 执行器 | 进程内 job queue（jobs.jsonl + 单 job JSON 原子写，五值状态词表）；merge/refresh/rejudge/conflict 四执行器；幂等重试（done 键闸）、失败保原文（抓取失败/模型畸形逐字节断言）；`--run/--jobs/--retry/--skip`。修复轮：router 喂 [llm] 段（C1）、账本多字节截断容错（I1）、failed job 保留已上报 usage（I2）。 |
+| T18 arbitrate | `arbitrate list/show/resolve`（--with 校验、违规退出 2 台账保持 open）；裁决留痕笔记（kind=experience 可检索）；Prior"待解决冲突（优先核验）"注入（实体相交 ∨ 相似度 ≥ similarity_floor，只读台账不重新比较）。 |
+| T19 P2 移交清账 | F7 写入 id 形态护栏（`^N-\d{4,}$`/`^C-\d{4,}$`，守在 _write_note/save_conflict 咽喉）；AgentLoop 三路 finally 关闭 SearchIndex；Prior 编号 `### [P-n]` 消除与报告引用碰撞。 |
+| T20 上下文预算 | 估算函数（估算≠计量，零写盘有测）+ `[context]` 段（threshold 回退 [runtime]→0.7）+ 滚动压缩（`compactions.jsonl` 断电容错审计，摘要带标记前缀不伪装原文，summarizer 失败保守降级）+ 稳定前缀不变量测试固化。 |
+| T21 checkpoint/resume | checkpoint.json（tmp+rename、损坏=None 告警不 crash）+ history 内联侧车；resume 跳过已完成 step、run_step_key 防重复入库、budget 谱系衔接（恢复 run 只记新消耗）；`scripts/kill_resume_smoke.py` 四闸（真实进程 kill）。修复轮：dispatch 候选重建（恢复 run 蒸馏输入不再静默丢失，RED 0==1 复现）。 |
+| T22 watchdog+压测 | `loop/watchdog.py`（外层包裹零侵入：逐问超时/连续失败暂停/失败账本/可读状态行）+ `scripts/stress_run.py`（单持久 root 连续问题流、lint 快照不恶化闸、诚实计量、cache 恒写"未报告"）。修复轮：预热产物校验（半成品快照目录毒化链，评审 10/10 复现后修复，连跑 10/10 绿）。 |
+
+**九条验收（PLAN.md §3.5）**：①dry-run 准确零落盘 ✓（测试）②job 重试零重复 ✓（五重断言）③refresh 旧快照保留+新证据可追溯 ✓ ④conflict 不被自动 merge + 仲裁有 resolution/resolved_at ✓（测试 + **真实数据上修复波后复验**）⑤lint 不恶化 ✓ mock 段（5233 快照逐对 0/0/0）；real 段失败为环境边界（R19）⑥10+ 连续问题 2h 零未解释崩溃 ✓ mock 26,157 问 0 错 0 超时 7211s + real 25 问 0 错 5755s ⑦token 曲线 + compaction 可审计 ✓ 机制层（触发/事件/容错专测）；两段压测 context 均未过阈值（0 次压缩，诚实记录——机制由测试覆盖）⑧kill→resume ✓（subprocess 四闸 + 计量对账）⑨cache 命中率只在 provider 返回时报告 ✓（恒写"未报告"）。总闸"可审计运行"：job 账本/compactions/unanswered.json/checkpoint/summary.json 全落盘可复算。
+
+**压测证据**（summary.json 在 `wiki-data/stress/`，gitignored，sha256 前 16 位：mock `91a5cb90e6ae8d6a`、real `bafcf1a686115d92`；逐 run root 本地保留 D:\p4stress\）：
+- mock 2h：26,157 问 · 0 超时 0 错误 · lint 0/0/0 全程 · EXIT=0（零 API 成本）。
+- real 25 问（R18：落在 R5 预注册 1–3M tok 包络内）：0 超时 0 错误 · tokens in 890,014 / out 438,669 ≈ 1.33M · 后段提速（43–50s vs 首段 85s，记忆复利可见）· q002 网络慢 855.6s 在 900s 死线内（HTTP 兜底 120s/请求已核实）。
+- **real 段 lint 闸失败 = 环境边界非缺陷（R19）**：无搜索 key → MockSearch 拟真 URL 抓取失败 → 引用无快照 → dangling_evidence 0→27。项目 2026-09-23 起的诚实边界被新闸定量显形。副产品：`unanswered.json` 在压测 run 目录出现 = T15 台账在 fresh==0 场景真实触发。
+
+**真实数据实操（验收总闸的活证据）**：对 real root 跑 `consolidate --dry-run`→`--run`：15 job（3 conflict + 10 merge + 2 rejudge），12 done / 3 failed——失败全是 R9 状态漂移保护（前序 merge 改变状态，后续计划项拒绝执行）；3 个 conflict 开台账（C-0010..12，slot 级 version 冲突 7.0 vs 6.8）；C-0007..9 是 run 期 memory_update 的"宁可开台账不造悬空来源"行为。`arbitrate resolve C-0010` 人工仲裁闭环（resolved + 留痕 N-0042）。修复波后 dry-run 收敛到仅 1 rejudge（闸 #4 排除生效）。
+
+**终审后修复波（320d34c，实操暴露、终审看不到的跨规则交互）**：①conflict×merge 相交绕过闸 #4（conflict 候选对 sim 0.85 同时落 merge 区间，max_merges 截断使其在后续 run 被合并）→ 规则层排除（截断前，frozenset 无序口径）+ 相交对专测；②rejudge confirm 不收敛（每轮重复真实模型调用）→ confirm 落 extra 标记 + 选择器排除（save_meta 完整传参防丢字段）。复审：两发现 ADDRESSED、无新破坏。
+
+**全部裁定**（台账全文）：R1 main 直推（项目既定交付模式）；R2 台账续接 `.superpowers/sdd/PLAN/`；R3 prior 注入顺序护栏→冲突→Prior；R4 checkpoint history 形态留给实现者（四闸兜底）；R5 real 压测预算先估算后跑；R6 ruff 闸=触碰文件零错误（仓库预存 34+10 在评测支线与 mcp-memory/）；R7 rejudge_stale_ratio 校准锚点；R8 merge 上界 0.95 排他；R9 共享笔记 merge 状态漂移→failed 可 skip（dry-run 预注册对象不允许静默改道）；R10 rejudge-supersede 无替代目标；R11 JobRecord.payload 增补；R12 护栏独立于 [prior] 开关/冲突块随 prior（安全护栏不对称原则）；R13 冲突注入块渲染第一槽位；R14 创建验证/重写保留的护栏不对称；R15 [runtime] 回退仅直接构造方完整生效；R16 ruff 预存数口径差异；R17 蒸馏跳过升级接受；R18 real 压测 25 问规模（1.33M tok 实际）；R19 real lint 闸失败=环境边界；R20 N-0005 计划→跳过循环=遗留转换痕迹不迁移。
+
+**环境备忘（预存非 P4 引入）**：pytest 默认 basetemp（C 盘）对含快照测试有 MAX_PATH 269>260 敏感性（LongPathsEnabled=0），`--basetemp` 指向 D 盘短路径即绿；本会话压测/终审一律 D 盘路径。评测支线文件 25 个预存 ruff 错误归该支线会话清理；`mcp-memory/` 分支线零提交零触碰。
+
+**诚实边界与移交**：①real 段 dangling_evidence 需要搜索 key 才能根治（MockSearch 拟真 URL 不可抓）；②compaction 在两段压测中零触发（context 未过阈值）——机制覆盖靠测试，长上下文真实场景留 eval 期；③max_conflict_pairs 窗口外的对不受闸 #4 保护（既定成本界，root 规模化时复查）；④收敛标记不感知正文变化（正文变了会重新计划 rejudge——正确方向）；⑤N-0005 遗留循环不迁移（R20）；⑥deferred minors ~24 项全录台账，终审 triage 无合并阻塞。下一阶段入口：PLAN §7 评测支线（P4 功能进 QA 集）与 RQ 叙事更新（"记忆自己演化"叙事现在有工程与数据双支撑）。
