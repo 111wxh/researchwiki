@@ -21,6 +21,13 @@
   当前问题相似度达标的条目，格式化成**独立护栏块**——调用方（AgentLoop）把它
   插在 Prior 块**之前**，不占用 ``[prior].top_k`` 配额：同题再到来时先看到
   "此问题此前已判定证据不足，禁止编造"。
+- ``retrieve_conflict_guards`` / ``format_conflict_guards``（P4a Task 18）：从
+  open 冲突台账（conflicts/，T17 维护执行器照单开出）里挑出与当前问题相关的
+  条目，格式化成**独立冲突块**，插在护栏块之后、Prior 块之前（R3 顺序裁定：
+  护栏 → 冲突 → Prior 笔记）。匹配是"实体相交 **或** 笔记相似度达标"两条满足
+  其一；注入内容只读台账记录字段（claim 槽位/笔记实体），**不重新比较**（T16
+  裁定）。``conflict_entity_names`` / ``conflict_assertion_pair`` 等展示字段
+  助手同时供 CLI（``arbitrate show`` 与仲裁留痕笔记）复用——单一实现防漂移。
 
 注入内容每条带：note_id、title、置信度、volatility、observed_at（缺省用
 created）、来源 URL 列表、正文（可截断）、以及若有重定向链则列出
@@ -34,10 +41,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from researchwiki.wiki.entities import slugify
 from researchwiki.wiki.index import SearchIndex, SearchMatch, index_drift
 from researchwiki.wiki.ledger import DEFAULT_GUARD_SIMILARITY, DEFAULT_GUARD_TOP_K
-from researchwiki.wiki.store import Note, WikiStore
-from researchwiki.wiki.verification import DEFAULT_SIMILARITY_DIM
+from researchwiki.wiki.store import Conflict, Note, WikiStore
+from researchwiki.wiki.verification import (
+    DEFAULT_SIMILARITY_DIM,
+    DEFAULT_SIMILARITY_FLOOR,
+    VerificationSettings,
+    token_similarity,
+)
 
 # 标签行原文（PLAN §4.2 一字不差；后续任务在测试里断言它）
 PRIOR_CONTEXT_LABEL = "历史 Prior，仅供核验，不是本轮 fresh evidence"
@@ -428,6 +441,197 @@ def format_unanswered_guards(guards: Sequence[UnansweredGuard]) -> str:
         for guard in guards
     ]
     return "\n\n".join(blocks) + "\n\n"
+
+
+# ---- 待解决冲突（P4a Task 18：open 冲突优先注入，展示字段助手供 CLI 复用）----
+
+
+# 冲突块头（task-18 简报文案逐字）
+CONFLICT_GUARD_HEADER = "### 待解决冲突（优先核验）"
+# 冲突注入条数上限：open 冲突是高价值信号但量级远小于笔记，缺省 3 条兜底防失控
+# （台账由 consolidation 按 max_actions 开出，常态只有个位数）
+DEFAULT_CONFLICT_TOP_K = 3
+
+
+@dataclass(frozen=True)
+class ConflictGuard:
+    """一条可注入的待解决冲突：台账记录字段 + 按槽位渲染的一对矛盾断言。
+
+    由 ``retrieve_conflict_guards`` 产生；文案由 ``format_conflict_guards`` 按
+    task-18 简报契约渲染（``### 待解决冲突（优先核验）`` + 台账行 + 来源与指令行）。
+    """
+
+    conflict_id: str
+    entity: str
+    assertion_a: str
+    assertion_b: str
+    note_a: str
+    note_b: str
+
+
+def conflict_claim_notes(
+    store: WikiStore, conflict: Conflict
+) -> tuple[Note | None, Note | None]:
+    """conflict 双方 claim 的笔记对象（读不到返回 None——台账记录可能悬空）。"""
+
+    def _load(claim_side: Mapping[str, object]) -> Note | None:
+        note_id = str(claim_side.get("note_id") or "")
+        return store.get_note(note_id) if note_id else None
+
+    return _load(conflict.claim_a), _load(conflict.claim_b)
+
+
+def conflict_entity_names(store: WikiStore, conflict: Conflict) -> list[str]:
+    """conflict 的实体名列表（注入匹配与 CLI 展示/留痕共用，确定性排序）。
+
+    实体身份 = slugify 归一键（"GLM-5.3" 与 "glm-5-3" 同一实体，与 ingest 查重
+    同一套身份定义）。优先取**双方公共实体**——consolidation 只对同实体对开
+    台账，公共实体就是冲突主体；无公共实体（手工登记 / 一方笔记已缺失）回退
+    双方并集（护栏宁可多注入，不因记录不完整而漏掉待解决问题）。
+    """
+
+    def _keys(note: Note | None) -> dict[str, str]:
+        # 归一键 → 原名（先到先得，保留笔记里登记的原始写法）
+        keys: dict[str, str] = {}
+        if note is None:
+            return keys
+        for name in note.entities:
+            key = slugify(str(name))
+            if key and key not in keys:
+                keys[key] = str(name)
+        return keys
+
+    note_a, note_b = conflict_claim_notes(store, conflict)
+    keys_a, keys_b = _keys(note_a), _keys(note_b)
+    shared = sorted(set(keys_a) & set(keys_b))
+    if shared:
+        return [keys_a[key] for key in shared]
+    merged: dict[str, str] = {**keys_b, **keys_a}  # 并集时 a 侧写法优先
+    return [merged[key] for key in sorted(merged)]
+
+
+def conflict_assertion_pair(conflict: Conflict) -> tuple[str, str]:
+    """conflict 的一对矛盾断言文案（只读台账记录，不重新比较——T16 裁定）。
+
+    T17 执行器把比较槽位原样写进双方 claim（``slots`` 列表 + ``role``），本函数
+    从记录取数渲染成「{context} {value}」形态。断言取**第一个槽位**（注入块是
+    摘要，全量槽位走 ``arbitrate show``）；槽位缺失时回退 claim.excerpt。两侧
+    取值键按 claim.role 对齐（prior → prior_value / evidence → evidence_value），
+    role 缺失时按 T16 方向兜底（claim_a = prior）。
+    """
+
+    def _render(claim_side: Mapping[str, object], default_key: str) -> str:
+        role = str(claim_side.get("role") or "")
+        if role in ("prior", "evidence"):
+            value_key = "evidence_value" if role == "evidence" else "prior_value"
+        else:
+            value_key = default_key
+        slots = claim_side.get("slots")
+        if isinstance(slots, list):
+            for slot in slots:
+                if not isinstance(slot, Mapping):
+                    continue
+                context = str(slot.get("context") or "").strip()
+                value = str(slot.get(value_key) or "").strip()
+                if context or value:
+                    return f"{context} {value}".strip()
+        return str(claim_side.get("excerpt") or "").strip()
+
+    return _render(conflict.claim_a, "prior_value"), _render(conflict.claim_b, "evidence_value")
+
+
+def _claim_label(claim_side: Mapping[str, object]) -> str:
+    """claim 的来源标签：note_id 优先，缺失回退 title（手工台账可能无 note_id）。"""
+    return str(claim_side.get("note_id") or claim_side.get("title") or "未知")
+
+
+def _note_question_similarity(note: Note | None, question: str, *, dim: int) -> float:
+    """冲突笔记与问题的相似度（verification 尺度）。
+
+    文本形态与 research_policy 的全库门控同款（``title + body[:400]``）——同一
+    系统对"笔记与问题像不像"用同一把尺、同一种取材。
+    """
+    if note is None:
+        return 0.0
+    text = f"{note.title} {note.body[:400]}".strip()
+    if not text:
+        return 0.0
+    return token_similarity(text, question, settings=VerificationSettings(similarity_dim=dim))
+
+
+def retrieve_conflict_guards(
+    question: str,
+    store: WikiStore,
+    *,
+    similarity_floor: float = DEFAULT_SIMILARITY_FLOOR,
+    top_k: int = DEFAULT_CONFLICT_TOP_K,
+    dim: int = DEFAULT_SIMILARITY_DIM,
+) -> list[ConflictGuard]:
+    """挑出与当前问题相关的 open 冲突（实体相交 **或** 笔记相似度达标）。
+
+    - 匹配口径（两条满足其一即注入）：
+      1. **实体相交**——冲突实体名的 slugify 键出现在问题文本的 slugify 键里
+         （``GLM-5.3`` 的键 ``glm-5-3`` 是问题 slug 的子串；写法变体同键归一）；
+      2. **笔记相似度**——任一方冲突笔记与问题的 ``token_similarity`` ≥
+         ``similarity_floor``（[verification].similarity_floor 同源同尺，维度
+         随 ``dim``——与护栏/记忆更新判定同一把尺）；
+    - resolved 冲突天然排除（只扫 open）；排序 = conflict_id 升序
+      （``list_conflicts`` 的落盘序，确定性），最多 ``top_k`` 条；
+    - 双方断言与实体都取不出的退化台账（无可展示内容）跳过；
+    - 纯读 store，零模型调用，同一入参恒得同一结果。
+    """
+    question_key = slugify(str(question))
+    guards: list[ConflictGuard] = []
+    for conflict in store.list_conflicts(status="open"):
+        note_a, note_b = conflict_claim_notes(store, conflict)
+        entity_names = conflict_entity_names(store, conflict)
+        entity_hit = any(
+            (key := slugify(name)) and key in question_key for name in entity_names
+        )
+        similar = max(
+            _note_question_similarity(note_a, question, dim=dim),
+            _note_question_similarity(note_b, question, dim=dim),
+        ) >= similarity_floor
+        if not (entity_hit or similar):
+            continue
+        assertion_a, assertion_b = conflict_assertion_pair(conflict)
+        entity = entity_names[0] if entity_names else str(conflict.claim_a.get("title") or "")
+        if not (entity or assertion_a or assertion_b):
+            continue  # 无任何可展示内容的退化台账：注入等于噪音
+        guards.append(
+            ConflictGuard(
+                conflict_id=conflict.id,
+                entity=entity,
+                assertion_a=assertion_a,
+                assertion_b=assertion_b,
+                note_a=_claim_label(conflict.claim_a),
+                note_b=_claim_label(conflict.claim_b),
+            )
+        )
+    return guards[: max(0, top_k)]
+
+
+def format_conflict_guards(guards: Sequence[ConflictGuard]) -> str:
+    """把待解决冲突格式化成 markdown 独立块（task-18 简报文案逐字）。
+
+    块头一行 ``### 待解决冲突（优先核验）``，每条冲突两行：台账行（id + 实体 +
+    一对矛盾断言）与来源/指令行（双方笔记 + 优先核验指令）。空列表返回空字符串；
+    块以空行结尾（与护栏块/Prior 块无缝拼接，调用方按 护栏 → 冲突 → Prior 顺序
+    前置）。
+    """
+    if not guards:
+        return ""
+    lines = [CONFLICT_GUARD_HEADER]
+    for guard in guards:
+        lines.append(
+            f"{guard.conflict_id} 实体「{guard.entity}」存在矛盾断言："
+            f"「{guard.assertion_a}」vs「{guard.assertion_b}」"
+        )
+        lines.append(
+            f"（来源 {guard.note_a} / {guard.note_b}）。"
+            "请优先核实哪一方是现行事实，并在报告中说明。"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 # ---- 索引一致性 -------------------------------------------------------------

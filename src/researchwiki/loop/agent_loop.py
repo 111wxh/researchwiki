@@ -46,6 +46,12 @@ formation，同 trace_id 幂等），结果落 run_dir/unanswered.json + state.m
 ``enabled = false`` 是逃生阀、``dry_run = true`` 是影子模式（不写笔记、不注入
 护栏）；未配置（None）时收尾零动作、Prior 零护栏。
 
+待解决冲突注入（P4a Task 18）：Prior 阶段同时扫 open 冲突台账（T17 维护执行器
+开出、人工经 ``arbitrate resolve`` 裁决），与当前问题实体相交或笔记相似度达
+``[verification].similarity_floor`` 的 open 冲突，以"待解决冲突（优先核验）"独立
+块插在护栏块之后、Prior 笔记之前（R3 顺序裁定）；resolved 不注入；``[prior].
+enabled = false`` 时整区照旧（冲突块同关，护栏独立性不变）。
+
 模式判定（P3 Dynamic Retrieval）：run 开始时先对同一 store/index 做零模型调用的
 探测检索，五因子特征 → 确定性模式判定（loop/research_policy.py）→ 留痕
 policy.json（features/reasons/outcome）与 state.md 的 retrieval 行，再按模式限额
@@ -1099,12 +1105,17 @@ class AgentLoop:
         # 未答问题护栏（P4a Task 15）：活跃台账里与当前问题相似的"已判证据不足"
         # 条目，在 Prior 块之前以独立块注入（不占 [prior].top_k 配额）。
         guard_block = self._unanswered_guard_block()
+        # 待解决冲突块（P4a Task 18）：open 冲突里与当前问题相关的条目，插在护栏
+        # 块之后、Prior 块之前（R3 顺序裁定：护栏 → 冲突 → Prior 笔记）。
+        conflict_block = self._conflict_guard_block()
         prior_block = self.prior_context.format() if self.prior_context is not None else ""
-        if guard_block or prior_block:
-            # 护栏块在最前、Prior 块随后，都放在问题之前、带分隔线；Prior 自带
-            # "仅供核验"标签行。系统提示词一字不动——稳定 prompt 前缀是阶段 3 的
-            # 前提，护栏与 Prior 同属动态后缀区。
-            plan_content = f"{guard_block}{prior_block}\n---\n\n研究问题：{self.question}"
+        if guard_block or conflict_block or prior_block:
+            # 护栏块在最前、冲突块随后、Prior 块最后，都放在问题之前、带分隔线；
+            # Prior 自带"仅供核验"标签行。系统提示词一字不动——稳定 prompt 前缀是
+            # 阶段 3 的前提，护栏/冲突与 Prior 同属动态后缀区。
+            plan_content = (
+                f"{guard_block}{conflict_block}{prior_block}\n---\n\n研究问题：{self.question}"
+            )
         else:
             plan_content = self.question
         plan_messages = [Message(role="user", content=plan_content)]
@@ -1546,6 +1557,28 @@ class AgentLoop:
             dim=self.verification_settings.similarity_dim,
         )
         return format_unanswered_guards(guards)
+
+    def _conflict_guard_block(self) -> str:
+        """plan 上下文的待解决冲突块（护栏块之后、Prior 块之前的独立块）。
+
+        - ``[prior]`` 禁用（enabled=false）→ 空串：冲突注入属于 Prior 动态装配区，
+          逃生阀关闭时整区照旧（护栏的独立性不变——Task 15 的既有口径）；
+        - 匹配口径（wiki/prior.retrieve_conflict_guards）：open 冲突实体与问题
+          实体相交，**或** 冲突笔记与问题相似度 ≥ ``[verification].similarity_floor``
+          （verification 尺度）；resolved 冲突不注入；
+        - 纯读 store，零模型调用；台账记录字段原样渲染，不重新比较（T16 裁定）。
+        """
+        if not self.prior_settings.enabled:
+            return ""
+        from researchwiki.wiki.prior import format_conflict_guards, retrieve_conflict_guards
+
+        guards = retrieve_conflict_guards(
+            self.question,
+            self.wiki_store,
+            similarity_floor=self.verification_settings.similarity_floor,
+            dim=self.verification_settings.similarity_dim,
+        )
+        return format_conflict_guards(guards)
 
     def _record_unanswered_guarded(self) -> None:
         """未答问题台账的守卫入口（同记忆更新 / outcome 回填的守卫约定）。

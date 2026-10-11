@@ -148,6 +148,178 @@ def _skip_job(runner, job_id: str, reason: str, *, as_json: bool) -> int:
     return 0
 
 
+def _conflict_to_dict(conflict) -> dict:
+    """Conflict → JSON 字典（--json 输出与留痕摘要共用同一形态）。"""
+    return {
+        "id": conflict.id,
+        "status": conflict.status,
+        "question": conflict.question,
+        "claim_a": conflict.claim_a,
+        "claim_b": conflict.claim_b,
+        "created": conflict.created,
+        "resolution": conflict.resolution,
+        "resolved_at": conflict.resolved_at,
+    }
+
+
+def _print_conflict_detail(conflict, *, entity: str, assertion_a: str, assertion_b: str) -> None:
+    """arbitrate show 的全文输出：台账头 + 双方 claim（含断言槽位）+ 裁决（如有）。"""
+    import json
+
+    print(f"{conflict.id} [{conflict.status}]")
+    print(f"问题：{conflict.question}")
+    print(f"登记：{conflict.created or '（缺省）'}")
+    print(f"实体：{entity or '（未登记）'}")
+    print(f"矛盾断言：「{assertion_a}」vs「{assertion_b}」")
+    for label, claim_side in (("claim_a", conflict.claim_a), ("claim_b", conflict.claim_b)):
+        note_id = claim_side.get("note_id") or "未知"
+        title = claim_side.get("title") or ""
+        role = claim_side.get("role") or "（未标）"
+        print(f"- {label}：{note_id}（role={role}，{title}）")
+        excerpt = str(claim_side.get("excerpt") or "")
+        if excerpt:
+            print(f"  摘录：{excerpt}")
+        slots = claim_side.get("slots")
+        if slots:
+            print(f"  槽位：{json.dumps(slots, ensure_ascii=False)}")
+    if conflict.status == "resolved":
+        resolution = conflict.resolution
+        print(f"裁决：{resolution.get('verdict', '')}")
+        print(f"采纳：{resolution.get('resolved_with', '')}")
+        print(f"裁决时间：{conflict.resolved_at}")
+
+
+def _arbitrate_resolve(store, conflict_id: str, verdict: str, resolved_with: str) -> tuple:
+    """裁决一条冲突并落一条仲裁留痕笔记；校验先行，任何失败都不碰 conflict 记录。
+
+    返回 (Conflict, Note)。
+
+    - conflict 必须存在；``--with`` 必须是存在且 active/merged 的笔记（墓碑是
+      失效审计记录，不作为采纳事实）——违规 raise ValueError（CLI 退出 2，
+      conflict 保持 open、零留痕）；
+    - 校验通过才调 ``store.resolve_conflict``（resolution + resolved_at 由它落盘，
+      本函数不重写 store 语义），随后写 kind=experience 留痕笔记（extra 平铺：
+      ledger=arbitration / conflict_id / adopted_note_id）——裁决本身成为可检索
+      记忆（memory.search 可召回，与其它记忆同通道）。
+    """
+    from researchwiki.wiki.prior import conflict_assertion_pair, conflict_entity_names
+
+    conflict = store.get_conflict(conflict_id)
+    if conflict is None:
+        raise ValueError(f"conflict 不存在：{conflict_id}")
+    adopted = store.get_note(resolved_with)
+    if adopted is None:
+        raise ValueError(f"--with 笔记不存在：{resolved_with}")
+    if adopted.tombstone:
+        raise ValueError(
+            f"--with 笔记是墓碑（失效审计记录），不能作为采纳事实：{resolved_with}"
+        )
+    if adopted.status not in ("active", "merged"):
+        raise ValueError(
+            f"--with 笔记状态为 {adopted.status}，只接受 active/merged：{resolved_with}"
+        )
+    conflict = store.resolve_conflict(conflict_id, verdict=verdict, resolved_with=resolved_with)
+    entity_names = conflict_entity_names(store, conflict)
+    assertion_a, assertion_b = conflict_assertion_pair(conflict)
+    claim_a, claim_b = conflict.claim_a, conflict.claim_b
+    note = store.save_note(
+        body=(
+            f"# 仲裁留痕 {conflict.id}\n"
+            "\n"
+            f"冲突问题：{conflict.question}\n"
+            f"- 双方：{_claim_source(claim_a)} vs {_claim_source(claim_b)}\n"
+            f"- 矛盾断言：「{assertion_a}」vs「{assertion_b}」\n"
+            f"- 结论：{verdict}\n"
+            f"- 采纳：{resolved_with}\n"
+        ),
+        title=f"冲突仲裁留痕 {conflict.id}",
+        entities=entity_names,
+        kind="experience",
+        extra={
+            "ledger": "arbitration",
+            "conflict_id": conflict.id,
+            "adopted_note_id": resolved_with,
+        },
+    )
+    return conflict, note
+
+
+def _claim_source(claim_side: dict) -> str:
+    """留痕笔记正文里的 claim 来源标签：note_id（标题）。"""
+    note_id = str(claim_side.get("note_id") or "未知")
+    title = str(claim_side.get("title") or "")
+    return f"{note_id}（{title}）" if title else note_id
+
+
+def _run_arbitrate(args) -> int:
+    """arbitrate 三个子动作的统一入口（list / show / resolve）。"""
+    import json
+
+    from researchwiki.wiki.prior import conflict_assertion_pair, conflict_entity_names
+    from researchwiki.wiki.store import WikiStore
+
+    store = WikiStore(args.root)
+    if args.arbitrate_action == "list":
+        status = None if args.status == "all" else args.status
+        conflicts = store.list_conflicts(status=status)
+        if args.json:
+            print(
+                json.dumps(
+                    [_conflict_to_dict(conflict) for conflict in conflicts],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"冲突台账（root={store.root}，status={args.status}）：共 {len(conflicts)} 条")
+            for conflict in conflicts:
+                line = f"  {conflict.id} [{conflict.status}] {conflict.question}"
+                if conflict.status == "resolved":
+                    line += f" → 采纳 {conflict.resolution.get('resolved_with', '')}"
+                print(line)
+        return 0
+
+    if args.arbitrate_action == "show":
+        conflict = store.get_conflict(args.conflict_id)
+        if conflict is None:
+            print(f"conflict 不存在：{args.conflict_id}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(_conflict_to_dict(conflict), ensure_ascii=False, indent=2))
+        else:
+            entity_names = conflict_entity_names(store, conflict)
+            assertion_a, assertion_b = conflict_assertion_pair(conflict)
+            _print_conflict_detail(
+                conflict,
+                entity=entity_names[0] if entity_names else "",
+                assertion_a=assertion_a,
+                assertion_b=assertion_b,
+            )
+        return 0
+
+    # resolve：校验失败（conflict 不存在 / --with 不合法）一律退出 2 且台账原状
+    try:
+        conflict, note = _arbitrate_resolve(
+            store, args.conflict_id, args.verdict, args.resolved_with
+        )
+    except ValueError as exc:
+        print(f"仲裁失败：{exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(
+            json.dumps(
+                {"conflict": _conflict_to_dict(conflict), "trace_note_id": note.id},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"已裁决：{conflict.id} → resolved（采纳 {args.resolved_with}）；留痕笔记 {note.id}"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # 先加载 .env：所有子命令（serve / lint / serve-mcp）都要能读到 key
     from researchwiki.env import load_env_file
@@ -221,7 +393,40 @@ def main(argv: list[str] | None = None) -> int:
         help="wiki 数据目录（默认 wiki-data，可用 RESEARCHWIKI_WIKI_DATA 覆盖）",
     )
     lint_parser.add_argument("--json", action="store_true", help="输出 JSON（便于 CI 消费）")
-    sub.add_parser("arbitrate", help="冲突人工仲裁入口（阶段 3）")
+    arbitrate_parser = sub.add_parser(
+        "arbitrate", help="冲突人工仲裁入口（P4a T4：list/show/resolve）"
+    )
+    arbitrate_sub = arbitrate_parser.add_subparsers(
+        dest="arbitrate_action", required=True, help="仲裁子动作"
+    )
+    arbitrate_list = arbitrate_sub.add_parser("list", help="列出冲突台账（默认只看 open）")
+    arbitrate_list.add_argument(
+        "--status",
+        choices=["open", "resolved", "all"],
+        default="open",
+        help="状态过滤：open（默认）/ resolved / all",
+    )
+    arbitrate_show = arbitrate_sub.add_parser("show", help="查看一条冲突的全文（含双方断言槽位）")
+    arbitrate_show.add_argument("conflict_id", help="冲突台账 ID（C-XXXX）")
+    arbitrate_resolve = arbitrate_sub.add_parser("resolve", help="裁决一条冲突并写仲裁留痕笔记")
+    arbitrate_resolve.add_argument("conflict_id", help="冲突台账 ID（C-XXXX）")
+    arbitrate_resolve.add_argument(
+        "--verdict", required=True, help="裁决结论说明（写入 resolution.verdict 与留痕笔记正文）"
+    )
+    arbitrate_resolve.add_argument(
+        "--with",
+        dest="resolved_with",
+        required=True,
+        metavar="NOTE_ID",
+        help="采纳的笔记 ID（必须是存在且 active/merged 的笔记，违规退出 2）",
+    )
+    for arbitrate_cmd in (arbitrate_list, arbitrate_show, arbitrate_resolve):
+        arbitrate_cmd.add_argument(
+            "--root",
+            default=os.environ.get("RESEARCHWIKI_WIKI_DATA", "wiki-data"),
+            help="wiki 数据目录（默认 wiki-data，可用 RESEARCHWIKI_WIKI_DATA 覆盖）",
+        )
+        arbitrate_cmd.add_argument("--json", action="store_true", help="输出 JSON（便于脚本消费）")
     mcp_parser = sub.add_parser(
         "serve-mcp", help="启动 wiki MCP server（标准 MCP 客户端如 Claude Code 用 stdio）"
     )
@@ -316,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(plan.format_text(root=str(args.root)))
         return 0
+
+    if args.command == "arbitrate":
+        # 延迟导入：arbitrate 之外的命令不需要拉起 wiki 子系统（分发在 _run_arbitrate）
+        return _run_arbitrate(args)
 
     if args.command == "lint":
         # 延迟导入：lint 之外的命令不需要拉起 wiki 子系统
