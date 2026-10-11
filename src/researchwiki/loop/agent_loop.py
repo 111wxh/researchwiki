@@ -1895,19 +1895,29 @@ class AgentLoop:
             )
 
     def _rebuild_source_pool_guarded(self, history: list[Message]) -> None:
-        """恢复 run 从 history 的工具结果按原顺序复原来源池（守卫入口，失败只记 stderr）。
+        """恢复 run 从 history 的工具结果按原顺序复原来源池与子 agent 候选（守卫入口，
+        失败只记 stderr，不阻断恢复）。
 
-        来源池是内存态，kill 后只剩 history 里的工具结果 JSON。按消息顺序重放各
-        handler 的入池逻辑（顺序即报告 [n] 编号，必须与原 run 一致）：
+        来源池与 pending_candidates 都是内存态，kill 后只剩 history 里的工具结果
+        JSON。按消息顺序重放各 handler 的副作用（顺序即报告 [n] 编号，必须与原
+        run 一致）：
 
         - web_search 结果：逐条 add(url, title)；
         - fetch_url 结果：add(final_url or url, 正文首行标题, content_hash)；
-        - dispatch_research 结果：逐条 add(子 agent 来源)。
+        - dispatch_research 结果：逐条 add(子 agent 来源)，并按 ``_run_subagent``
+          的同口径从返回体的 notes 键重建 ``self.pending_candidates``——它是蒸馏
+          阶段的直接候选输入，漏掉它会让恢复 run 的蒸馏候选静默缺失（子 agent
+          笔记只剩 _tool_digest 的 800 字截断摘编，LLM 重推导只能近似还原，
+          恢复 run 笔记集与一次性基线不一致）。子 agent 的**内部**检索步骤不在
+          主循环 history（独立上下文），无法复原，属已知限度。
 
         与 handler 的唯一差别是不再计数 search_calls/fetch_calls——恢复 run 的
         fresh 计数只记本 run 实际发生的检索（诚实计量口径）。
         """
         try:
+            # wiki 层延迟导入，见文件头 TYPE_CHECKING 说明（loop → wiki 循环导入）
+            from researchwiki.wiki.distiller import CandidateNote
+
             for m in history:
                 if m.role != "tool" or not m.content:
                     continue
@@ -1934,15 +1944,32 @@ class AgentLoop:
                     )
                     continue
                 sub_sources = data.get("sources")  # dispatch_research
-                if isinstance(sub_sources, list):
-                    for item in sub_sources:
+                sub_notes = data.get("notes")
+                if isinstance(sub_sources, list) or isinstance(sub_notes, list):
+                    # 来源先入池（与 _run_subagent 的 add_source 顺序一致），再取
+                    # refs 重建候选——refs 口径 = 子 agent 来源入池后的全池快照
+                    for item in sub_sources or []:
                         if isinstance(item, dict):
                             self.ctx.add_source(
                                 str(item.get("url") or ""), str(item.get("title") or "")
                             )
+                    if isinstance(sub_notes, list):
+                        urls = [
+                            str(item.get("url") or "")
+                            for item in sub_sources or []
+                            if isinstance(item, dict) and str(item.get("url") or "")
+                        ]
+                        refs = self.ctx.source_refs()
+                        for note in sub_notes:
+                            if isinstance(note, dict):
+                                self.pending_candidates.append(
+                                    CandidateNote.from_dict(
+                                        {**note, "source_urls": urls}, sources=refs
+                                    )
+                                )
         except Exception as exc:  # noqa: BLE001 -- 复原失败降级为空池（报告无引用可挂）
             print(
-                f"[agent-loop] 来源池复原失败（恢复 run 的报告将没有可引用来源）："
+                f"[agent-loop] 来源池/子 agent 候选复原失败（恢复 run 的蒸馏候选将缺失）："
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )

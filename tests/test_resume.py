@@ -443,3 +443,92 @@ def test_resume_killed_between_terminal_act_and_distill(tmp_path: Path) -> None:
     assert final_ck["completed_step_ids"] == [
         "plan", "act:1", "act:2", "act:3", "distill", "report", "finalize",
     ]
+
+
+# ---- dispatch 场景恢复：子 agent 候选从侧车重建（评审 Important 修复回归）--------
+
+
+def test_resume_rebuilds_pending_candidates_from_dispatch(tmp_path: Path) -> None:
+    """含 dispatch_research 的 act step 完成后被 kill：恢复 run 从侧车 dispatch 返回体
+    （notes 键）重建 pending_candidates（与 _run_subagent 同口径）——恢复 run 的蒸馏
+    候选与一次性基线一致，子 agent 笔记不再靠 _tool_digest 重推导近似还原（静默少记）。
+
+    蒸馏脚本给空抽取结果：候选唯一来源是子 agent 笔记，重建缺失必然使笔记集不一致。
+    """
+    sub_json = json.dumps(
+        {
+            "findings": "子问题结论：Letta 的记忆固化走后台 subagent。",
+            "notes": [
+                {
+                    "text": "子 agent 笔记：Letta 用后台 subagent 整理长期记忆。",
+                    "entities": ["Letta"],
+                    "confidence": "high",
+                }
+            ],
+            "sources": [{"url": DISTILL_NOTE_URL, "title": "Letta (MemGPT)"}],
+        },
+        ensure_ascii=False,
+    )
+    empty_distill = text_turn(json.dumps({"notes": [], "conflicts": []}, ensure_ascii=False))
+    strong_script = [
+        text_turn(PLAN_TEXT),
+        tool_turn([call("dispatch_research", {"topic": "上下文压缩"}, id="c1")]),
+        tool_turn([call("web_search", {"query": "agent 长期记忆"}, id="s2")]),
+        text_turn(SEARCH_SUMMARY),
+        text_turn(REPORT_TEXT),
+    ]
+    cheap_script = [text_turn(sub_json), distill_turn()]  # 子 agent 单步 + 蒸馏
+
+    # 基线：一次性跑完；笔记集 = 子 agent 笔记（蒸馏零抽取）
+    base_root = tmp_path / "base"
+    base_loop = make_loop(
+        base_root,
+        strong=ScriptedProvider(strong_script, model="mock-strong"),
+        cheap=ScriptedProvider(cheap_script, tier="cheap", model="mock-cheap"),
+    )
+    list(base_loop.events())
+    base_notes = WikiStore(base_root / "wiki-data").list_notes()
+    assert len(base_notes) == 1
+    assert base_notes[0].body.strip().startswith("子 agent 笔记：")
+
+    # 受害：act:1（dispatch 步）checkpoint 落盘后中断（手法同 _kill_and_resume）。
+    # kill 落在 act:1 与 act:2 之间：蒸馏从未执行，候选丢失只能在恢复时暴露。
+    root = tmp_path / "killed"
+    run_dir = root / "run"
+    strong_a = ScriptedProvider(strong_script, model="mock-strong")
+    cheap_a = ScriptedProvider(cheap_script, tier="cheap", model="mock-cheap")
+    loop_a = make_loop(root, strong=strong_a, cheap=cheap_a, run_dir=run_dir)
+    gen = loop_a.events()
+    for _event in gen:
+        ck = checkpoint.load(run_dir)
+        if ck and "act:1" in ck["completed_step_ids"]:
+            break
+    gen.close()
+    ck_kill = checkpoint.load(run_dir)
+    assert ck_kill is not None
+    assert ck_kill["completed_step_ids"] == ["plan", "act:1"]
+    # 子 agent 在 act:1 内部跑过（cheap 第 1 轮），蒸馏未到（第 2 轮未消费）
+    assert len(cheap_a.calls) == 1
+    assert len(loop_a.pending_candidates) == 1  # kill 前候选在内存里，随进程消失
+
+    # 恢复：剧本从 act:2 起；蒸馏空抽取 → 候选唯一来源是重建的 pending_candidates
+    strong_b = ScriptedProvider(strong_script[2:], model="mock-strong")
+    cheap_b = ScriptedProvider([empty_distill], tier="cheap", model="mock-cheap")
+    loop_b = make_loop(root, strong=strong_b, cheap=cheap_b, run_dir=run_dir, resume_from=run_dir)
+    events_b = list(loop_b.events())
+
+    assert events_b[-1]["type"] == "finish"
+    # pending_candidates 从侧车 dispatch 返回体重建（与 _run_subagent 同口径）
+    assert len(loop_b.pending_candidates) == 1
+    rebuilt = loop_b.pending_candidates[0]
+    assert rebuilt.text.startswith("子 agent 笔记：")
+    assert rebuilt.source_urls == [DISTILL_NOTE_URL]
+    # 子 agent 不重跑（dispatch 步已跳过）：cheap 只有蒸馏 1 次调用
+    assert len(cheap_b.calls) == 1
+    assert len(strong_b.calls) == 3  # act:2 / act:3 / report
+    # 恢复 run 的笔记集与一次性基线一致（静默少记的核心断言）
+    notes_b = WikiStore(root / "wiki-data").list_notes()
+    assert [n.body.strip() for n in notes_b] == [n.body.strip() for n in base_notes]
+    assert [e["data"]["text"] for e in events_b if e["type"] == "data-note"] == [
+        "子 agent 笔记：Letta 用后台 subagent 整理长期记忆。"
+    ]
