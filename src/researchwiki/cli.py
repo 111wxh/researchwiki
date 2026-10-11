@@ -29,6 +29,121 @@ def load_config() -> dict:
         return {}
 
 
+def _run_maintenance(store, config, consolidation_settings, *, as_json: bool) -> int:
+    """consolidate --run：按 [consolidation] 的计划逐动作执行（[maintenance] 接线）。
+
+    逃生阀与不接线语义（Global Constraints 逐字）：[maintenance] 段缺失 = 不接线 =
+    整段无操作（退出 1，与 [consolidation] 缺段同口径）；enabled = false 即完全
+    禁用（零动作零留痕，退出 0）。有 failed 时退出 1，供脚本感知部分失败。
+    """
+    import json
+
+    from researchwiki.llm.router import ModelRouter
+    from researchwiki.wiki.consolidation import plan_consolidation
+    from researchwiki.wiki.maintenance import MaintenanceRunner, maintenance_settings
+
+    maintenance = maintenance_settings(config)
+    if maintenance is None:
+        print(
+            "[maintenance] 段未配置（config.toml 缺段 = 不接线）："
+            "consolidate --run 不做任何事。",
+            file=sys.stderr,
+        )
+        return 1
+    if not maintenance.enabled:
+        print("maintenance 已禁用（enabled=false）：维护执行零动作零留痕。")
+        return 0
+    plan = plan_consolidation(store, consolidation_settings)
+    runner = MaintenanceRunner(store, ModelRouter(config), maintenance)
+    records = runner.run(plan)
+    counts: dict[str, int] = {}
+    for record in records:
+        counts[record.status] = counts.get(record.status, 0) + 1
+    summary = "、".join(f"{name} {counts.get(name, 0)}" for name in ("done", "failed", "skipped"))
+    if as_json:
+        print(
+            json.dumps(
+                {"scanned": plan.scanned, "jobs": [r.to_dict() for r in records]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"维护执行（root={store.root}）：候选 {len(records)} 个 → {summary}"
+            if records
+            else f"维护执行（root={store.root}）：无维护候选，零动作。"
+        )
+        for record in records:
+            line = (
+                f"  {record.job_id} [{record.status:>7}] {record.action:<8} "
+                f"{'、'.join(record.note_ids)}"
+            )
+            if record.error:
+                line += f"  错误：{record.error}"
+            print(line)
+    return 1 if counts.get("failed") else 0
+
+
+def _print_jobs(runner, *, status: str | None, as_json: bool) -> int:
+    """--jobs：列出维护 job 账本（可按状态过滤）。"""
+    import json
+
+    records = runner.list_jobs(status=status)
+    if as_json:
+        print(json.dumps([record.to_dict() for record in records], ensure_ascii=False, indent=2))
+        return 0
+    label = f"（status={status}）" if status else ""
+    print(f"维护 job 账本（root={runner.store.root}）{label}：共 {len(records)} 条")
+    for record in records:
+        line = (
+            f"  {record.job_id} [{record.status:>7}] {record.action:<8} "
+            f"{'、'.join(record.note_ids)} attempt={record.attempt} "
+            f"tokens={record.tokens_in}/{record.tokens_out}"
+        )
+        if record.error:
+            line += f"  错误：{record.error}"
+        print(line)
+    return 0
+
+
+def _retry_job(runner, job_id: str, *, as_json: bool) -> int:
+    """--retry：重试 failed 的 job（退出码跟随重试结果：done 0 / failed 1）。"""
+    import json
+
+    try:
+        record = runner.retry_job(job_id)
+    except ValueError as exc:
+        print(f"重试失败：{exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"重试完成：{record.job_id} [{record.status}] {record.action} "
+            f"{'、'.join(record.note_ids)} attempt={record.attempt}"
+        )
+        if record.error:
+            print(f"  错误：{record.error}")
+    return 0 if record.status == "done" else 1
+
+
+def _skip_job(runner, job_id: str, reason: str, *, as_json: bool) -> int:
+    """--skip --reason：跳过 pending/failed 的 job，理由留痕进 job 记录。"""
+    import json
+
+    try:
+        record = runner.skip_job(job_id, reason)
+    except ValueError as exc:
+        print(f"跳过失败：{exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(f"已跳过：{record.job_id}（reason={reason}）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # 先加载 .env：所有子命令（serve / lint / serve-mcp）都要能读到 key
     from researchwiki.env import load_env_file
@@ -66,7 +181,34 @@ def main(argv: list[str] | None = None) -> int:
     consolidate_run_group.add_argument(
         "--run",
         action="store_true",
-        help="执行维护动作（执行器在 T3 接线；当前为桩）",
+        help="执行维护动作：按 [consolidation] 计划逐动作执行（[maintenance] 接线）",
+    )
+    consolidate_run_group.add_argument(
+        "--jobs",
+        action="store_true",
+        help="查看维护 job 账本（可配 --status 过滤）",
+    )
+    consolidate_run_group.add_argument(
+        "--retry",
+        metavar="JOB_ID",
+        default=None,
+        help="重试指定 job（仅 failed 可重试；按原计划参数重放，attempt+1）",
+    )
+    consolidate_run_group.add_argument(
+        "--skip",
+        metavar="JOB_ID",
+        default=None,
+        help="跳过指定 job（仅 pending/failed 可跳过；需配 --reason 留痕）",
+    )
+    consolidate_parser.add_argument(
+        "--status",
+        default=None,
+        help="--jobs 的状态过滤：pending / running / done / failed / skipped",
+    )
+    consolidate_parser.add_argument(
+        "--reason",
+        default=None,
+        help="--skip 的跳过理由（必填，写入 job 记录留痕）",
     )
     lint_parser = sub.add_parser("lint", help="wiki 健康度检查（阶段 2）")
     lint_parser.add_argument(
@@ -113,16 +255,44 @@ def main(argv: list[str] | None = None) -> int:
         # 延迟导入：consolidate 之外的命令不需要拉起 wiki 子系统
         import json
 
+        from researchwiki.llm.router import ModelRouter
         from researchwiki.wiki.consolidation import consolidation_settings, plan_consolidation
+        from researchwiki.wiki.maintenance import (
+            MaintenanceRunner,
+            MaintenanceSettings,
+            maintenance_settings,
+        )
         from researchwiki.wiki.store import WikiStore
 
-        if args.run:
-            # T17 会接走执行器；当前保留桩语义（返回 1，零写盘）
-            print("执行器在 T3 接线：consolidate --run 尚未实现，本次未做任何事。", file=sys.stderr)
+        # 跨参数依赖校验（argparse 的互斥组表达不了）
+        if args.skip and not args.reason:
+            print("--skip 需要配合 --reason 提供跳过理由（审计留痕）。", file=sys.stderr)
             return 1
+        if args.status and not args.jobs:
+            print("--status 需要配合 --jobs 使用。", file=sys.stderr)
+            return 1
+
+        store = WikiStore(args.root)
+        config = load_config()
+
+        # --jobs / --retry / --skip：对既有账本的运维动作。不要求 [maintenance] 段
+        # 存在——账本可能产生于段被移除之前，运维不该被配置缺失挡在门外；
+        # 缺段时用默认 settings（retry 的 rejudge 档位回退 cheap）。
+        if args.jobs or args.retry or args.skip:
+            runner = MaintenanceRunner(
+                store,
+                ModelRouter(config),
+                maintenance_settings(config) or MaintenanceSettings(),
+            )
+            if args.jobs:
+                return _print_jobs(runner, status=args.status, as_json=args.json)
+            if args.retry:
+                return _retry_job(runner, args.retry, as_json=args.json)
+            return _skip_job(runner, args.skip, args.reason, as_json=args.json)
+
         # 配置接线与 lint 同手法：load_config() 宽容读（缺失/损坏回退空配置），
         # consolidation_settings 对缺 [consolidation] 段返回 None = 不接线。
-        settings = consolidation_settings(load_config())
+        settings = consolidation_settings(config)
         if settings is None:
             print(
                 "[consolidation] 段未配置（config.toml 缺段 = 不接线）："
@@ -130,8 +300,12 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        if args.run:
+            return _run_maintenance(store, config, settings, as_json=args.json)
+
         # dry-run 是默认路径（--dry-run 仅为显式声明）：纯选择零写盘
-        plan = plan_consolidation(WikiStore(args.root), settings)
+        plan = plan_consolidation(store, settings)
         if args.json:
             print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
         else:

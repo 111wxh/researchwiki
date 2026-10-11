@@ -225,3 +225,11 @@ max_merges = 10
 max_refresh = 10
 max_rejudge = 10
 max_conflicts = 10
+
+[maintenance]
+# 维护执行器（P4a）：consolidate --run 按 [consolidation] 的计划逐动作执行。
+# 幂等：同 idempotency_key 的 done job 使重放变 skipped；失败保原文（抓取失败/
+# 模型畸形绝不落新事实）；job 账本 jobs.jsonl 追加式 + 单 job JSON 原子写。
+# 用户可查看（--jobs）、重试（--retry，仅 failed）、跳过（--skip）。
+enabled = true
+# rejudge_model_tier = "cheap"   # rejudge 用的模型档（默认 cheap）

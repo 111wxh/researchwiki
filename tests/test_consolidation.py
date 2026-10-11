@@ -513,11 +513,18 @@ def test_cli_json_plan_shape(tmp_path: Path, capsys, monkeypatch) -> None:
     }
 
 
-def test_cli_run_stub_returns_1(tmp_path: Path, capsys) -> None:
-    """--run 在本任务保留桩语义：打印"执行器在 T3 接线"返回 1（T17 接走）。"""
-    exit_code = cli.main(["consolidate", "--run", "--root", str(tmp_path / "wiki-data")])
+def test_cli_run_without_maintenance_section_exits_1(tmp_path: Path, capsys, monkeypatch) -> None:
+    """--run 由 T17 执行器接走：[maintenance] 段缺失 = 不接线，退出 1 零动作。"""
+    store = make_store(tmp_path)
+    save(store, "N-0001", MERGE_A, entities=["GLM-5.3"], created="2026-03-01T00:00:00+00:00")
+    save(store, "N-0002", MERGE_B, entities=["GLM-5.3"], created="2026-01-01T00:00:00+00:00")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONSOLIDATION_TOML, encoding="utf-8")
+    monkeypatch.setattr(cli, "CONFIG_PATH", config_path)
+    exit_code = cli.main(["consolidate", "--run", "--root", str(store.root)])
     assert exit_code == 1
-    assert "执行器在 T3 接线" in capsys.readouterr().err
+    assert "未配置" in capsys.readouterr().err
+    assert store.get_note("N-0001").meta.status == "active"  # 零动作
 
 
 def test_cli_text_output_is_human_readable(tmp_path: Path, capsys, monkeypatch) -> None:
