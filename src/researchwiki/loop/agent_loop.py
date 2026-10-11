@@ -72,11 +72,26 @@ run_dir/compactions.jsonl（与 T17 jobs.jsonl 同一套追加+断电容错手�
 system prompt 与工具 schema 顺序在 run 内固定（前缀区），护栏/冲突/Prior/
 工具结果/压缩摘要一律属动态后缀区（见 _events 装配处与 build_registry 的注释，
 tests/test_compaction.py 固化）。
+
+checkpoint 与恢复（P4b 支撑设施 T7）：每个研究 step 完成（plan、每个 act 步、
+distill、report、finalize）后，原子写 run_dir/checkpoint.json 与 history 侧车
+checkpoint-history.json（形态取舍见 loop/checkpoint.py docstring）。进程被 kill
+后用同一 run_dir 新建 AgentLoop 并传 ``resume_from`` 即从断点继续：已完成 step
+不重跑（模型调用自然不重复 → 不重复扣费）、llm_keys_seen 采集已发调用请求哈希
+做纵深防御、入库笔记 extra 带 run_step_key 幂等键——恢复 run 入库前查同键笔记
+防重复创建（checkpoint 滞后一拍的写-崩溃窗口兜底）。checkpoint 损坏 = None +
+告警：宁可重跑不可带病恢复。恢复 run 续用原 run_dir（resume_from 未显式给
+run_dir 时），预算熔断以 checkpoint.budget_used 为基线，run-metrics 只记新消耗
+（14 字段契约不动）。显式传入 ``[checkpoint]`` 段才启用保存；resume 由显式
+``resume_from`` 参数触发（server 通路不接线——每 request 新 loop，resume 是
+CLI/脚本级能力），``enabled = false`` 是逃生阀；未配置（None）时零写盘、零恢复
+检测，行为逐字段与接入前一致。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -87,6 +102,8 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import Message, Provider, TokenUsage, chunk_text
+from researchwiki.loop import checkpoint
+from researchwiki.loop.checkpoint import CheckpointSettings, ResumeState
 from researchwiki.loop.compaction import (
     COMPACTION_SYSTEM,
     context_settings_from_config,
@@ -593,6 +610,8 @@ class AgentLoop:
         verification_config: Mapping[str, Any] | None = None,
         unanswered_config: Mapping[str, Any] | None = None,
         context_config: Mapping[str, Any] | None = None,
+        checkpoint_config: Mapping[str, Any] | None = None,
+        resume_from: str | Path | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -603,6 +622,13 @@ class AgentLoop:
         self.wiki_root = Path(wiki_root)
         default_run_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{self.trace_id}"
         self.run_dir = Path(run_dir) if run_dir else self.wiki_root / "runs" / default_run_id
+        # checkpoint 恢复（T7）：resume_from 指向原 run 的 run_dir（其下的
+        # checkpoint.json + checkpoint-history.json 是断点状态）。未显式给 run_dir
+        # 时续用原 run_dir——research-plan.md / state.md / report.md 与 checkpoint
+        # 同目录，断点产物不被拆散；取舍见 loop/checkpoint.py docstring。
+        self.resume_from = Path(resume_from) if resume_from else None
+        if self.resume_from is not None and run_dir is None:
+            self.run_dir = self.resume_from
         self.max_steps = max_steps
         self.token_budget = token_budget
         self.clock = clock
@@ -612,6 +638,25 @@ class AgentLoop:
         self._aux_tier = pick_tier(llm_config, "cheap")
         self.distill_provider = router.get(self._aux_tier)
         self.subagent_provider = router.get(self._aux_tier)
+
+        # checkpoint（P4b T7）：[checkpoint] 段（None = 段缺失 = 不接线 = 零写盘零
+        # 恢复检测）；enabled=false 是逃生阀。接线时给三个 provider 套 KeyRecording
+        # 包装，采集已发调用的请求哈希（llm_keys_seen，纵深防御——口径与
+        # llm/replay.py 的 request_hash 一致，两者可组合出真"重放不扣费"）。
+        self.checkpoint_settings: CheckpointSettings | None = (
+            None
+            if checkpoint_config is None
+            else checkpoint.checkpoint_settings_from_config(checkpoint_config)
+        )
+        self._llm_keys_seen: list[str] = []
+        if self.checkpoint_settings is not None and self.checkpoint_settings.enabled:
+            self.provider = checkpoint.KeyRecordingProvider(self.provider, self._llm_keys_seen)
+            self.distill_provider = checkpoint.KeyRecordingProvider(
+                self.distill_provider, self._llm_keys_seen
+            )
+            self.subagent_provider = checkpoint.KeyRecordingProvider(
+                self.subagent_provider, self._llm_keys_seen
+            )
 
         self.ctx = RunContext(
             search_provider=search_provider or get_search_provider(),
@@ -708,6 +753,16 @@ class AgentLoop:
         # 账本正文在 run_dir/compactions.jsonl，不进 run-metrics）
         self.compaction_count = 0
         self.compaction_events: list[dict[str, Any]] = []
+        # checkpoint（T7）运行态：已完成 step / 已入库笔记 id / 已完成子任务，均
+        # 随 checkpoint.json 逐步落盘；恢复基线（budget_used 与 keys_seen）在
+        # _load_resume_state_guarded 里从 checkpoint 带入，_resumed_tokens_* 只进
+        # 预算熔断与 state.md 恢复行——run-metrics 仍只记本 run 新消耗（诚实计量）
+        self._checkpoint_completed: list[str] = []
+        self._checkpoint_note_ids: list[str] = []
+        self.completed_subtask_ids: list[str] = []
+        self._resumed_tokens_in = 0
+        self._resumed_tokens_out = 0
+        self._resume_skipped: list[str] = []
 
     # ---- 基础设施 ----------------------------------------------------------
 
@@ -865,9 +920,10 @@ class AgentLoop:
                 index,
                 settings=settings,
                 freshness_settings=self.freshness_settings,
-                # 预算余量：此刻尚未发生任何模型调用，公式照 PLAN 口径给出（=1.0）
+                # 预算余量：模式判定发生在任何本 run 模型调用之前，公式照 PLAN 口径
+                # 给出；恢复 run 计入 checkpoint 基线（预算熔断口径，见 budget_input_tokens）
                 budget_remaining_ratio=max(
-                    0.0, 1.0 - self.input_tokens / max(1, self.token_budget)
+                    0.0, 1.0 - self.budget_input_tokens / max(1, self.token_budget)
                 ),
                 elapsed_seconds=self.clock() - self._t0,
             ),
@@ -1022,6 +1078,9 @@ class AgentLoop:
             on_usage=self._absorb_usage,
         )
         result = sub.run()
+        # 子任务完成留痕（checkpoint.completed_subtask_ids，审计字段）：子 agent 的
+        # 断点语义由其所属 act step 承载——act step 未完成则整个子任务随 step 重跑
+        self.completed_subtask_ids.append(f"subagent:{len(self.completed_subtask_ids) + 1}")
         # 子 agent 产物汇入本次 run：笔记进蒸馏队列（同样走入库去重），来源进引用池
         for s in result.sources:
             self.ctx.add_source(str(s.get("url") or ""), str(s.get("title") or ""))
@@ -1042,6 +1101,16 @@ class AgentLoop:
             return
         self.input_tokens += usage.input_tokens
         self.output_tokens += usage.output_tokens
+
+    @property
+    def budget_input_tokens(self) -> int:
+        """预算口径的 input tokens：本 run 新消耗 + 恢复基线（T7 checkpoint 带入）。
+
+        恢复 run 不重置预算：kill 前已耗的量经 checkpoint.budget_used 作为基线带入
+        熔断判定（超限即强制收尾），而 run-metrics / tokens.jsonl 仍只记本 run 新
+        消耗（诚实计量，14 字段契约不动）——两个口径严格分账。
+        """
+        return self.input_tokens + self._resumed_tokens_in
 
     def _record(self, step: str, provider: Provider, usage: TokenUsage | None, t0: float) -> None:
         """每步一行记账；usage 缺失时记 0（行数仍是每步一行，可对账调用次数）。"""
@@ -1092,6 +1161,13 @@ class AgentLoop:
             lines.append(
                 f"- retrieval: mode={decision.mode} forced={str(decision.forced).lower()}"
                 f" reasons={first_reason}"
+            )
+        if self._resume_skipped:
+            # T7 恢复行：断点续跑可审计（跳过了哪些 step、带入多少已耗基线）
+            lines.append(
+                f"- 恢复：从 checkpoint 断点继续（跳过 {'、'.join(self._resume_skipped)}；"
+                f"基线 input {self._resumed_tokens_in} / output {self._resumed_tokens_out}，"
+                "本次新增见下行）"
             )
         lines += [
             f"- 步骤：{self.step_count}/{effective_max_steps}"
@@ -1153,6 +1229,13 @@ class AgentLoop:
                 )
 
     def _events(self) -> Iterator[dict[str, Any]]:
+        # ---- checkpoint 恢复（P4b T7）：加载断点状态（缺/损坏 → 全新 run）----
+        # 先于模式判定：恢复基线（checkpoint.budget_used）要进预算熔断口径。
+        resume = self._load_resume_state_guarded()
+        completed: set[str] = set(resume.completed_step_ids) if resume is not None else set()
+        # 恢复 run 的 history：plan 完成时取侧车重建（否则由 plan 阶段全新装配）
+        history: list[Message] = list(resume.history) if resume is not None else []
+
         # ---- 阶段 -1：模式判定（P3 Dynamic Retrieval：探测 → 判定 → 留痕）----
         # 先于 Prior 注入与 plan 消息：模式限额（prior k/max_chars 覆盖、fresh
         # 搜索帽、子代理门、生效步数、报告样式）从本轮第一条消息前就生效。
@@ -1187,33 +1270,50 @@ class AgentLoop:
         plan_messages = [Message(role="user", content=plan_content)]
 
         # ---- 阶段 1：规划（reasoning 流式转发，计划文本并入同一思考块）----
-        t0 = self.clock()
-        yield {"type": "reasoning-start", "id": "plan"}
-        parts: list[str] = []
-        usage: TokenUsage | None = None
-        for ev in self.provider.stream(plan_messages, system=PLAN_SYSTEM, tools=None):
-            if ev.type == "reasoning_delta":
-                yield {"type": "reasoning-delta", "id": "plan", "delta": ev.delta}
-            elif ev.type == "text_delta":
-                parts.append(ev.delta)
-                yield {"type": "reasoning-delta", "id": "plan", "delta": ev.delta}
-            elif ev.type == "usage" and ev.usage is not None:
-                usage = ev.usage
-        yield {"type": "reasoning-end", "id": "plan"}
-        self.plan_text = "".join(parts)
-        self._absorb_usage(usage)
-        self._record("plan", self.provider, usage, t0)
-        self._write_plan_file()
-        task_plan = self.ctx.next_task_id()
-        self.ctx.push_task(task_plan, "制定研究计划", "done", "计划已写入 research-plan.md")
-        yield from self._drain_tasks()
-        self._write_state("researching")
+        if "plan" in completed:
+            # [T7 恢复] plan 已完成：不发模型调用、不重写 research-plan.md——计划
+            # 文本与断点 history 都从侧车重建（详见 _load_resume_state_guarded）。
+            self.plan_text = next(
+                (
+                    m.content
+                    for m in history
+                    if m.role == "assistant" and m.content.strip()
+                ),
+                "",
+            )
+            task_plan = self.ctx.next_task_id()
+            self.ctx.push_task(
+                task_plan, "制定研究计划", "done", "已从 checkpoint 恢复，规划未重跑"
+            )
+            yield from self._drain_tasks()
+            self._write_state("researching")
+        else:
+            t0 = self.clock()
+            yield {"type": "reasoning-start", "id": "plan"}
+            parts: list[str] = []
+            usage: TokenUsage | None = None
+            for ev in self.provider.stream(plan_messages, system=PLAN_SYSTEM, tools=None):
+                if ev.type == "reasoning_delta":
+                    yield {"type": "reasoning-delta", "id": "plan", "delta": ev.delta}
+                elif ev.type == "text_delta":
+                    parts.append(ev.delta)
+                    yield {"type": "reasoning-delta", "id": "plan", "delta": ev.delta}
+                elif ev.type == "usage" and ev.usage is not None:
+                    usage = ev.usage
+            yield {"type": "reasoning-end", "id": "plan"}
+            self.plan_text = "".join(parts)
+            self._absorb_usage(usage)
+            self._record("plan", self.provider, usage, t0)
+            self._write_plan_file()
+            task_plan = self.ctx.next_task_id()
+            self.ctx.push_task(task_plan, "制定研究计划", "done", "计划已写入 research-plan.md")
+            yield from self._drain_tasks()
+            self._write_state("researching")
+            # [T7] plan step 完成 → checkpoint 落盘（history = 问题 + 计划）
+            history = [plan_messages[0], Message(role="assistant", content=self.plan_text)]
+            self._save_checkpoint_guarded("plan", history)
 
         # ---- 阶段 2：执行（带 tools 的循环，tool_calls → 执行 → role="tool" 回传）----
-        history: list[Message] = [
-            plan_messages[0],
-            Message(role="assistant", content=self.plan_text),
-        ]
         steps_used = 0
         forced = ""
         # P3 模式限额：生效步数用模式限额覆盖构造参数（未判定 = 原值，行为不变）
@@ -1221,22 +1321,49 @@ class AgentLoop:
         effective_max_steps = (
             mode_limits.max_steps if mode_limits is not None else self.max_steps
         )
-        if self.input_tokens >= self.token_budget:
+        if self.budget_input_tokens >= self.token_budget:
             forced = "token_budget"
         elif effective_max_steps <= 0:
             forced = "max_steps"
 
+        # [T7 恢复] 已完成的 act 步不重跑：步数从断点续计（熔断判定随之续算）。
+        resumed_act_steps = sorted(
+            int(m.group(1))
+            for sid in completed
+            if (m := re.fullmatch(r"act:(\d+)", sid)) is not None
+        )
+        if resumed_act_steps:
+            steps_used = max(resumed_act_steps)
+            self.step_count = steps_used
+        # [T7 恢复] 来源池是内存态，kill 后只能从 history 的工具结果按原顺序复原
+        # （报告 [n] 编号、蒸馏候选的来源过滤与 formation 判定都依赖它）。
+        if resume is not None and history:
+            self._rebuild_source_pool_guarded(history)
+        # [T7 恢复] 终端总结识别：history 末条是无工具调用的 assistant 且已有工具
+        # 轮 → 文本收尾步已完成，不再重入 act 循环（蒸馏从断点直接继续）。
+        # 限度：文本收尾调用未完成（checkpoint 未记）时此处不成立，恢复后照常重入。
+        resumed_terminal = (
+            bool(history)
+            and history[-1].role == "assistant"
+            and not history[-1].tool_calls
+            and any(m.role == "tool" for m in history)
+        )
+        if resumed_terminal:
+            self.research_summary = history[-1].content
+
         task_act: str | None = None
-        if not forced:
+        if not forced and not resumed_terminal:
             task_act = self.ctx.next_task_id()
-            self.ctx.push_task(task_act, "执行研究（工具调用）", "running", "第 0 步 · 计划已就绪")
+            self.ctx.push_task(
+                task_act, "执行研究（工具调用）", "running", f"第 {steps_used} 步 · 计划已就绪"
+            )
             yield from self._drain_tasks()
 
-        while not forced:
+        while not forced and not resumed_terminal:
             if steps_used >= effective_max_steps:
                 forced = "max_steps"
                 break
-            if self.input_tokens >= self.token_budget:
+            if self.budget_input_tokens >= self.token_budget:
                 forced = "token_budget"
                 break
             # ---- 滚动压缩触发（P4b T6）：上一步 observe（工具结果入史）之后、
@@ -1265,6 +1392,10 @@ class AgentLoop:
                 # 纯文本结尾：研究阶段自然结束
                 self.research_summary = step_text
                 history.append(Message(role="assistant", content=step_text))
+                # [T7] act step 完成（文本收尾形态）→ checkpoint 落盘；every_step=
+                # false 时本步不落盘，其完成语义由后续 distill 保存的 history 末条
+                # 承载（终端总结识别覆盖该形态，见上方 resumed_terminal 注释）
+                self._save_checkpoint_guarded(f"act:{steps_used}", history)
                 break
 
             self.tool_calls_count += len(tool_calls)
@@ -1296,6 +1427,9 @@ class AgentLoop:
                 )
             yield from self._drain_tasks()
             self._write_state("researching")
+            # [T7] act step 完成（工具形态）→ checkpoint 落盘；every_step=false 时
+            # 本步不落盘（只在阶段边界保存，kill 后重做窗口相应变大，见 config 注释）
+            self._save_checkpoint_guarded(f"act:{steps_used}", history)
 
         if forced:
             self.forced_reason = _FORCED_REASONS[forced]
@@ -1327,120 +1461,161 @@ class AgentLoop:
         # 蒸馏的是**报告素材**（研究总结 + 工具结果摘编，与随后的报告同源），而不是
         # 报告成品。Distiller.extract_notes 的输入契约仍是报告正文：阶段 4 的
         # consolidation / 单跑蒸馏可以直接把 run_dir/report.md 喂给它。
-        task_distill = self.ctx.next_task_id()
-        self.ctx.push_task(task_distill, "蒸馏原子笔记 → wiki", "running", "抽取事实中")
-        yield from self._drain_tasks()
+        # [T7 恢复] 蒸馏是"产生笔记"的 step，跳过判定有两层：(1) checkpoint 记了
+        # distill 完成；(2) 写-崩溃窗口兜底（checkpoint 滞后一拍）——入库笔记 extra
+        # 带 run_step_key，恢复时入库前查同键笔记，存在即 kill 前的抽取与冲突登记
+        # 都已完成 → 跳过整个蒸馏阶段（零重复笔记、零重复冲突、零重复扣费）。
+        resumed_distill = "distill" in completed
+        if not resumed_distill and self.resume_from is not None:
+            step_key = checkpoint.run_step_key(self.run_dir.name, "distill")
+            found_ids = self._find_step_key_note_ids_guarded(step_key)
+            if found_ids:
+                print(
+                    f"[agent-loop] checkpoint 滞后窗口：store 已有同 run_step_key 笔记"
+                    f"（{step_key} → {'、'.join(found_ids)}），跳过蒸馏阶段防重复创建",
+                    file=sys.stderr,
+                )
+                resumed_distill = True
+                for note_id in found_ids:
+                    if note_id not in self._checkpoint_note_ids:
+                        self._checkpoint_note_ids.append(note_id)
 
-        sources = self.ctx.source_refs()
-        material = self._report_material(history)
-        extracted = self.distiller.extract_notes(
-            material, question=self.question, sources=sources
-        )
-        candidates = [*self.pending_candidates, *extracted]
-
-        note_seq = 0
-        created = 0
-        merged = 0
-        ingested: list[Note] = []
-        for candidate in candidates:
-            # formation 判定（RQ1：什么时候应该记住）：未启用返回 None（逃生阀，
-            # 全部照旧入库）；拒绝的候选不入库、只计数，防无差别堆积。
-            self.formation_stats["candidates"] += 1
-            decision = self._formation_decision(candidate)
-            if decision is not None and not decision.persist:
-                self.formation_stats["rejected"] += 1
-                continue
-            result = self.ingestor.add(candidate, trace_id=self.trace_id)
-            note_seq += 1
-            self.notes_written += 1
-            self.formation_stats["persisted"] += 1
-            # 真正入库的候选 = 本轮"新记忆"：记忆更新阶段把它们当新证据与命中
-            # Prior 比较（被 formation 拒绝的候选不构成新记忆，不进证据集）；
-            # 同时记下 Ingestor 给的**规范 ID**（新建 = 新 ID，命中合并 = 既有
-            # 规范 ID），supersede 可直接复用它当替代版本
-            self.ingested_candidates.append(candidate)
-            self.ingested_note_ids.append(result.note.id)
-            if decision is not None:
-                # importance/kind 写进 frontmatter，判定理由写进 extra（辅助产物，
-                # 失败不推翻入库）
-                self._annotate_formation(result.note, decision)
-            created += 1 if result.action == "created" else 0
-            merged += 1 if result.action == "merged" else 0
-            ingested.append(result.note)
-            # data-note 结构不变；data.id 恒为规范 ID（合并命中时引用既有笔记）
-            yield {
-                "type": "data-note",
-                "id": f"note-{note_seq}",
-                "data": {
-                    "id": result.note.id,
-                    "text": result.note.body.strip(),
-                    "entities": list(result.note.entities),
-                    "confidence": result.note.confidence,
-                },
-            }
-        # 入库动作计数 → run-metrics.json（IngestResult.action 只有 created/merged，
-        # 蒸馏阶段自身不产生 superseded；真正的替代计数在**记忆更新阶段**填入
-        # notes_superseded——见 _apply_memory_updates，字段集不变、只是值语义，
-        # §4.4 契约仍由 metrics.RunMetrics 的字段清单锁定）
-        self.notes_created = created
-        self.notes_merged = merged
-        self.notes_superseded = 0
-        conflicts = self.distiller.last_conflicts
-        for i, conflict in enumerate(conflicts, start=1):
-            yield {
-                "type": "data-conflict",
-                "id": f"conflict-{i}",
-                "data": {
-                    "id": conflict.id,
-                    "summary": conflict.summary,
-                    "action": conflict.action,
-                },
-            }
-        if self.build_pages and ingested:
-            # 页面聚合（LLM）默认关闭：run 内多一次模型调用就会拉长时延，
-            # 由调用方显式开启（阶段 4 的 consolidation 或 MCP 侧写路径）
-            for draft in self.distiller.build_pages(ingested):
-                self.wiki_store.save_page(draft.slug, draft.title, draft.body)
-        if task_distill:
+        if resumed_distill:
+            task_distill = self.ctx.next_task_id()
             self.ctx.push_task(
-                task_distill,
-                "蒸馏原子笔记 → wiki",
-                "done",
-                f"新增 {created} 条笔记 · 合并 {merged} 条 · {len(conflicts)} 条冲突",
+                task_distill, "蒸馏原子笔记 → wiki", "done", "已从 checkpoint 恢复，蒸馏未重跑"
             )
             yield from self._drain_tasks()
+            # 证据集还原：收尾的记忆更新需要 ingested_candidates/ingested_note_ids
+            # （蒸馏被跳过时只能从 checkpoint 的 notes_created 反查 store，尽力而为）
+            self._restore_ingested_candidates_guarded()
+            self._save_checkpoint_guarded("distill", history)
+        else:
+            task_distill = self.ctx.next_task_id()
+            self.ctx.push_task(task_distill, "蒸馏原子笔记 → wiki", "running", "抽取事实中")
+            yield from self._drain_tasks()
+
+            sources = self.ctx.source_refs()
+            material = self._report_material(history)
+            extracted = self.distiller.extract_notes(
+                material, question=self.question, sources=sources
+            )
+            candidates = [*self.pending_candidates, *extracted]
+
+            note_seq = 0
+            created = 0
+            merged = 0
+            ingested: list[Note] = []
+            for candidate in candidates:
+                # formation 判定（RQ1：什么时候应该记住）：未启用返回 None（逃生阀，
+                # 全部照旧入库）；拒绝的候选不入库、只计数，防无差别堆积。
+                self.formation_stats["candidates"] += 1
+                decision = self._formation_decision(candidate)
+                if decision is not None and not decision.persist:
+                    self.formation_stats["rejected"] += 1
+                    continue
+                result = self.ingestor.add(candidate, trace_id=self.trace_id)
+                note_seq += 1
+                self.notes_written += 1
+                self.formation_stats["persisted"] += 1
+                # 真正入库的候选 = 本轮"新记忆"：记忆更新阶段把它们当新证据与命中
+                # Prior 比较（被 formation 拒绝的候选不构成新记忆，不进证据集）；
+                # 同时记下 Ingestor 给的**规范 ID**（新建 = 新 ID，命中合并 = 既有
+                # 规范 ID），supersede 可直接复用它当替代版本
+                self.ingested_candidates.append(candidate)
+                self.ingested_note_ids.append(result.note.id)
+                # [T7] run_step_key 幂等键先入 extra（formation 标注读到它后会原样
+                # 保留）；恢复 run 入库前同键查询据此防重复创建
+                self._checkpoint_note_ids.append(result.note.id)
+                self._stamp_note_step_key(result.note)
+                if decision is not None:
+                    # importance/kind 写进 frontmatter，判定理由写进 extra（辅助产物，
+                    # 失败不推翻入库）
+                    self._annotate_formation(result.note, decision)
+                created += 1 if result.action == "created" else 0
+                merged += 1 if result.action == "merged" else 0
+                ingested.append(result.note)
+                # data-note 结构不变；data.id 恒为规范 ID（合并命中时引用既有笔记）
+                yield {
+                    "type": "data-note",
+                    "id": f"note-{note_seq}",
+                    "data": {
+                        "id": result.note.id,
+                        "text": result.note.body.strip(),
+                        "entities": list(result.note.entities),
+                        "confidence": result.note.confidence,
+                    },
+                }
+            # 入库动作计数 → run-metrics.json（IngestResult.action 只有 created/merged，
+            # 蒸馏阶段自身不产生 superseded；真正的替代计数在**记忆更新阶段**填入
+            # notes_superseded——见 _apply_memory_updates，字段集不变、只是值语义，
+            # §4.4 契约仍由 metrics.RunMetrics 的字段清单锁定）
+            self.notes_created = created
+            self.notes_merged = merged
+            self.notes_superseded = 0
+            conflicts = self.distiller.last_conflicts
+            for i, conflict in enumerate(conflicts, start=1):
+                yield {
+                    "type": "data-conflict",
+                    "id": f"conflict-{i}",
+                    "data": {
+                        "id": conflict.id,
+                        "summary": conflict.summary,
+                        "action": conflict.action,
+                    },
+                }
+            if self.build_pages and ingested:
+                # 页面聚合（LLM）默认关闭：run 内多一次模型调用就会拉长时延，
+                # 由调用方显式开启（阶段 4 的 consolidation 或 MCP 侧写路径）
+                for draft in self.distiller.build_pages(ingested):
+                    self.wiki_store.save_page(draft.slug, draft.title, draft.body)
+            if task_distill:
+                self.ctx.push_task(
+                    task_distill,
+                    "蒸馏原子笔记 → wiki",
+                    "done",
+                    f"新增 {created} 条笔记 · 合并 {merged} 条 · {len(conflicts)} 条冲突",
+                )
+                yield from self._drain_tasks()
+            # [T7] distill step 完成 → checkpoint 落盘
+            self._save_checkpoint_guarded("distill", history)
         self._write_state("reporting")
 
         # ---- 阶段 4：报告（[n] 引用 + source-url 事件出自实际来源池）----
         sources = self.ctx.source_pool.numbered()
-        t0 = self.clock()
-        yield {"type": "text-start", "id": "report"}
-        parts = []
-        usage = None
-        report_messages = [*history, Message(role="user", content=REPORT_REQUEST)]
-        report_system_text = report_system(sources, forced_reason=self.forced_reason)
-        if (
-            self.policy_decision is not None
-            and self.policy_decision.limits.report_style == "brief"
-        ):
-            # P3 简报样式：报告 system 提示后追加简报约束（standard/full 现状不变）
-            from researchwiki.loop.research_policy import _REPORT_STYLE_SUFFIX
+        if "report" in completed:
+            # [T7 恢复] report 已完成：不发模型调用；report.md 已在盘上，读回正文
+            # 供 run-metrics 的引用覆盖率口径（读失败降级为空串，只记 stderr）。
+            self.report_text = self._read_report_text_guarded()
+        else:
+            t0 = self.clock()
+            yield {"type": "text-start", "id": "report"}
+            parts = []
+            usage = None
+            report_messages = [*history, Message(role="user", content=REPORT_REQUEST)]
+            report_system_text = report_system(sources, forced_reason=self.forced_reason)
+            if (
+                self.policy_decision is not None
+                and self.policy_decision.limits.report_style == "brief"
+            ):
+                # P3 简报样式：报告 system 提示后追加简报约束（standard/full 现状不变）
+                from researchwiki.loop.research_policy import _REPORT_STYLE_SUFFIX
 
-            report_system_text = f"{report_system_text}\n{_REPORT_STYLE_SUFFIX}"
-        for ev in self.provider.stream(
-            report_messages,
-            system=report_system_text,
-            tools=None,
-        ):
-            if ev.type == "text_delta":
-                parts.append(ev.delta)
-                yield {"type": "text-delta", "id": "report", "delta": ev.delta}
-            elif ev.type == "usage" and ev.usage is not None:
-                usage = ev.usage
-        yield {"type": "text-end", "id": "report"}
-        self.report_text = "".join(parts)
-        self._absorb_usage(usage)
-        self._record("report", self.provider, usage, t0)
+                report_system_text = f"{report_system_text}\n{_REPORT_STYLE_SUFFIX}"
+            for ev in self.provider.stream(
+                report_messages,
+                system=report_system_text,
+                tools=None,
+            ):
+                if ev.type == "text_delta":
+                    parts.append(ev.delta)
+                    yield {"type": "text-delta", "id": "report", "delta": ev.delta}
+                elif ev.type == "usage" and ev.usage is not None:
+                    usage = ev.usage
+            yield {"type": "text-end", "id": "report"}
+            self.report_text = "".join(parts)
+            self._absorb_usage(usage)
+            self._record("report", self.provider, usage, t0)
 
         for s in sources:
             yield {
@@ -1450,24 +1625,35 @@ class AgentLoop:
                 "title": s["title"],
             }
 
-        atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
+        if "report" not in completed:
+            atomic_write_text(self.run_dir / "report.md", self.report_text + "\n")
 
-        # ---- P3：policy.json outcome 回填 + 诚实缺口提示（报告写盘后）----
-        # 位置同记忆更新的守卫约定：report 已写盘（run 产物已完整），回填失败
-        # 只记 stderr，不推翻本次 run。
-        self._backfill_policy_outcome_guarded()
+            # ---- P3：policy.json outcome 回填 + 诚实缺口提示（报告写盘后）----
+            # 位置同记忆更新的守卫约定：report 已写盘（run 产物已完整），回填失败
+            # 只记 stderr，不推翻本次 run。
+            self._backfill_policy_outcome_guarded()
+            # [T7] report step 完成 → checkpoint 落盘
+            self._save_checkpoint_guarded("report", history)
 
         # ---- 阶段 5：记忆更新（RQ2 闭环：本轮新证据 vs 命中的 Prior）----
         # 位置刻意放这里：report 已写盘（哪怕本阶段出问题，run 的产物已完整），
         # 且在 _write_run_metrics（events() 的 try/finally）之前——state.md 的
         # 记忆更新行因此能带真实计数，而 run-metrics 的 14 字段契约不被触碰。
-        self._apply_memory_updates_guarded()
+        # [T7 恢复] finalize 已完成 → 收尾辅助产物都已落盘，跳过（防重复 supersede
+        # / 重复台账）；蒸馏被跳过时证据集由 _restore_ingested_candidates 还原。
+        if "finalize" in completed:
+            pass
+        else:
+            self._apply_memory_updates_guarded()
 
-        # ---- 阶段 6：未答问题台账（P4a：反幻觉经验记忆，零模型调用）----
-        # 紧邻 _apply_memory_updates_guarded 之后（同为收尾辅助产物，失败只记
-        # stderr）；state.md 的台账行在下一次 _write_state("done") 里带上。
-        self._record_unanswered_guarded()
+            # ---- 阶段 6：未答问题台账（P4a：反幻觉经验记忆，零模型调用）----
+            # 紧邻 _apply_memory_updates_guarded 之后（同为收尾辅助产物，失败只记
+            # stderr）；state.md 的台账行在下一次 _write_state("done") 里带上。
+            self._record_unanswered_guarded()
         self._write_state("done")
+        # [T7] finalize step 完成 → checkpoint 落盘（此后只剩 finish 事件；
+        # 在此之后被 kill 的 run，恢复时直接走到 finish）
+        self._save_checkpoint_guarded("finalize", history)
         yield {"type": "finish"}
 
     # ---- 上下文预算与滚动压缩（P4b T6）-------------------------------------
@@ -1522,6 +1708,256 @@ class AgentLoop:
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+
+    # ---- checkpoint 与恢复（P4b T7）-----------------------------------------
+
+    def _load_resume_state_guarded(self) -> ResumeState | None:
+        """加载断点状态（``resume_from`` 未给 → None；缺/损坏 → None 并告警）。
+
+        - checkpoint.json 记索引态（completed ids / keys_seen / budget / 笔记 id），
+          checkpoint-history.json 记断点 history；两侧的 completed_step_ids 取并集
+          （保存顺序是先侧车后 checkpoint.json，进程死在两写之间时侧车超前 = 该
+          step 确已完成，并集兜底）；
+        - **宁可重跑不可带病恢复**：checkpoint 缺失/损坏、或记了完成 step 但侧车
+          读不出来 / 消息形态畸形 → 返回 None，调用方按全新 run 从头跑；
+        - 恢复基线在此带入：budget_used 进预算熔断（run-metrics 仍只记新消耗）、
+          keys_seen 续账、笔记 id 供证据集还原与 state.md 恢复行。
+        """
+        if self.resume_from is None:
+            return None
+        payload = checkpoint.load(self.resume_from)
+        if payload is None:
+            print(
+                f"[agent-loop] resume_from={self.resume_from} 无有效 checkpoint，"
+                "按全新 run 从头执行（宁可重跑不可带病恢复）",
+                file=sys.stderr,
+            )
+            return None
+        completed = [str(sid) for sid in payload.get("completed_step_ids") or []]
+        sidecar: dict[str, Any] | None = None
+        if completed:
+            sidecar = checkpoint.load_history(self.resume_from)
+            if sidecar is None:
+                # 有已完成 step 却重建不出 history：跳过它们会丢上下文，重跑才诚实
+                print(
+                    "[agent-loop] checkpoint-history.json 不可用，放弃恢复、"
+                    "按全新 run 从头执行（宁可重跑不可带病恢复）",
+                    file=sys.stderr,
+                )
+                return None
+            for sid in sidecar.get("completed_step_ids") or []:
+                if str(sid) not in completed:
+                    completed.append(str(sid))
+        history: list[Message] = []
+        if sidecar is not None:
+            rebuilt = checkpoint.deserialize_history(sidecar.get("messages") or [])
+            if rebuilt is None:
+                print(
+                    "[agent-loop] checkpoint-history.json 消息形态畸形，放弃恢复、"
+                    "按全新 run 从头执行（宁可重跑不可带病恢复）",
+                    file=sys.stderr,
+                )
+                return None
+            history = rebuilt
+        budget = payload.get("budget_used") or {}
+        self._resumed_tokens_in = max(0, int(budget.get("tokens_in") or 0))
+        self._resumed_tokens_out = max(0, int(budget.get("tokens_out") or 0))
+        self._checkpoint_note_ids = [str(n) for n in payload.get("notes_created") or []]
+        # 断点续账：恢复 run 的 checkpoint 是同一谱系的延续（保存会覆写同一文件，
+        # 必须携带 kill 前的 completed ids，否则谱系历史被截断）
+        self._checkpoint_completed = list(completed)
+        for key in payload.get("llm_keys_seen") or []:
+            if str(key) not in self._llm_keys_seen:
+                self._llm_keys_seen.append(str(key))
+        self._resume_skipped = list(completed)
+        return ResumeState(
+            completed_step_ids=completed,
+            history=history,
+            budget_tokens_in=self._resumed_tokens_in,
+            budget_tokens_out=self._resumed_tokens_out,
+            notes_created=list(self._checkpoint_note_ids),
+            llm_keys_seen=list(self._llm_keys_seen),
+        )
+
+    def _save_checkpoint_guarded(self, step_id: str, history: list[Message]) -> None:
+        """step 完成后的 checkpoint 落盘（守卫入口，失败只记 stderr 不推翻研究）。
+
+        - [checkpoint] 段缺失（未接线）或 enabled=false（逃生阀）→ 直接返回；
+        - ``every_step=false`` 时 act 步不落盘（只在阶段边界保存）；act 步的完成
+          语义在该形态下由后续 distill 保存的 history 末条承载（终端总结识别）；
+        - 先写 history 侧车、后写 checkpoint.json（侧车自带 completed 清单，
+          两写之间的窗口由恢复侧并集兜底，见 loop/checkpoint.py docstring）。
+        """
+        settings = self.checkpoint_settings
+        if settings is None or not settings.enabled:
+            return
+        if step_id.startswith("act:") and not settings.every_step:
+            return
+        if step_id not in self._checkpoint_completed:
+            self._checkpoint_completed.append(step_id)
+        try:
+            checkpoint.save_history(self.run_dir, self._checkpoint_completed, history)
+            payload = {
+                "version": checkpoint.CHECKPOINT_VERSION,
+                "run_id": self.run_dir.name,
+                "mode": (
+                    self.policy_decision.mode if self.policy_decision is not None else ""
+                ),
+                "completed_step_ids": list(self._checkpoint_completed),
+                "completed_subtask_ids": list(self.completed_subtask_ids),
+                "notes_created": list(self._checkpoint_note_ids),
+                "llm_keys_seen": list(self._llm_keys_seen),
+                # budget_used = 本 run 谱系累计计量（kill 前消耗 + 恢复基线），
+                # 恢复时作为基线带入预算熔断；与 run-metrics 的"只记新消耗"分账
+                "budget_used": {
+                    "tokens_in": self.budget_input_tokens,
+                    "tokens_out": self.output_tokens + self._resumed_tokens_out,
+                },
+                "history_summary_ref": checkpoint.HISTORY_SIDECAR,
+                "state_file_version": checkpoint.STATE_FILE_VERSION,
+                "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+            checkpoint.save(self.run_dir, payload)
+        except Exception as exc:  # noqa: BLE001 -- checkpoint 是辅助设施，失败不能推翻研究循环
+            print(
+                f"[agent-loop] checkpoint 落盘失败（研究不受影响）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _find_step_key_note_ids_guarded(self, key: str) -> list[str]:
+        """按 run_step_key 查已入库笔记（写-崩溃窗口兜底的查询点，失败降级空表）。"""
+        try:
+            return checkpoint.find_step_key_note_ids(self.wiki_store, key)
+        except Exception as exc:  # noqa: BLE001 -- 查询失败按"无同键笔记"处理（保守重跑）
+            print(
+                f"[agent-loop] run_step_key 笔记查询失败（按无同键笔记处理）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return []
+
+    def _stamp_note_step_key(self, note: Note) -> None:
+        """把 run_step_key 写进入库笔记 extra（产生它的蒸馏 step 幂等键）。
+
+        原地更新 note.meta（后续 formation 标注读到 extra 时会原样保留该键）并
+        经 ``meta.replace + save_meta`` 落盘——只点名 extra，其余字段逐字段保留
+        （漏传根因见 _annotate_formation 注释）。辅助产物：失败只记 stderr，不
+        推翻已完成的入库；[checkpoint] 未接线时不写（该键只服务恢复幂等）。
+        """
+        settings = self.checkpoint_settings
+        if settings is None or not settings.enabled:
+            return
+        try:
+            extra: dict[str, Any] = dict(note.meta.extra)
+            extra["run_step_key"] = checkpoint.run_step_key(self.run_dir.name, "distill")
+            note.meta = note.meta.replace(extra=extra)
+            self.wiki_store.save_meta(note.meta, note.body)
+        except Exception as exc:  # noqa: BLE001 -- 标注失败不能推翻入库
+            print(
+                f"[agent-loop] run_step_key 写入笔记 extra 失败："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _restore_ingested_candidates_guarded(self) -> None:
+        """恢复 run 还原证据集（收尾记忆更新的输入），尽力而为、失败降级空集。
+
+        蒸馏 step 被跳过时（kill 前已完成），ingested_candidates 只能从 checkpoint
+        的 notes_created（规范 ID 列表）反查 store 重建——EvidenceItem 的正文/实体/
+        来源与盘上笔记一致，足以支撑确定性比较（verification 零模型调用）。
+        """
+        try:
+            from researchwiki.wiki.distiller import CandidateNote  # 延迟导入，见文件头说明
+
+            for note_id in self._checkpoint_note_ids:
+                if note_id in self.ingested_note_ids:
+                    continue
+                note = self.wiki_store.get_note(note_id)
+                if note is None:
+                    continue  # 笔记在 kill 后被外部清理：证据集缺一条，不阻断恢复
+                self.ingested_candidates.append(
+                    CandidateNote(
+                        text=note.body,
+                        entities=list(note.entities),
+                        confidence=note.confidence,
+                        volatility=note.volatility,
+                        source_urls=[s.url for s in note.meta.sources],
+                        source_refs=list(note.meta.sources),
+                    )
+                )
+                self.ingested_note_ids.append(note.id)
+        except Exception as exc:  # noqa: BLE001 -- 还原失败=记忆更新无证据可比，不阻断恢复
+            print(
+                f"[agent-loop] 证据集还原失败（记忆更新阶段将无证据可比）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _rebuild_source_pool_guarded(self, history: list[Message]) -> None:
+        """恢复 run 从 history 的工具结果按原顺序复原来源池（守卫入口，失败只记 stderr）。
+
+        来源池是内存态，kill 后只剩 history 里的工具结果 JSON。按消息顺序重放各
+        handler 的入池逻辑（顺序即报告 [n] 编号，必须与原 run 一致）：
+
+        - web_search 结果：逐条 add(url, title)；
+        - fetch_url 结果：add(final_url or url, 正文首行标题, content_hash)；
+        - dispatch_research 结果：逐条 add(子 agent 来源)。
+
+        与 handler 的唯一差别是不再计数 search_calls/fetch_calls——恢复 run 的
+        fresh 计数只记本 run 实际发生的检索（诚实计量口径）。
+        """
+        try:
+            for m in history:
+                if m.role != "tool" or not m.content:
+                    continue
+                try:
+                    data = json.loads(m.content)
+                except json.JSONDecodeError:
+                    continue  # 非工具结果 JSON（畸形/其它工具）：跳过
+                if not isinstance(data, dict):
+                    continue
+                results = data.get("results")
+                if isinstance(results, list):  # web_search
+                    for hit in results:
+                        if isinstance(hit, dict):
+                            self.ctx.add_source(
+                                str(hit.get("url") or ""), str(hit.get("title") or "")
+                            )
+                    continue
+                if "final_url" in data or "content_hash" in data:  # fetch_url
+                    url = str(data.get("final_url") or data.get("url") or "")
+                    self.ctx.add_source(
+                        url,
+                        _title_from_text(str(data.get("text") or ""), url),
+                        content_hash=str(data.get("content_hash") or ""),
+                    )
+                    continue
+                sub_sources = data.get("sources")  # dispatch_research
+                if isinstance(sub_sources, list):
+                    for item in sub_sources:
+                        if isinstance(item, dict):
+                            self.ctx.add_source(
+                                str(item.get("url") or ""), str(item.get("title") or "")
+                            )
+        except Exception as exc:  # noqa: BLE001 -- 复原失败降级为空池（报告无引用可挂）
+            print(
+                f"[agent-loop] 来源池复原失败（恢复 run 的报告将没有可引用来源）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _read_report_text_guarded(self) -> str:
+        """恢复 run 读取 kill 前已写盘的 report.md（run-metrics 引用覆盖率口径）。"""
+        try:
+            return (self.run_dir / "report.md").read_text(encoding="utf-8").rstrip("\n")
+        except Exception as exc:  # noqa: BLE001 -- 读失败降级为空报告，不阻断恢复
+            print(
+                f"[agent-loop] report.md 读回失败（恢复 run 的引用覆盖率将为空）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return ""
 
     # ---- 记忆更新（RQ2 闭环：新证据 vs 旧记忆）-----------------------------
 

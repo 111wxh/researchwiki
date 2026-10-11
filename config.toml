@@ -258,3 +258,18 @@ compaction_threshold = 0.7
 # 压缩时保留的最近轮次数（一轮 = 一条 assistant 消息及其工具结果，整轮保留
 # 保证 OpenAI 协议的 tool_calls → tool 配对不被切断）
 keep_recent_turns = 4
+
+[checkpoint]
+# checkpoint 与恢复（P4b 支撑设施 T7）：每个研究 step 完成（plan、每个 act 步、
+# 蒸馏、报告、收尾）后，原子写 run_dir/checkpoint.json 与 history 侧车
+# checkpoint-history.json（形态取舍见 loop/checkpoint.py docstring）。进程被 kill
+# 后用同一 run_dir 新建 AgentLoop 并传 resume_from 即从断点继续：已完成 step 不
+# 重跑（不重复扣费）、入库笔记带 run_step_key 幂等键（恢复时同键笔记不重复创建，
+# 写-崩溃窗口兜底）；checkpoint 损坏 = None + 告警，宁可重跑不可带病恢复。
+# 注意：server 通路不接线（每 request 新 loop，resume 是 CLI/脚本级能力）；
+# 恢复 run 续用原 run_dir，预算熔断以 checkpoint.budget_used 为基线，
+# run-metrics 只记恢复后新消耗（14 字段契约不动）。
+# enabled = false 是逃生阀：零写盘、零恢复检测；段缺失 = 不接线 = 同样零行为。
+enabled = true
+every_step = true   # false = 只在阶段边界落 checkpoint（plan/distill/report/finalize），
+                    # act 步不落盘（kill 后重做窗口相应变大，换取更少的写盘次数）
