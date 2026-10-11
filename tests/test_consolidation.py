@@ -8,7 +8,8 @@
 ③ review_due + 有来源 → refresh 候选（payload 带 url）；review_due + 无来源 → rejudge 改派；
 ④ confidence=low → rejudge（payload 记模型档位）；
 ⑤ 同实体 slot 级矛盾对 → conflict 候选（构造法参照 tests/test_verification.py；
-   实体不相交的对不产 conflict——实体护栏方向被预筛尊重）；
+   实体不相交的对不产 conflict——实体护栏方向被预筛尊重；终审后修复波·闸 #4：
+   conflict 对排除出 merge 候选，只走 conflict）；
 ⑥ max_* 截断生效（max_rejudge / max_merges / max_conflict_pairs / max_conflicts）；
 ⑦ dry-run 零变异：plan 与 CLI 前后目录逐字节对比（含 mtime）；
 ⑧ 同一 store 状态两次 plan 输出逐字节相同；
@@ -130,8 +131,8 @@ def rich_store(tmp_path: Path) -> WikiStore:
     """覆盖四类候选的混合库（族间实体不相交，互不串扰）：
 
     - merge 族（GLM-5.3）：N-0001/N-0002 相似度 0.8447 → merge；
-    - conflict 族（DeepSeek-V3）：N-0003/N-0004 同槽位取值冲突 → conflict（且
-      相似度 ≥0.5 同时产 merge——两类判定独立，都是保守动作）；
+    - conflict 族（DeepSeek-V3）：N-0003/N-0004 同槽位取值冲突 → conflict（相似度
+      0.8473 虽落 merge 区间，但闸 #4：冲突对不产 merge 候选，只走 conflict）；
     - N-0005 volatile + 有来源 → refresh；N-0006 volatile 无来源 → rejudge 改派；
       N-0007 confidence=low → rejudge。
     """
@@ -302,14 +303,66 @@ def test_low_confidence_goes_to_rejudge(tmp_path: Path) -> None:
     assert len(plan.actions) == 1
 
 
+def test_rejudge_confirm_marker_blocks_replan_candidate(tmp_path: Path) -> None:
+    """终审后修复波·发现 2：带 confirm 收敛标记的笔记不再产 rejudge 候选（重跑收敛）。
+
+    标记（extra 里的 rejudge_verdict=="confirm" + rejudged_at）是执行器 confirm
+    时落盘的审计事实——"已由模型复核并确认"。没有它，confidence=low 恒触发，
+    每轮维护重复烧一次模型调用（真实压测实锤：N-0005 confirm 后 J-0014 → J-0029
+    反复 rejudge）。诚实原则：标记不伪造 confidence，confidence 原样保留。
+    """
+    store = make_store(tmp_path)
+    note = save(store, "N-0001", "低置信断言待复核。", confidence="low")
+    plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert [a.note_ids for a in actions_of(plan, ACTION_REJUDGE)] == [["N-0001"]]  # RED 前提
+
+    # 模拟执行器 confirm 落盘的标记（字段与 maintenance._exec_rejudge 逐字一致）
+    stamp = "2026-05-31T00:00:00+00:00"
+    store.save_meta(
+        note.meta.replace(
+            reviewed_at=stamp,
+            extra={
+                **note.meta.extra,
+                "rejudge_verdict": "confirm",
+                "rejudged_at": stamp,
+            },
+        ),
+        note.body,
+    )
+
+    replan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert actions_of(replan, ACTION_REJUDGE) == []  # 收敛：不再重复 rejudge
+    assert replan.actions == []
+    assert store.get_note("N-0001").meta.confidence == "low"  # 标记不伪造 confidence
+
+
+def test_rejudge_confirm_marker_does_not_block_other_notes(tmp_path: Path) -> None:
+    """发现 2 补充：收敛标记按笔记生效——未标记的 low 笔记照常产 rejudge 候选。"""
+    store = make_store(tmp_path)
+    confirmed = save(store, "N-0001", "已复核确认的低置信断言。", confidence="low")
+    save(store, "N-0002", "未经复核的低置信断言。", confidence="low")
+    stamp = "2026-05-31T00:00:00+00:00"
+    store.save_meta(
+        confirmed.meta.replace(
+            reviewed_at=stamp,
+            extra={**confirmed.meta.extra, "rejudge_verdict": "confirm", "rejudged_at": stamp},
+        ),
+        confirmed.body,
+    )
+    plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert [a.note_ids for a in actions_of(plan, ACTION_REJUDGE)] == [["N-0002"]]
+
+
 # ---- ⑤ conflict 候选 --------------------------------------------------------
 
 
 def test_conflict_candidate_for_same_entity_slot_clash(tmp_path: Path) -> None:
     """⑤同实体 slot 级取值冲突（构造法同 test_verification）→ conflict 候选。
 
-    该对相似度 0.8473 ∈ [0.5, 0.95)，同时产 merge 候选——两类判定独立，
-    merge（内容保留）与 conflict（开台账）都是保守动作，互不抑制。
+    该对相似度 0.8473 ∈ [0.5, 0.95)——终审后修复波（闸 #4）：同时命中 conflict
+    与 merge 时只走 conflict，该对不产 merge 候选（台账开着待人工，笔记不被自动
+    合并；旧行为"两类并存"会绕过 PLAN.md §3.5 退出条件，已由
+    test_conflict_pair_excluded_from_merge_candidates_gate4 单独锁定）。
     """
     store = make_store(tmp_path)
     save(store, "N-0001", CONFLICT_A, entities=["GLM-5.3"])
@@ -330,7 +383,7 @@ def test_conflict_candidate_for_same_entity_slot_clash(tmp_path: Path) -> None:
         }
     ]
     assert "conflicting" in action.reason
-    assert len(actions_of(plan, ACTION_MERGE)) == 1  # 同一对的 merge 候选并存
+    assert actions_of(plan, ACTION_MERGE) == []  # 闸 #4：冲突对不产 merge 候选
 
 
 def test_conflict_respects_entity_guard(tmp_path: Path) -> None:
@@ -341,6 +394,48 @@ def test_conflict_respects_entity_guard(tmp_path: Path) -> None:
     plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
     assert actions_of(plan, ACTION_CONFLICT) == []
     assert actions_of(plan, ACTION_MERGE) == []  # 实体不交同样不 merge
+
+
+def test_conflict_pair_excluded_from_merge_candidates_gate4(tmp_path: Path) -> None:
+    """终审后修复波·发现 1（闸 #4）：conflict 对被排除出 merge 候选。
+
+    PLAN.md §3.5 退出条件"conflict 不能被自动 merge 掉"：conflict 是保守动作
+    （开台账待人工），merge 是内容合并——同一对笔记既 slot 冲突又落 merge 区间
+    [0.5, 0.95) 时只走 conflict。真实压测实锤：N-0032/N-0033（sim 0.8546 + 实体
+    相交）台账 C-0010..12 开着，却在下一轮重扫描时升入 merge 候选被自动合并——
+    退出条件被绕过。排除按对生效：仅落 merge 区间、无槽位冲突的笔记对照常 merge。
+    """
+    store = make_store(tmp_path)
+    save(store, "N-0001", CONFLICT_A, entities=["GLM-5.3"])
+    save(store, "N-0002", CONFLICT_B, entities=["GLM-5.3"])
+    # 锚点：该对既判 conflicting 又落 merge 区间——修复前会同时产双候选（RED）
+    pair_sim = token_similarity(CONFLICT_A, CONFLICT_B)
+    assert 0.5 <= pair_sim < 0.95
+
+    plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert [a.note_ids for a in actions_of(plan, ACTION_CONFLICT)] == [["N-0001", "N-0002"]]
+    assert actions_of(plan, ACTION_MERGE) == []  # 闸 #4：该对不产 merge 候选
+    assert len(plan.actions) == 1  # 只走 conflict
+
+    # 排除按对生效：另一对仅落 merge 区间、无槽位冲突的笔记照常产 merge
+    save(store, "N-0003", MERGE_A, entities=["Qwen-3"], created="2026-03-01T00:00:00+00:00")
+    save(store, "N-0004", MERGE_B, entities=["Qwen-3"], created="2026-01-01T00:00:00+00:00")
+    plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert [a.note_ids for a in actions_of(plan, ACTION_MERGE)] == [["N-0003", "N-0004"]]
+    assert [a.note_ids for a in actions_of(plan, ACTION_CONFLICT)] == [["N-0001", "N-0002"]]
+
+
+def test_conflict_exclusion_holds_despite_max_conflicts_truncation(tmp_path: Path) -> None:
+    """闸 #4 补充：排除发生在规则层（判 conflicting 即排除），不受 max_conflicts
+    批量截断影响——本轮被截断的对既不开台账也不被 merge，留给下一轮台账槽位，
+    绝不因"台账名额用完"漏进 merge 轨道。"""
+    store = make_store(tmp_path)
+    for i, value in enumerate(["32k", "64k", "128k", "200k"], start=1):
+        save(store, f"N-{i:04d}", f"GLM-5.3 的上下文窗口是 {value}。", entities=["GLM-5.3"])
+    plan = plan_consolidation(store, ConsolidationSettings(max_conflicts=2), now=NOW)
+    # 台账批量只出前 2 对，但 6 对全部判 conflicting → 全部排除出 merge
+    assert len(actions_of(plan, ACTION_CONFLICT)) == 2
+    assert actions_of(plan, ACTION_MERGE) == []
 
 
 # ---- ⑥ max_* 截断 ----------------------------------------------------------
@@ -358,7 +453,12 @@ def test_max_rejudge_caps_batch(tmp_path: Path) -> None:
 
 
 def test_max_merges_and_conflicts_caps(tmp_path: Path) -> None:
-    """⑥max_merges / max_conflicts / max_conflict_pairs 截断（确定性排序后取前 N）。"""
+    """⑥max_merges / max_conflicts / max_conflict_pairs 截断（确定性排序后取前 N）。
+
+    终审后修复波（闸 #4）：conflict 族（GLM-5.3 窗口笔记）的对全部被排除出
+    merge 候选，merge 截断改在无槽位冲突的纯 merge 族（Qwen-3 / Kimi-K2，实体与
+    conflict 族不相交）上验证。
+    """
     store = make_store(tmp_path)
     for i, value in enumerate(["32k", "64k", "128k", "200k"], start=1):
         save(
@@ -367,7 +467,12 @@ def test_max_merges_and_conflicts_caps(tmp_path: Path) -> None:
             f"GLM-5.3 的上下文窗口是 {value}。",
             entities=["GLM-5.3"],
         )
-    # 4 条同实体窗口笔记：6 个两两对全部相似（≥0.5）且全部槽位冲突
+    save(store, "N-0005", MERGE_A, entities=["Qwen-3"], created="2026-03-01T00:00:00+00:00")
+    save(store, "N-0006", MERGE_B, entities=["Qwen-3"], created="2026-01-01T00:00:00+00:00")
+    save(store, "N-0007", MERGE_A, entities=["Kimi-K2"], created="2026-03-01T00:00:00+00:00")
+    save(store, "N-0008", MERGE_B, entities=["Kimi-K2"], created="2026-01-01T00:00:00+00:00")
+    # 4 条同实体窗口笔记：6 个两两对全部相似（≥0.5）且全部槽位冲突；
+    # Qwen/Kimi 两族（MERGE_A/MERGE_B，sim 0.8447，verdict=consistent）纯 merge
     plan = plan_consolidation(store, ConsolidationSettings(max_conflict_pairs=3), now=NOW)
     conflicts = actions_of(plan, ACTION_CONFLICT)
     assert [a.note_ids for a in conflicts] == [
@@ -375,7 +480,15 @@ def test_max_merges_and_conflicts_caps(tmp_path: Path) -> None:
         ["N-0001", "N-0003"],
         ["N-0001", "N-0004"],
     ]  # 只扫前 3 对（max_conflict_pairs=3），后续对根本不进比较器
-    assert len(actions_of(plan, ACTION_MERGE)) == 6  # merge 不受 pairs 截断（上限 10 未触顶）
+    # 闸 #4：被判 conflicting 的 3 对排除出 merge；merge = 未被判冲突的 3 个 GLM
+    # 组合（比较器没扫到，无冲突判定）+ Qwen/Kimi 两个纯 merge 族
+    assert [a.note_ids for a in actions_of(plan, ACTION_MERGE)] == [
+        ["N-0002", "N-0003"],
+        ["N-0002", "N-0004"],
+        ["N-0003", "N-0004"],
+        ["N-0005", "N-0006"],
+        ["N-0007", "N-0008"],
+    ]
 
     plan = plan_consolidation(store, ConsolidationSettings(max_conflicts=2), now=NOW)
     assert [a.note_ids for a in actions_of(plan, ACTION_CONFLICT)] == [
@@ -383,11 +496,10 @@ def test_max_merges_and_conflicts_caps(tmp_path: Path) -> None:
         ["N-0001", "N-0003"],
     ]
 
-    plan = plan_consolidation(store, ConsolidationSettings(max_merges=2), now=NOW)
-    assert [a.note_ids for a in actions_of(plan, ACTION_MERGE)] == [
-        ["N-0001", "N-0002"],
-        ["N-0001", "N-0003"],
-    ]
+    plan = plan_consolidation(store, ConsolidationSettings(max_merges=1), now=NOW)
+    # 默认 max_conflict_pairs 下 6 个 GLM 对全部判 conflicting → 全部排除出 merge，
+    # 只剩两个纯 merge 族 → max_merges=1 截断取前 1（按 note_ids 字典序）
+    assert [a.note_ids for a in actions_of(plan, ACTION_MERGE)] == [["N-0005", "N-0006"]]
 
 
 # ---- ⑦ dry-run 零变异 / ⑧ 可复算 --------------------------------------------
@@ -420,7 +532,8 @@ def test_same_state_produces_byte_identical_plan(tmp_path: Path) -> None:
     text_first = json.dumps(first.to_dict(), ensure_ascii=False, sort_keys=True)
     text_second = json.dumps(second.to_dict(), ensure_ascii=False, sort_keys=True)
     assert text_first == text_second
-    assert len(first.actions) == 6  # 2 merge + 1 conflict + 1 refresh + 2 rejudge
+    assert len(first.actions) == 5  # 1 merge + 1 conflict + 1 refresh + 2 rejudge
+    # （闸 #4：N-0003/N-0004 冲突对不再产 merge 候选）
     # 动作排序 (action, note_ids) 字典序
     keys = [(a.action, tuple(a.note_ids)) for a in first.actions]
     assert keys == sorted(keys)
@@ -624,7 +737,7 @@ def test_plan_format_text(tmp_path: Path) -> None:
     plan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
     text = plan.format_text(root=str(store.root))
     assert "consolidation dry-run" in text
-    assert "扫描 7 条" in text and "候选 6 个" in text
+    assert "扫描 7 条" in text and "候选 5 个" in text
     for action in plan.actions:
         assert action.reason in text
 

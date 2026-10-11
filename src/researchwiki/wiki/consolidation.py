@@ -15,11 +15,18 @@
    正文——0.31 < 0.5 新地板，该形态不再自动 merge。
    上界 ``MERGE_MAX_SIMILARITY = 0.95``：≥0.95 属近乎重复带（[wiki].dedup 与
    formation.near_duplicate 的辖区），consolidation 只兜"相关但表述不同"的漏网对。
+   **conflict 相交排除（终审后修复波·发现 1 / 闸 #4）**：与 conflict 候选相同的
+   笔记对（同 note_ids 集合，无论顺序）不产 merge 候选——同一对同时命中两条规则
+   时只走 conflict（PLAN.md §3.5 退出条件"conflict 不能被自动 merge 掉"：conflict
+   是保守动作、开台账待人工，merge 是内容合并；台账开着笔记却被自动合并等于绕闸）。
 2. **refresh**：freshness 三态 ∈ {review_due, stale} 且 ≥1 个来源 URL 的笔记
    → 重抓候选（payload 记 url/urls）；**无来源的 review_due/stale 笔记改派
    rejudge**（无从重抓，只能重判）。
 3. **rejudge**：confidence=="low" 的 active 笔记 ∪（无来源且 review_due/stale，
-   来自规则 2 改派）；payload 记执行器（T3）要用的模型档位。
+   来自规则 2 改派）；payload 记执行器（T3）要用的模型档位。已带 confirm 收敛
+   标记（``extra[REJUDGE_VERDICT_KEY] == "confirm"``，T3 执行器 confirm 时落盘的
+   审计事实）的笔记不再进入本规则（终审后修复波·发现 2：重跑收敛，不重复烧模型
+   调用）；supersede 的笔记 status 已变，自然离开候选池。
 4. **conflict**：同实体 knowledge 笔记对过 verification 比较（respect
    similarity_floor；实体护栏是全局前置——同实体预筛之后护栏不会触发，保留它
    是双保险），verdict=="conflicting" → 开台账候选，payload 记双方断言槽位。
@@ -108,6 +115,16 @@ DEFAULT_MAX_PER_CLASS = 10
 # rejudge 动作默认的模型档位（payload 记录，T3 执行器按此调用）：与笔记蒸馏同档
 # 的成本口径——重判的是单条笔记的 confidence，不是整轮综述。
 REJUDGE_TIER = "cheap"
+
+# rejudge 收敛标记（终审后修复波·发现 2）：T3 执行器 confirm 时落进笔记 extra 的
+# 审计标记——"这条笔记已由模型复核并确认"。选择器的 rejudge 规则据此排除（见
+# _refresh_and_rejudge_candidates），否则 confidence=low 恒触发，每轮维护重复烧一次
+# 模型调用（真实压测实锤：N-0005 confirm 后 J-0014 → J-0029 反复 rejudge）。
+# supersede 的笔记 status 已变（离开 active 池），自然不会再入选，无需标记。
+# 诚实原则：标记不伪造 confidence——confidence 原样保留，标记只是审计事实。
+REJUDGE_VERDICT_KEY = "rejudge_verdict"
+REJUDGED_AT_KEY = "rejudged_at"
+REJUDGE_VERDICT_CONFIRM = "confirm"
 
 # created 缺失/不可解析时的排序哨兵：视为最晚，canonical 让给有时间基准的笔记
 _LATEST = datetime.max.replace(tzinfo=UTC)
@@ -400,8 +417,10 @@ def _merge_and_conflict_candidates(
 ) -> list[PlannedAction]:
     """同实体 knowledge 笔记对上的两类候选（一次配对枚举，两族规则共用）。
 
-    - merge：verification 尺度相似度 ∈ [merge_floor, 0.95)（便宜，全量算）；
-    - conflict：完整 verification 比较（贵，只扫前 max_conflict_pairs 对）。
+    - conflict：完整 verification 比较（贵，只扫前 max_conflict_pairs 对）——
+      **先判 conflict**：merge 候选要据此排除冲突对（闸 #4，见下方注释）；
+    - merge：verification 尺度相似度 ∈ [merge_floor, 0.95)（便宜，全量算），但
+      与 conflict 候选相同的笔记对（同 note_ids 集合，无论顺序）一律排除。
     配对顺序 = 笔记按 ID 升序的两两组合（确定性，防组合爆炸的截断因此可复算）。
     """
     knowledge = [note for note in pool if note.kind == "knowledge"]
@@ -412,14 +431,8 @@ def _merge_and_conflict_candidates(
         if shared:
             pairs.append((left, right, shared))
 
-    merges: list[PlannedAction] = []
-    for left, right, shared in pairs:
-        similarity = token_similarity(left.body, right.body, settings=settings.verification)
-        if settings.merge_min_similarity <= similarity < MERGE_MAX_SIMILARITY:
-            merges.append(_merge_action(left, right, shared, similarity, settings, body_hashes))
-    merges.sort(key=lambda item: (tuple(item.note_ids), item.idempotency_key))
-
     conflicts: list[PlannedAction] = []
+    conflict_pair_ids: set[frozenset[str]] = set()
     # 实体护栏（verification 全局前置）在此不会触发：预筛保证两侧实体相交；
     # 保留比较器内部的护栏是双保险（不绕过、不重写判定）。
     for left, right, _shared in pairs[: settings.max_conflict_pairs]:
@@ -430,8 +443,30 @@ def _merge_and_conflict_candidates(
         )
         if comparison.verdict != VERDICT_CONFLICTING:
             continue
+        conflict_pair_ids.add(frozenset((left.id, right.id)))
         conflicts.append(_conflict_action(left, right, comparison, body_hashes))
     conflicts.sort(key=lambda item: (tuple(item.note_ids), item.idempotency_key))
+
+    merges: list[PlannedAction] = []
+    for left, right, shared in pairs:
+        # 闸 #4（PLAN.md §3.5 退出条件"conflict 不能被自动 merge 掉"）：conflict 是
+        # 保守动作（开台账待人工），merge 是内容合并——同一对笔记同时命中两条规则
+        # 时**只走 conflict**：与 conflict 候选相同的笔记对（同 note_ids 集合，无论
+        # 顺序）一律排除出 merge 候选。真实压测实锤：N-0032/N-0033（sim 0.8546 +
+        # 实体相交）第一轮 conflict 台账已开（C-0010..12），该对因 max_merges 截断
+        # 未进第一轮 merge，第二轮重扫描时升入 merge 候选被自动合并（J-0024 done）
+        # ——台账还开着，笔记却被合并，退出条件被绕过。
+        # 排除发生在**规则层**（比较器判 conflicting 即记入排除集），不受
+        # max_conflicts 批量截断影响：本轮被截断的对既不开台账也不被 merge，留给
+        # 下一轮台账槽位，绝不因"台账名额用完"漏进 merge 轨道。max_conflict_pairs
+        # 扫描上限之外的对未经比较、无冲突判定，不在此列（扫描上限是既定的防组合
+        # 爆炸成本界）。
+        if frozenset((left.id, right.id)) in conflict_pair_ids:
+            continue
+        similarity = token_similarity(left.body, right.body, settings=settings.verification)
+        if settings.merge_min_similarity <= similarity < MERGE_MAX_SIMILARITY:
+            merges.append(_merge_action(left, right, shared, similarity, settings, body_hashes))
+    merges.sort(key=lambda item: (tuple(item.note_ids), item.idempotency_key))
     return [*merges[: settings.max_merges], *conflicts[: settings.max_conflicts]]
 
 
@@ -515,12 +550,25 @@ def _refresh_and_rejudge_candidates(
     - review_due/stale 且 ≥1 个来源 URL → refresh（payload 记 url/urls）；
     - review_due/stale 但无来源 → 改派 rejudge（规则 2 的显式改派）；
     - confidence=="low" → rejudge（规则 3 第一析取支，与 freshness 无关）。
-    同一笔记同时命中 rejudge 的两个来源时只出**一条**动作（∪ 语义），触发原因
-    依触发顺序拼接。refresh 按 note_ids 排序后取前 max_refresh 条；rejudge 按
-    note_ids 排序后取前 max_rejudge 条。
+    带 confirm 收敛标记（``extra[REJUDGE_VERDICT_KEY] == "confirm"``，T3 执行器
+    confirm 时落盘的审计事实）的笔记不产 rejudge 候选——重跑收敛（终审后修复波·
+    发现 2）。同一笔记同时命中 rejudge 的两个来源时只出**一条**动作（∪ 语义），
+    触发原因依触发顺序拼接。refresh 按 note_ids 排序后取前 max_refresh 条；
+    rejudge 按 note_ids 排序后取前 max_rejudge 条。
     """
     refreshes: list[PlannedAction] = []
     rejudge_triggers: dict[str, list[str]] = {}
+    # rejudge 收敛标记（终审后修复波·发现 2）：带 confirm 标记的笔记排除出 rejudge
+    # 规则的**任何**触发分支（confidence=low 与无来源改派都是）——否则 confidence=low
+    # 恒触发，每轮维护重复烧一次模型调用（真实压测实锤：N-0005 confirm 后 J-0014 →
+    # J-0029 反复 rejudge）。标记是"已由模型复核并确认"的审计事实，不伪造 confidence；
+    # 人工要再次重判时清掉 extra 里的标记即可。supersede 的笔记 status 已变（离开
+    # active 池），自然不会再入选，无需标记。
+    rejudge_blocked = {
+        note.id
+        for note in pool
+        if note.meta.extra.get(REJUDGE_VERDICT_KEY) == REJUDGE_VERDICT_CONFIRM
+    }
     for note in pool:
         state = evaluate_freshness(note, now=moment, settings=settings.freshness)
         due = state.state in (FRESHNESS_REVIEW_DUE, FRESHNESS_STALE)
@@ -555,7 +603,9 @@ def _refresh_and_rejudge_candidates(
             )
 
     rejudges: list[PlannedAction] = []
-    for note_id in sorted(rejudge_triggers)[: settings.max_rejudge]:
+    # 先按收敛标记过滤、再取前 max_rejudge 条（被标记占位的笔记不挤占批量名额）
+    eligible = [note_id for note_id in sorted(rejudge_triggers) if note_id not in rejudge_blocked]
+    for note_id in eligible[: settings.max_rejudge]:
         payload = {"tier": REJUDGE_TIER}
         note_ids = [note_id]
         reason = (
@@ -584,7 +634,10 @@ __all__ = [
     "DEFAULT_MAX_PER_CLASS",
     "DEFAULT_REJUDGE_STALE_RATIO",
     "MERGE_MAX_SIMILARITY",
+    "REJUDGED_AT_KEY",
     "REJUDGE_TIER",
+    "REJUDGE_VERDICT_CONFIRM",
+    "REJUDGE_VERDICT_KEY",
     "ConsolidationPlan",
     "ConsolidationSettings",
     "PlannedAction",

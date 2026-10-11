@@ -20,12 +20,14 @@ conflict 四类 ``PlannedAction``），带进程内 job queue：每个动作一�
   （快照版本化是 fetch_url 的内部事务，执行器不自写 sources/）；抓取异常 → job
   failed、原笔记零改动。``fetcher`` 注入缺省用真 ``fetch_url``（测试注入 fake）。
 - **rejudge**：cheap 档模型判定（单条 user 消息 + 严格 JSON 输出解析，允许字段
-  恰好为 {verdict, reason}，超字段即畸形）——confirm → 刷新 reviewed_at；
-  supersede → 原笔记置 superseded（理由记 ``supersede_reason``，不删除历史、不创建
-  替代笔记）；JSON 畸形 → job failed、原笔记零改动。token 记账：provider 回了
-  usage 就如实计入 tokens_in/tokens_out，没回就记 0 并在 result 注明来源
-  （诚实计量）；调用本身的幂等由 ReplayProvider 的请求哈希覆盖，job 记 model 与
-  idempotency_key 留痕。
+  恰好为 {verdict, reason}，超字段即畸形）——confirm → 刷新 reviewed_at 并落
+  收敛标记（``extra[rejudge_verdict]="confirm"`` + ``rejudged_at``，与 T2 选择器
+  共享常量：重跑 plan 不再产该笔记的 rejudge 候选，不收敛会每轮维护重复烧一次
+  模型调用——真实压测实锤 J-0014 → J-0029）；supersede → 原笔记置 superseded
+  （理由记 ``supersede_reason``，不删除历史、不创建替代笔记）；JSON 畸形 → job
+  failed、原笔记零改动。token 记账：provider 回了 usage 就如实计入 tokens_in/
+  tokens_out，没回就记 0 并在 result 注明来源（诚实计量）；调用本身的幂等由
+  ReplayProvider 的请求哈希覆盖，job 记 model 与 idempotency_key 留痕。
 - **conflict**：把 T16 已判定的冲突候选落成台账（``store.save_conflict``），claim
   内容取 payload 的断言槽位——**绝不重新构造带来源/时间的比较**（判定方向是
   T16 选择器的承重裁定，执行器照单开台账），两笔记均保持 active，绝不自动 merge。
@@ -62,6 +64,9 @@ from researchwiki.wiki.consolidation import (
     ACTION_REFRESH,
     ACTION_REJUDGE,
     REJUDGE_TIER,
+    REJUDGE_VERDICT_CONFIRM,
+    REJUDGE_VERDICT_KEY,
+    REJUDGED_AT_KEY,
 )
 from researchwiki.wiki.entities import slugify
 from researchwiki.wiki.frontmatter import SourceRef
@@ -532,9 +537,11 @@ class MaintenanceRunner:
     ) -> dict[str, Any]:
         """cheap 档模型重判：严格 JSON 输出（{verdict, reason}），畸形即 failed。
 
-        confirm → 刷新 reviewed_at；supersede → 原笔记置 superseded（理由记
-        supersede_reason，不删除历史、不创建替代笔记）。token 用量如实记账：
-        provider 回了 usage 记实际值，没回记 0 并在 result 注明来源。
+        confirm → 刷新 reviewed_at 并落收敛标记（rejudge_verdict/rejudged_at 进
+        extra——"已由模型复核并确认"的审计事实，T2 选择器据此排除，重跑收敛）；
+        supersede → 原笔记置 superseded（理由记 supersede_reason，不删除历史、不创建
+        替代笔记）。token 用量如实记账：provider 回了 usage 记实际值，没回记 0 并在
+        result 注明来源。
         """
         if not note_ids:
             raise ValueError("rejudge 动作缺少 note_ids")
@@ -563,7 +570,24 @@ class MaintenanceRunner:
 
         stamp = _now_iso()
         if verdict == "confirm":
-            self.store.save_meta(note.meta.replace(reviewed_at=stamp), note.body)
+            # 终审后修复波·发现 2：confirm 落收敛标记（rejudge_verdict/rejudged_at，
+            # 常量与 T2 选择器共享）——"已由模型复核并确认"的审计事实，T2 的 rejudge
+            # 规则据此排除，重跑 plan 不再产生该笔记的候选（否则 confidence=low 恒
+            # 触发，每轮维护重复烧一次模型调用）。诚实原则：标记不伪造 confidence，
+            # confidence 原样保留。必须走 save_meta 完整传参（meta.replace 未点名的
+            # 字段逐字段保留）——save_note 的参数默认值会静默丢字段（store docstring
+            # 有警告）。
+            self.store.save_meta(
+                note.meta.replace(
+                    reviewed_at=stamp,
+                    extra={
+                        **note.meta.extra,
+                        REJUDGE_VERDICT_KEY: REJUDGE_VERDICT_CONFIRM,
+                        REJUDGED_AT_KEY: stamp,
+                    },
+                ),
+                note.body,
+            )
         else:  # supersede：与 mcp_server._mark_superseded 同形态，只多 reason 两个 extra 槽
             self.store.save_meta(
                 note.meta.replace(

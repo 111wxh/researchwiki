@@ -7,8 +7,10 @@
 ② refresh：Mock fetcher 返回相同内容 → 仅 reviewed_at 变、无新快照；返回不同内容 →
    新证据笔记（kind=knowledge、带来源）+ 旧快照文件仍在 + mark_source_changed 留痕；
    fetcher 抛异常 → job failed、原笔记 body/frontmatter 逐字节不变；
-③ rejudge：合法 confirm / supersede JSON 两条路径；畸形 JSON / 超字段 → failed +
-   原笔记逐字节不变；usage 记进 job（无 usage 记 0 并在 result 注明来源——诚实计量）；
+③ rejudge：合法 confirm / supersede JSON 两条路径；confirm 落收敛标记
+   （rejudge_verdict/rejudged_at 进 extra，重跑 plan 不再产 rejudge 候选——终审后
+   修复波·发现 2）；畸形 JSON / 超字段 → failed + 原笔记逐字节不变；usage 记进
+   job（无 usage 记 0 并在 result 注明来源——诚实计量）；
 ④ 幂等：同 plan 跑两遍，第二遍全 skipped、笔记数/快照数/台账数不增（第二遍只追加
    skipped 行），模型零重复调用（零重复 token 记账）；
 ⑤ retry（仅 failed 可重试，重试成功 attempt+1）、skip（含 reason 留痕，仅
@@ -379,6 +381,41 @@ def test_rejudge_confirm_refreshes_reviewed_at(tmp_path: Path) -> None:
     assert note.body == "低置信断言待复核。"  # 正文不动
 
 
+def test_rejudge_confirm_writes_marker_and_replan_converges(tmp_path: Path) -> None:
+    """终审后修复波·发现 2：confirm 在 extra 落收敛标记（save_meta 完整传参），
+    重跑 plan 不再产生该笔记的 rejudge 候选、模型零重复调用。
+
+    没有标记时 confidence=low 恒触发——每轮维护重复烧一次真实模型调用（实锤：
+    N-0005 第一次 confirm 后 J-0014，第二次 --run 又 J-0029）。诚实原则：标记是
+    "已由模型复核并确认"的审计事实，confidence 原样保留、不伪造。
+    """
+    store = rejudge_store(tmp_path)
+    provider = MockProvider(
+        '{"verdict": "confirm", "reason": "复核后仍然成立"}',
+        tier="cheap",
+        model="mock-cheap",
+        usage=TokenUsage(input_tokens=5, output_tokens=3),
+    )
+    runner = make_runner(store, provider=provider)
+    record = runner.run(single_action_plan(store, ACTION_REJUDGE))[0]
+    assert record.status == "done" and record.result["verdict"] == "confirm"
+
+    # 标记落盘（读取断言）：审计字段在 extra，confidence 不被伪造
+    note = store.get_note("N-0001")
+    assert note.meta.extra["rejudge_verdict"] == "confirm"
+    assert note.meta.extra["rejudged_at"]
+    assert note.meta.confidence == "low"  # 不伪造 confidence
+    assert note.meta.status == "active" and note.meta.reviewed_at is not None
+    assert note.body == "低置信断言待复核。"  # 正文不动
+
+    # 重跑 plan：该笔记不再产 rejudge 候选 → 零重复模型调用（收敛）
+    replan = plan_consolidation(store, ConsolidationSettings(), now=NOW)
+    assert actions_of(replan, ACTION_REJUDGE) == []
+    calls_after_first = len(provider.calls)
+    assert runner.run(replan) == []
+    assert len(provider.calls) == calls_after_first
+
+
 def test_rejudge_supersede_marks_without_replacement(tmp_path: Path) -> None:
     """③合法 supersede JSON → 原笔记置 superseded（带理由、不删历史、不建替代笔记）。"""
     store = rejudge_store(tmp_path)
@@ -667,7 +704,13 @@ def test_jsonl_survives_power_cut_mid_append(tmp_path: Path) -> None:
         provider=MockProvider('{"verdict": "confirm", "reason": "ok"}', tier="cheap"),
     )
     (runner.ledger_path.parent).mkdir(parents=True, exist_ok=True)
-    first = runner.run(single_action_plan(store, ACTION_REJUDGE))
+    # 同一 plan 对象重放两遍：confirm 落收敛标记后（终审后修复波·发现 2），
+    # 重算的 plan 不再含该笔记的 rejudge 候选（状态级收敛，已由
+    # test_rejudge_confirm_writes_marker_and_replan_converges 锁定）；本测试锁的是
+    # 账本行为，confirm 不改正文 → 幂等键不变 → 第二遍走 skipped 追加路径，与
+    # 旧行为逐字节一致。
+    plan = single_action_plan(store, ACTION_REJUDGE)
+    first = runner.run(plan)
     assert len(first) == 1
 
     # 模拟断电：追加动作在行中途被杀（尾行残缺、无换行符）
@@ -683,7 +726,7 @@ def test_jsonl_survives_power_cut_mid_append(tmp_path: Path) -> None:
     assert [r.job_id for r in runner.list_jobs()] == [first[0].job_id]
 
     # 断电恢复后继续执行：新记录补换行后追加，不与截断行粘连
-    second = runner.run(single_action_plan(store, ACTION_REJUDGE))
+    second = runner.run(plan)
     assert second[0].job_id == "J-0002"  # 编号只认可解析记录，不被坏尾行带偏
     records = runner.list_jobs()
     assert [r.job_id for r in records] == [first[0].job_id, "J-0002"]
