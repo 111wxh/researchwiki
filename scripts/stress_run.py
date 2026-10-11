@@ -79,10 +79,12 @@ real          config.toml 全量接线（llm / search / embedding / wiki / prior
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import tomllib
@@ -260,14 +262,11 @@ def build_mock_stack() -> StressStack:
                 _text_turn(f"- 任务一：围绕「{question}」检索资料\n- 任务二：蒸馏原子笔记\n"),
                 _tool_turn([
                     _call("web_search", {"query": question}, call_id="stress-s1"),
+                    # 单次 fetch 即可：正常路径下快照已由 _warm_mock_snapshot 校验
+                    # 落地，本抓取走"目录已存在即跳过"的纯计算分支，零磁盘写。
+                    # 写失败场景下重试抓取也无济于事——半成品目录（有目录无
+                    # content.md）会让重试拿到假成功，真正的防线在预热校验。
                     _call("fetch_url", {"url": MOCK_FETCH_URL}, call_id="stress-f1"),
-                    # 同回合二次 fetch：mock 快照写盘偶发撞上 Windows 文件竞争
-                    # （Defender/索引器瞬时 PermissionError）——工具异常被
-                    # registry.dispatch 折算成 error JSON、run 照常 done，但来源池
-                    # 里该 URL 只剩搜索命中（无 content_hash），蒸馏笔记引用它即成
-                    # 悬空证据、闸 5 误报。二次 fetch（快照 append-only，同目录已
-                    # 存在即跳过）把瞬时抖动挡掉，压测证据只反映真实链路行为。
-                    _call("fetch_url", {"url": MOCK_FETCH_URL}, call_id="stress-f2"),
                 ]),
                 _text_turn("已检索并阅读来源，信息足够，研究结束。"),
                 _text_turn(f"## 研究报告\n\n关于「{question}」的核心结论见正文与笔记[1]。\n"),
@@ -316,40 +315,85 @@ def build_mock_stack() -> StressStack:
     )
 
 
+def _mock_url_key(sources_root: Path, url: str) -> Path:
+    """mock 抓取 URL 的快照一级目录：sources/{sha1(url)}/（与 tools.fetch 布局对齐）。"""
+    return sources_root / hashlib.sha1(url.encode("utf-8")).hexdigest()
+
+
+def _purge_half_made_snapshot_dirs(sources_root: Path, url: str) -> int:
+    """删除 {sha1(url)}/ 下缺 content.md 的半成品快照目录，返回删除数。
+
+    背景（评审 C1 复现的毒化链）：atomic_write_text 先 mkdir 后写文件——写失败
+    （如 Defender 瞬时锁打断了 os.replace）会留下"有目录、无 content.md"的半成品；
+    _save_snapshot 的跳过判据只看**目录**存在，于是此后每次抓取都直接 return
+    （带 content_hash 假成功），笔记引用哈希但正文永远缺失 → 悬空证据 → 闸 5
+    误报。删除半成品不破坏 append-only 语义：合法快照目录必含 content.md
+    （_save_snapshot 先写 content.md、后写 meta.json），缺 content.md 的目录
+    只可能是写失败残留、且按现有跳过判据永远不会被补写——删掉让重试完整重建
+    （目录内至多为空；meta.json 晚于 content.md 写出，顺序上不会单独残留，
+    防御性容忍其存在）。
+    """
+    url_key = _mock_url_key(sources_root, url)
+    if not url_key.is_dir():
+        return 0
+    purged = 0
+    for subdir in sorted(url_key.iterdir()):
+        if subdir.is_dir() and not (subdir / "content.md").is_file():
+            shutil.rmtree(subdir, ignore_errors=True)
+            purged += 1
+    return purged
+
+
 def _warm_mock_snapshot(wiki_root: Path, stack: StressStack) -> None:
     """预热 mock 抓取的来源快照（脚本启动时写一次，之后每问的抓取零磁盘写）。
 
     为什么需要：mock 剧本里唯一的**工具内**磁盘写是 fetch_url 的快照落盘——
-    registry.dispatch 把工具异常折算成 error JSON（run 照常 done），而来源池里
-    该 URL 已有搜索命中（无 content_hash），蒸馏笔记引用它就成了悬空证据，闸 5
-    会因 Windows 文件竞争（Defender/索引器对新建文件的瞬时锁）误报。预热把
-    sources/{sha1(url)}/{content_hash}/ 目录先建好，_save_snapshot 见目录已存在
-    即跳过写盘（append-only 语义），每问抓取只剩纯内存计算——悬空证据从机制上
-    不可能被写入抖动制造。
+    registry.dispatch 把工具异常折算成 error JSON（run 照常 done），来源池里该
+    URL 已有搜索命中（无 content_hash），蒸馏笔记引用它即成悬空证据；而写失败
+    留下的半成品目录更会经"目录存在即跳过"判据变成永久毒化（见
+    _purge_half_made_snapshot_dirs 的背景说明）。预热把
+    sources/{sha1(url)}/{content_hash}/ **连同 content.md** 先建好并校验落地，
+    之后 _save_snapshot 见目录已存在即跳过写盘（append-only 语义），每问抓取
+    只剩纯内存计算——悬空证据从机制上不可能被写入抖动制造。
 
-    预热重试 3 次（0.2s 间隔，针对上述瞬时锁）：预热失败时逐问抓取退回原路径
-    （仍带同回合二次 fetch 兜底），只记 stderr 不中断——预热是稳健性优化，不是
-    前置条件。
+    成功判据是**文件已落地**（sources/{sha1}/{hash}/content.md is_file），不是
+    "fetch_url 不抛异常"——后者在半成品目录存在时会假成功（跳过判据不看文件）。
+    每次尝试前先清半成品目录再抓取；重试 3 次（0.2s 间隔，针对瞬时文件锁）。
+    预热最终失败只记 stderr 不中断——逐问抓取退回原路径（抓取失败如实降级为
+    error JSON），预热是稳健性优化，不是前置条件。
     """
     import time as _time
 
+    sources_root = wiki_root / "sources"
     last_error: Exception | None = None
     for _attempt in range(1, 4):
+        _purge_half_made_snapshot_dirs(sources_root, MOCK_FETCH_URL)
         try:
-            fetch_url(
+            result = fetch_url(
                 MOCK_FETCH_URL,
-                sources_dir=wiki_root / "sources",
+                sources_dir=sources_root,
                 transport=stack.fetch_transport,
             )
-            return  # 成功：快照目录已就绪
         except Exception as exc:  # noqa: BLE001 -- 瞬时文件锁重试，见上
             last_error = exc
             _time.sleep(0.2)
+            continue
+        if _mock_url_key_hash_file(sources_root, result.content_hash).is_file():
+            return  # 成功判据：快照正文真正落地
+        # fetch_url"成功"但正文缺失 = 半成品目录骗过了跳过判据（评审 C1 链），
+        # 记为失败、下一轮清理后重写
+        last_error = RuntimeError(f"预热快照未落地：{_mock_url_key(sources_root, MOCK_FETCH_URL)}")
+        _time.sleep(0.2)
     print(
-        f"[warm ] mock 快照预热 3 次均失败（逐问抓取将走原路径 + 二次 fetch 兜底）："
+        f"[warm ] mock 快照预热 3 次均未确认落地（逐问抓取将走原路径）："
         f"{type(last_error).__name__}: {last_error}",
         file=sys.stderr,
     )
+
+
+def _mock_url_key_hash_file(sources_root: Path, content_hash: str) -> Path:
+    """预热成功判据的落点：sources/{sha1(mock url)}/{content_hash}/content.md。"""
+    return _mock_url_key(sources_root, MOCK_FETCH_URL) / content_hash / "content.md"
 
 
 def load_config() -> dict[str, Any]:

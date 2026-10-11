@@ -13,6 +13,8 @@
    MockSearch + MockTransport，零网络零 key）、questions.jsonl 真实落盘且 tokens
    与 tokens.jsonl 按 trace 复算一致（诚实计量）、lint 快照真拍且不恶化闸通过、
    退出码 0；汇总写明 cache 命中率未报告（九闸第 9 条）。
+⑥ C1 回归：半成品快照目录（有目录无 content.md——评审注入 os.replace
+   PermissionError 的等效终态）不再毒化不恶化闸，预热必须校验落地并自愈。
 
 超时注入用假时钟 + 慢 provider（现有测试惯例），全程零真实 sleep、零网络。
 """
@@ -24,6 +26,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 
 from researchwiki.llm.accounting import TokenAccountant
@@ -31,9 +34,9 @@ from researchwiki.llm.provider import ScriptedProvider, StreamEvent
 from researchwiki.loop.agent_loop import AgentLoop
 from researchwiki.loop.metrics import sum_tokens_from_jsonl
 from researchwiki.loop.watchdog import RunWatchdog, WatchdogPaused, WatchdogSettings
-from researchwiki.tools import MockSearch
+from researchwiki.tools import MockSearch, fetch_url
 from researchwiki.wiki.embeddings import MockEmbeddingProvider
-from researchwiki.wiki.store import WikiStore
+from researchwiki.wiki.store import WikiStore, source_snapshot_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -369,6 +372,55 @@ def test_stress_run_mock_fast_path(tmp_path: Path, capsys: pytest.CaptureFixture
     assert summary["cache_hit_rate"] == "未报告：provider 无 cache 字段"
     stdout_text = capsys.readouterr().out
     assert "未报告" in stdout_text and "cache" in stdout_text
+
+
+def test_warmup_purges_half_made_snapshot_dir(tmp_path: Path) -> None:
+    """C1 回归（评审受控实验的确定性复现）：半成品快照目录不再毒化不恶化闸。
+
+    毒化链：atomic_write_text 先 mkdir 后写文件——写失败（评审注入的 os.replace
+    PermissionError，模拟 Defender 瞬时锁）留下"有目录、无 content.md"的半成品；
+    _save_snapshot 的跳过判据只看目录存在 → 此后每次抓取带 hash 假成功 → 笔记
+    引用哈希但正文缺失 → 悬空证据 → 闸 5 误报。本测试构造完全相同的毒化态
+    （真哈希目录 + 删掉 content.md），预热必须识别"文件未落地"→ 清理半成品 →
+    重写 → 校验落地，fast path 恢复确定性绿。
+    """
+    root = tmp_path / "stress-root"
+    out_dir = tmp_path / "stress-out"
+    sources_root = root / "sources"
+
+    # 先真抓一次拿到真实 content_hash，再删掉正文、保留目录——即评审注入
+    # os.replace PermissionError 后的磁盘状态
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, html=stress.MOCK_FETCH_HTML)
+    )
+    result = fetch_url(stress.MOCK_FETCH_URL, sources_dir=sources_root, transport=transport)
+    content_md = source_snapshot_path(sources_root, stress.MOCK_FETCH_URL, result.content_hash)
+    assert content_md.is_file()
+    content_md.unlink()
+    assert not content_md.is_file()
+
+    rc = stress.main(
+        [
+            "--questions",
+            "3",
+            "--provider",
+            "mock",
+            "--root",
+            str(root),
+            "--out",
+            str(out_dir),
+        ]
+    )
+
+    # 预热清理半成品并重写：快照正文回到盘上，闸不被毒化
+    assert rc == 0
+    assert content_md.is_file()
+    final = json.loads((out_dir / "lint-final.json").read_text(encoding="utf-8"))
+    assert stress.gate_counts(final) == {
+        "broken_links": 0,
+        "orphan_notes": 0,
+        "dangling_evidence": 0,
+    }
 
 
 def test_stress_run_requires_questions_or_duration(tmp_path: Path) -> None:
