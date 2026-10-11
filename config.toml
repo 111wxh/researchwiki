@@ -44,7 +44,8 @@ base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "RESEARCHWIKI_JUDGE_API_KEY"
 
 [runtime]
-# 上下文超过窗口该比例触发 compaction（阶段 3）
+# 旧键：compaction_threshold 已迁往 [context]（P4b T6）；此处保留为**回退读取**
+# （[context] 段缺该键时生效，两处都没有用默认 0.7），老配置不必立即迁移。
 compaction_threshold = 0.7
 
 [embedding]
@@ -233,3 +234,27 @@ max_conflicts = 10
 # 用户可查看（--jobs）、重试（--retry，仅 failed）、跳过（--skip）。
 enabled = true
 # rejudge_model_tier = "cheap"   # rejudge 用的模型档（默认 cheap）
+
+[context]
+# 上下文预算（P4b 支撑设施 T6：估算 + 稳定前缀 + 滚动压缩）：长程运行（连续
+# 问题流）下主循环 history 无界增长会撑爆模型窗口——每次 observe 后、下一次
+# 模型调用前对 history 做**确定性字符估算**（CJK 1 token/字、其余 1 token/4
+# 字符；估算非计量，计量只来自 provider usage，见 llm/accounting.py）。估算 ≥
+# compaction_threshold × max_context_tokens 时，把旧轮次压缩成一条「研究进展
+# 摘要」消息（cheap 档模型生成，带【研究进展摘要·已压缩 N 轮】标记前缀，诚实
+# 呈现不伪装原文），保留最近 keep_recent_turns 轮原文与计划里的未解决任务清单
+# （原文）。压缩事件追加 run_dir/compactions.jsonl
+# （index/at/pre_tokens/post_tokens/kept_turns/summary_chars，失败加 status），
+# 不改 run-metrics 14 字段契约。稳定前缀不变量：system prompt 与工具 schema
+# 顺序在 run 内固定，护栏/冲突/Prior/工具结果/摘要一律属动态后缀区。
+# enabled = false 是逃生阀：永不压缩、零估算零留痕；段缺失 = 不接线 = 同样零行为。
+enabled = true
+# 上下文窗口上限（token）：按主力模型窗口配置（glm-4.5-air 为 128K）
+max_context_tokens = 131072
+# 触发比例：估算达到窗口的该比例即压缩。迁移说明：本键新家在 [context]；
+# 旧键 [runtime].compaction_threshold 保留为回退读取（[context] 缺该键时生效），
+# 两处都没有用默认 0.7——老配置可继续只用 [runtime]，新配置以本段为准。
+compaction_threshold = 0.7
+# 压缩时保留的最近轮次数（一轮 = 一条 assistant 消息及其工具结果，整轮保留
+# 保证 OpenAI 协议的 tool_calls → tool 配对不被切断）
+keep_recent_turns = 4

@@ -58,6 +58,20 @@ policy.json（features/reasons/outcome）与 state.md 的 retrieval 行，再按
 约束本轮研究（prior k/max_chars 覆盖、fresh 搜索帽、子代理门、生效步数、报告
 样式）。显式传入 ``[retrieval]`` 段才启用（server 通路），``enabled = false`` 是
 逃生阀（评测基线）；未配置（None）时模式概念不存在，行为逐字节与接入前一致。
+
+上下文预算与滚动压缩（P4b 支撑设施 T6）：act 循环每次 observe（工具结果入史）
+之后、下一次模型调用之前，把 history 交给 loop/compaction.maybe_compact 做
+确定性 token 估算（llm/accounting.py 的 estimate_*，**估算非计量**——估算值不进
+tokens.jsonl、不覆盖 run-metrics 任何字段）；估算达到
+``[context].compaction_threshold × max_context_tokens`` 时把旧轮次压缩成一条
+「研究进展摘要」消息（cheap 档模型生成、带标记前缀诚实呈现），保留最近
+``[context].keep_recent_turns`` 轮原文与计划里的未解决任务清单。压缩事件追加
+run_dir/compactions.jsonl（与 T17 jobs.jsonl 同一套追加+断电容错手法）。
+显式传入 ``[context]`` 段才启用（server 通路），``enabled = false`` 是逃生阀；
+未配置（None）时不估算不压缩零留痕，行为逐字段与接入前一致。稳定前缀不变量：
+system prompt 与工具 schema 顺序在 run 内固定（前缀区），护栏/冲突/Prior/
+工具结果/压缩摘要一律属动态后缀区（见 _events 装配处与 build_registry 的注释，
+tests/test_compaction.py 固化）。
 """
 
 from __future__ import annotations
@@ -73,6 +87,12 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from researchwiki.llm.accounting import TokenAccountant
 from researchwiki.llm.provider import Message, Provider, TokenUsage, chunk_text
+from researchwiki.loop.compaction import (
+    COMPACTION_SYSTEM,
+    context_settings_from_config,
+    maybe_compact,
+    record_compaction_event,
+)
 from researchwiki.loop.metrics import (
     RunMetrics,
     compute_citation_coverage,
@@ -572,6 +592,7 @@ class AgentLoop:
         memory_update_config: Mapping[str, Any] | None = None,
         verification_config: Mapping[str, Any] | None = None,
         unanswered_config: Mapping[str, Any] | None = None,
+        context_config: Mapping[str, Any] | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -599,6 +620,11 @@ class AgentLoop:
             fetch_transport=fetch_transport,
             max_fetch_chars=max_fetch_chars,
         )
+        # 稳定前缀区（P4b T6）：工具注册顺序即模型可见的 schema 顺序，run 内固定
+        # ——此处 build_registry 的注册次序与 _register_research_tools 的书写次序
+        # 一一对应，不可重排；唯一合法的整体重建点在 P3 模式判定
+        # （_rebuild_registries_for_mode，run 开头一次性完成，之后不再变化）。
+        # 前缀稳定性由 tests/test_compaction.py 的两次构造逐字节比对固化。
         self.registry = build_registry(self.ctx)
         self.sub_registry = build_sub_registry(self.ctx)
         self.tools_schema = self.registry.schemas()
@@ -672,6 +698,16 @@ class AgentLoop:
         # 未接线（[unanswered] 段缺失 = 不接线）时恒 None——state.md 与 run 目录都
         # 不会出现相关内容，与 memory_update_report 同约定。
         self.unanswered_outcome: dict[str, Any] | None = None
+        # 上下文预算（P4b T6）：[context] 段（None = 段缺失 = 不接线 = 不估算不
+        # 压缩零留痕）；enabled=false 是逃生阀（永不压缩）。阈值解析含
+        # [runtime].compaction_threshold 迁移回退（见 loop/compaction.py 注释）。
+        self.context_settings = (
+            None if context_config is None else context_settings_from_config(context_config)
+        )
+        # 压缩留痕：run 内压缩序号（事件 index，1 起）与已写事件（供上层读取；
+        # 账本正文在 run_dir/compactions.jsonl，不进 run-metrics）
+        self.compaction_count = 0
+        self.compaction_events: list[dict[str, Any]] = []
 
     # ---- 基础设施 ----------------------------------------------------------
 
@@ -1134,9 +1170,15 @@ class AgentLoop:
         conflict_block = self._conflict_guard_block()
         prior_block = self.prior_context.format() if self.prior_context is not None else ""
         if guard_block or conflict_block or prior_block:
-            # 护栏块在最前、冲突块随后、Prior 块最后，都放在问题之前、带分隔线；
-            # Prior 自带"仅供核验"标签行。系统提示词一字不动——稳定 prompt 前缀是
-            # 阶段 3 的前提，护栏/冲突与 Prior 同属动态后缀区。
+            # 护栏块在最前、冲突块随后、Prior 块最后，都放在问题之前、带分隔线。
+            # 前缀/后缀分区不变量（P4b T6 稳定前缀，PLAN §3.5 支撑设施 3）：
+            #   前缀区 = system prompt（PLAN_SYSTEM / ACT_SYSTEM / report_system
+            #   模板）与工具 schema 顺序——构造时定死，run 内不随状态变化；
+            #   动态后缀区 = T15 未答护栏块 / T18 待解决冲突块 / Prior 块 /
+            #   研究问题 / 工具结果 / 压缩摘要消息（T6）——一切随 run 状态
+            #   变化的内容只进后缀区。
+            # 系统提示词一字不动——稳定 prompt 前缀是阶段 3 的前提，护栏/冲突
+            # 与 Prior 同属动态后缀区。
             plan_content = (
                 f"{guard_block}{conflict_block}{prior_block}\n---\n\n研究问题：{self.question}"
             )
@@ -1197,6 +1239,11 @@ class AgentLoop:
             if self.input_tokens >= self.token_budget:
                 forced = "token_budget"
                 break
+            # ---- 滚动压缩触发（P4b T6）：上一步 observe（工具结果入史）之后、
+            # 下一次模型调用之前，把 history 交给 maybe_compact 估算裁决。
+            # 位置在 events() 的 try 块内（T19 的 finally 收尾结构不受影响）；
+            # 未接线 / 逃生阀 / 估算未达阈值时零动作零留痕。
+            self._compact_history_guarded(history)
             steps_used += 1
             self.step_count = steps_used
             t0 = self.clock()
@@ -1422,6 +1469,59 @@ class AgentLoop:
         self._record_unanswered_guarded()
         self._write_state("done")
         yield {"type": "finish"}
+
+    # ---- 上下文预算与滚动压缩（P4b T6）-------------------------------------
+
+    def _compact_summarizer(self, messages: list[Message]) -> str:
+        """压缩摘要的模型调用包装（maybe_compact 的 summarizer 注入契约：
+        待压缩旧轮次消息列表 → 摘要文本）。
+
+        cheap 档优先、未配置复用 strong（``self.distill_provider``，即
+        pick_tier(llm_config, "cheap") 的口径，与蒸馏/子 agent 同一套档位选择；
+        router 仍是构造时注入的 TierRouter，契约是 [llm] 段——T17 修复后的口径）。
+        这是真实模型调用，走 _record 正常计量（step="compact"）——与触发用的
+        字符估算严格分账：估算不进 tokens.jsonl，计量不进 compactions.jsonl。
+        """
+        provider = self.distill_provider
+        t0 = self.clock()
+        parts: list[str] = []
+        usage: TokenUsage | None = None
+        for ev in provider.stream(messages, system=COMPACTION_SYSTEM, tools=None):
+            if ev.type == "text_delta":
+                parts.append(ev.delta)
+            elif ev.type == "usage" and ev.usage is not None:
+                usage = ev.usage
+        self._absorb_usage(usage)
+        self._record("compact", provider, usage, t0)
+        return "".join(parts)
+
+    def _compact_history_guarded(self, history: list[Message]) -> None:
+        """滚动压缩触发的守卫入口（同 run-metrics / 记忆更新的守卫约定）。
+
+        - [context] 段缺失（未接线）或 enabled=false（逃生阀）→ 直接返回：
+          不估算、不压缩、零留痕；
+        - 压缩触发或 summarizer 失败时追加 compactions.jsonl 事件（index 为 run
+          内压缩序号，1 起）；
+        - 任何失败（估算/压缩/写盘）都只记 stderr：压缩是辅助设施，不得让研究
+          循环在 act 步之间中断。
+        """
+        settings = self.context_settings
+        if settings is None or not settings.enabled:
+            return
+        try:
+            result = maybe_compact(history, settings, summarizer=self._compact_summarizer)
+            if result.compacted or result.status == "failed":
+                self.compaction_count += 1
+                event = record_compaction_event(
+                    self.run_dir, index=self.compaction_count, result=result
+                )
+                self.compaction_events.append(event)
+        except Exception as exc:  # noqa: BLE001 -- 压缩故障不能推翻研究循环
+            print(
+                f"[agent-loop] 上下文压缩失败（研究不受影响）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     # ---- 记忆更新（RQ2 闭环：新证据 vs 旧记忆）-----------------------------
 
