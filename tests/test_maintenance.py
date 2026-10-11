@@ -441,6 +441,26 @@ def test_rejudge_without_usage_records_zero_honestly(tmp_path: Path) -> None:
     assert record.result["tokens_source"] == "none_reported"
 
 
+def test_rejudge_failed_still_records_reported_usage(tmp_path: Path) -> None:
+    """I2 回归：输出畸形（正是会被反复 --retry 的场景）时，provider 已上报的
+    消耗也必须记进 failed job——用量落账先于输出解析（诚实计量）。"""
+    store = rejudge_store(tmp_path)
+    provider = MockProvider(
+        "这不是 JSON",  # 畸形输出 → 必 failed
+        tier="cheap",
+        model="mock-cheap",
+        usage=TokenUsage(input_tokens=33, output_tokens=7),  # 但消耗已真实发生
+    )
+    record = make_runner(store, provider=provider).run(
+        single_action_plan(store, ACTION_REJUDGE)
+    )[0]
+
+    assert record.status == "failed"
+    assert record.tokens_in == 33 and record.tokens_out == 7  # 上报值如实入账
+    assert record.model == "mock-cheap"
+    assert store.get_note("N-0001").meta.status == "active"  # 原笔记仍零改动
+
+
 # ---- ④ 幂等 ------------------------------------------------------------------
 
 
@@ -676,6 +696,43 @@ def test_jsonl_survives_power_cut_mid_append(tmp_path: Path) -> None:
     json.loads(lines_after[2])  # 断电后追加的新记录完整可解析
 
 
+def test_jsonl_survives_multibyte_truncation(tmp_path: Path) -> None:
+    """I1 回归：断电截断落在多字节字符中间 → 整本账本不得不可读。
+
+    账本行含中文（rejudge reason、--skip reason），真实断电可能把字节流截在
+    UTF-8 序列中间——整文件 decode 会抛 UnicodeDecodeError 让 run/list/retry/skip
+    全崩。读取侧必须按字节逐行 decode（坏行被 json.loads 拒绝），既有行照常可读。
+    """
+    store = rejudge_store(tmp_path)
+    provider = MockProvider("坏输出", tier="cheap")  # 先造一条 failed（可被 skip）
+    runner = make_runner(store, provider=provider)
+    first = runner.run(single_action_plan(store, ACTION_REJUDGE))
+    assert first[0].status == "failed"
+    runner.skip_job(first[0].job_id, "人工理由：保留原记忆")  # 第二行含中文 reason
+    ledger = runner.ledger_path
+    data = ledger.read_bytes()
+    lines = data.split(b"\n")
+    assert len(lines) >= 3 and lines[0] and lines[1]  # 两行完整记录 + 末尾空段
+
+    # 把文件截断到第二行某个多字节字符的字节中间（"保" = 3 字节 UTF-8）
+    marker = "保留原记忆".encode()  # 3 字节 UTF-8
+    cut = data.index(marker) + 1  # 只留该字符的首字节
+    assert cut > len(lines[0])  # 截断点在第二行内：第一行完好
+    ledger.write_bytes(data[:cut])
+
+    # 旧实现在此直接抛 UnicodeDecodeError；修复后既有行照常可读
+    records = runner.list_jobs()
+    assert [record.job_id for record in records] == [first[0].job_id]
+    assert records[0].status == "failed"  # 坏尾行被跳过，折叠回退到完好的第一行
+
+    # 断电恢复后仍可正常追加（换好 provider 重试 → done）
+    provider.script = ['{"verdict": "confirm", "reason": "ok"}']
+    second = runner.run(single_action_plan(store, ACTION_REJUDGE))
+    assert second[0].job_id == "J-0002"
+    assert second[0].status == "done"
+    assert [record.job_id for record in runner.list_jobs()] == ["J-0001", "J-0002"]
+
+
 # ---- 配置解析 ----------------------------------------------------------------
 
 
@@ -831,3 +888,76 @@ def test_cli_skip_requires_reason(tmp_path: Path, capsys, monkeypatch) -> None:
     assert cli.main(["consolidate", "--skip", job_id, "--root", str(store.root)]) == 1
     assert "reason" in capsys.readouterr().err
     assert (store.root / "maintenance" / "jobs.jsonl").read_bytes() == before
+
+
+# ---- 回归（评审 C1/I1/I2）----------------------------------------------------
+
+LLM_CHEAP_TOML = """\
+[llm.cheap]
+model = "glm-4.5-air"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "RESEARCHWIKI_CHEAP_API_KEY"
+"""
+
+
+class SpyRouter:
+    """替身 router：捕获 CLI 实际传入的 config，并回放脚本 provider（零网络）。"""
+
+    def __init__(self, config, captured: list) -> None:
+        captured.append(config)
+        self.provider = MockProvider(
+            '{"verdict": "confirm", "reason": "ok"}', tier="cheap", model="mock-cheap"
+        )
+
+    def get(self, tier: str):
+        return self.provider
+
+
+def test_cli_run_passes_llm_section_to_router(tmp_path: Path, capsys, monkeypatch) -> None:
+    """C1 回归：--run 必须把 [llm] 段（而非整个 config）传给 ModelRouter。
+
+    传整本 config 时 ModelRouter.get("cheap") 找不到档位 → 静默回退 MockProvider
+    （占位文案 → JSON 解析必失败 → 全部 failed 且报错误导排障）。与
+    server/main.py 的 `config.get("llm") or {}` 先例逐字对齐。
+    """
+    store = rejudge_store(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONSOLIDATION_TOML + MAINTENANCE_TOML + LLM_CHEAP_TOML)
+    monkeypatch.setattr(cli, "CONFIG_PATH", config_path)
+
+    import researchwiki.llm.router as router_module
+
+    captured: list = []
+    monkeypatch.setattr(router_module, "ModelRouter", lambda config: SpyRouter(config, captured))
+    assert cli.main(["consolidate", "--run", "--root", str(store.root)]) == 0
+
+    section = captured[0]
+    # 是 [llm] 段本身；整本 config 会带出 consolidation/maintenance
+    assert set(section) == {"cheap"}
+    assert section["cheap"]["base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+    # rejudge 走到了脚本 provider（若回退 Mock，占位文案解析必 failed）
+    record = MaintenanceRunner(
+        store, FakeRouter(MockProvider("", tier="cheap")), MaintenanceSettings()
+    ).list_jobs()[0]
+    assert record.status == "done" and record.result["verdict"] == "confirm"
+
+
+def test_cli_retry_passes_llm_section_to_router(tmp_path: Path, capsys, monkeypatch) -> None:
+    """C1 回归：--retry（--jobs/--skip 同分支）同样只传 [llm] 段给 ModelRouter。"""
+    store = rejudge_store(tmp_path)
+    job_id = seed_failed_rejudge_job(store)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONSOLIDATION_TOML + MAINTENANCE_TOML + LLM_CHEAP_TOML)
+    monkeypatch.setattr(cli, "CONFIG_PATH", config_path)
+
+    import researchwiki.llm.router as router_module
+
+    captured: list = []
+    monkeypatch.setattr(router_module, "ModelRouter", lambda config: SpyRouter(config, captured))
+    assert cli.main(["consolidate", "--retry", job_id, "--root", str(store.root)]) == 0
+
+    assert set(captured[0]) == {"cheap"}  # [llm] 段，而非整本 config
+    record = MaintenanceRunner(
+        store, FakeRouter(MockProvider("", tier="cheap")), MaintenanceSettings()
+    ).list_jobs(status="done")[0]
+    assert record.attempt == 2  # 重试成功（脚本 provider 判定 confirm）

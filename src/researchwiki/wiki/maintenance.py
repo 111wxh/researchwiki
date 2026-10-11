@@ -551,13 +551,15 @@ class MaintenanceRunner:
             elif event.type == "usage" and event.usage is not None:
                 usage = event.usage
         raw = "".join(text_parts)
-        verdict, reason = _parse_rejudge_output(raw)
+        # 用量落账先于输出解析：模型输出畸形（正是会被反复 --retry 的场景）时，
+        # provider 已上报的消耗也必须记进 job（failed 记录同样带 usage——诚实计量）
         if usage is not None:
             record.tokens_in = usage.input_tokens
             record.tokens_out = usage.output_tokens
             tokens_source = "provider_usage"
         else:
             tokens_source = "none_reported"  # 没有计量就记 0 并注明，不硬造
+        verdict, reason = _parse_rejudge_output(raw)
 
         stamp = _now_iso()
         if verdict == "confirm":
@@ -670,13 +672,17 @@ class MaintenanceRunner:
         """读取账本并按 job_id 折叠（同 job 多行取最后一行）。
 
         不可解析的行跳过——append-only 语义下只可能是断电截断的尾行，
-        既有记录不受影响。
+        既有记录不受影响。**按字节读、逐行 decode（errors="replace"）**：账本行
+        含中文（rejudge reason、--skip reason），真实断电可能把字节流截在 UTF-8
+        序列中间——整文件 decode 会在此时抛 UnicodeDecodeError 让
+        run / list_jobs / retry / skip 全崩（读取侧的承诺是"最多损坏最后一行"）；
+        替换后的坏行交由 json.loads 拒绝。
         """
         records: dict[str, JobRecord] = {}
         if not self.ledger_path.is_file():
             return records
-        for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for raw_line in self.ledger_path.read_bytes().split(b"\n"):
+            line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:

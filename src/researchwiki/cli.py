@@ -54,7 +54,11 @@ def _run_maintenance(store, config, consolidation_settings, *, as_json: bool) ->
         print("maintenance 已禁用（enabled=false）：维护执行零动作零留痕。")
         return 0
     plan = plan_consolidation(store, consolidation_settings)
-    runner = MaintenanceRunner(store, ModelRouter(config), maintenance)
+    # router 契约是 [llm] 段（server/main.py 同款先例）：传整本 config 会让
+    # get("cheap") 找不到档位、静默回退 MockProvider，真实配置下判定全 failed
+    runner = MaintenanceRunner(
+        store, ModelRouter(config.get("llm") or {}), maintenance
+    )
     records = runner.run(plan)
     counts: dict[str, int] = {}
     for record in records:
@@ -281,7 +285,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.jobs or args.retry or args.skip:
             runner = MaintenanceRunner(
                 store,
-                ModelRouter(config),
+                # router 契约是 [llm] 段（--run 同款）：传整本 config 会静默回退 Mock
+                ModelRouter(config.get("llm") or {}),
                 maintenance_settings(config) or MaintenanceSettings(),
             )
             if args.jobs:
