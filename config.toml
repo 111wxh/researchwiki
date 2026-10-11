@@ -209,3 +209,19 @@ enabled = true
 dry_run = false            # 影子模式：判定与留痕照跑，不写笔记、不注入护栏
 guard_similarity = 0.4     # 护栏触发的问题相似度（verification 尺度，校准项）
 guard_top_k = 2
+
+[consolidation]
+# 后台维护选择器（P4a）：扫描 active 记忆产出四类候选（merge/refresh/rejudge/
+# conflict）。纯选择零写盘；执行在 [maintenance]（consolidate --run）。
+# merge_floor 明文化（P2 移交裁定）：merge 是保守动作（双内容保留在规范 ID 下），
+# 独立下限 0.5，低于 supersede 门 0.6；supersede 门只约束覆盖类动作，merge 与
+# conflict 不受它约束（与 [verification] 注释一致）。0.6–0.8 灰区：相似度在该带
+# 内的新证据不 supersede（落 uncertain 人工看），但允许 merge（内容不丢）。
+enabled = true
+merge_min_similarity = 0.5
+rejudge_stale_ratio = 0.25   # 等于 [freshness].stale_ratio；超龄笔记派 rejudge
+max_conflict_pairs = 50
+max_merges = 10
+max_refresh = 10
+max_rejudge = 10
+max_conflicts = 10

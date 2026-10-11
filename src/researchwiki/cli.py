@@ -45,7 +45,29 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument(
         "--port", type=int, default=int(os.environ.get("RESEARCHWIKI_PORT", "8000"))
     )
-    sub.add_parser("consolidate", help="后台 consolidation：merge / refresh / conflict（阶段 3）")
+    consolidate_parser = sub.add_parser(
+        "consolidate",
+        help="后台 consolidation：merge / refresh / rejudge / conflict 候选选择（P4a）",
+    )
+    consolidate_parser.add_argument(
+        "--root",
+        default=os.environ.get("RESEARCHWIKI_WIKI_DATA", "wiki-data"),
+        help="wiki 数据目录（默认 wiki-data，可用 RESEARCHWIKI_WIKI_DATA 覆盖）",
+    )
+    consolidate_parser.add_argument(
+        "--json", action="store_true", help="输出 JSON（plan 的 dict 形态，便于 CI 消费）"
+    )
+    consolidate_run_group = consolidate_parser.add_mutually_exclusive_group()
+    consolidate_run_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只选择零写盘（默认行为；此参数仅为显式声明）",
+    )
+    consolidate_run_group.add_argument(
+        "--run",
+        action="store_true",
+        help="执行维护动作（执行器在 T3 接线；当前为桩）",
+    )
     lint_parser = sub.add_parser("lint", help="wiki 健康度检查（阶段 2）")
     lint_parser.add_argument(
         "--root",
@@ -86,6 +108,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.root:
             forwarded += ["--root", args.root]
         return mcp_main(forwarded)
+
+    if args.command == "consolidate":
+        # 延迟导入：consolidate 之外的命令不需要拉起 wiki 子系统
+        import json
+
+        from researchwiki.wiki.consolidation import consolidation_settings, plan_consolidation
+        from researchwiki.wiki.store import WikiStore
+
+        if args.run:
+            # T17 会接走执行器；当前保留桩语义（返回 1，零写盘）
+            print("执行器在 T3 接线：consolidate --run 尚未实现，本次未做任何事。", file=sys.stderr)
+            return 1
+        # 配置接线与 lint 同手法：load_config() 宽容读（缺失/损坏回退空配置），
+        # consolidation_settings 对缺 [consolidation] 段返回 None = 不接线。
+        settings = consolidation_settings(load_config())
+        if settings is None:
+            print(
+                "[consolidation] 段未配置（config.toml 缺段 = 不接线）："
+                "consolidate 不做任何事。",
+                file=sys.stderr,
+            )
+            return 1
+        # dry-run 是默认路径（--dry-run 仅为显式声明）：纯选择零写盘
+        plan = plan_consolidation(WikiStore(args.root), settings)
+        if args.json:
+            print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(plan.format_text(root=str(args.root)))
+        return 0
 
     if args.command == "lint":
         # 延迟导入：lint 之外的命令不需要拉起 wiki 子系统
