@@ -148,6 +148,8 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # [verification] 段是它的判定阈值（None = 模块默认值）
         memory_update_config=config.get("memory_update"),
         verification_config=config.get("verification"),
+        # [unanswered] 段（P4a 未答问题台账；None = 不接线：收尾零动作、Prior 零护栏）
+        unanswered_config=config.get("unanswered"),
         # [retrieval] 段（P3 模式判定；None = 不启用，行为同 P2）；
         # freshness_settings 用完整 config 解析（半衰期回退读 [wiki] 段，
         # 与 cli lint 同口径）

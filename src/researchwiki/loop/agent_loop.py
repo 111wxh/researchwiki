@@ -35,6 +35,17 @@ run-metrics 落盘前）把本轮蒸馏入库的候选当**新证据**，与 pla
 逃生阀、``dry_run = true`` 是影子模式；未配置（None）时整个阶段不执行，state.md
 与 run 目录逐字段与接入前一致。
 
+未答问题台账（P4a Task 15：反幻觉经验记忆）：紧邻记忆更新之后（同为收尾辅助
+产物，守卫入口失败只记 stderr），用确定性规则（零模型调用）判定本轮是否"没答
+上"——零产出 → no_notes；fresh 来源数低于当前模式 ``[retrieval.<mode>].
+min_fresh_sources``（mode 不可得按 deep 段）→ below_min_fresh。命中即写一条
+kind=experience 的高 importance 台账笔记（wiki/ledger.py，显式写入通道、不经
+formation，同 trace_id 幂等），结果落 run_dir/unanswered.json + state.md 一行；
+此后相似问题再到来时，plan 上下文在 Prior 块之前注入"不可编造"护栏（独立块，
+不占 [prior].top_k 配额）。显式传入 ``[unanswered]`` 段才启用（server 通路），
+``enabled = false`` 是逃生阀、``dry_run = true`` 是影子模式（不写笔记、不注入
+护栏）；未配置（None）时收尾零动作、Prior 零护栏。
+
 模式判定（P3 Dynamic Retrieval）：run 开始时先对同一 store/index 做零模型调用的
 探测检索，五因子特征 → 确定性模式判定（loop/research_policy.py）→ 留痕
 policy.json（features/reasons/outcome）与 state.md 的 retrieval 行，再按模式限额
@@ -554,6 +565,7 @@ class AgentLoop:
         formation_config: Mapping[str, Any] | None = None,
         memory_update_config: Mapping[str, Any] | None = None,
         verification_config: Mapping[str, Any] | None = None,
+        unanswered_config: Mapping[str, Any] | None = None,
         build_pages: bool = False,
     ) -> None:
         self.question = question
@@ -597,6 +609,10 @@ class AgentLoop:
         self.policy_settings = (
             None if retrieval_config is None else policy_settings_from_config(retrieval_config)
         )
+        # [retrieval] 段原样保存：模式不可得（段缺失 / enabled=false）时，
+        # below_min_fresh 判定按 deep 子段的 min_fresh_sources 兜底（见
+        # _min_fresh_sources）
+        self.retrieval_config = retrieval_config
         # freshness 判定参数（P3 特征采集用；None = 模块默认，由调用方显式传入）
         self.freshness_settings = freshness_settings
         # 模式判定结论（_events 开头填充；None = 未启用或未判定）与 run 起始时刻
@@ -614,6 +630,7 @@ class AgentLoop:
             formation_config=formation_config,
             memory_update_config=memory_update_config,
             verification_config=verification_config,
+            unanswered_config=unanswered_config,
         )
         self.build_pages = build_pages
         # 滚动状态（state.md 的数据源）
@@ -645,6 +662,10 @@ class AgentLoop:
         # 记忆更新（RQ2 闭环）的报告：阶段未启用时恒 None（state.md 与 run 目录
         # 都不会出现相关内容——未配置 = 逐字段零行为变化）
         self.memory_update_report: MemoryUpdateReport | None = None
+        # 未答问题台账（P4a Task 15）：run 收尾判定的结果（unanswered.json 的内容）。
+        # 未接线（[unanswered] 段缺失 = 不接线）时恒 None——state.md 与 run 目录都
+        # 不会出现相关内容，与 memory_update_report 同约定。
+        self.unanswered_outcome: dict[str, Any] | None = None
 
     # ---- 基础设施 ----------------------------------------------------------
 
@@ -657,6 +678,7 @@ class AgentLoop:
         formation_config: Mapping[str, Any] | None,
         memory_update_config: Mapping[str, Any] | None,
         verification_config: Mapping[str, Any] | None,
+        unanswered_config: Mapping[str, Any] | None,
     ) -> None:
         """装配 wiki 层：WikiStore / EntityRegistry / Ingestor / Distiller / Prior 索引。
 
@@ -669,6 +691,7 @@ class AgentLoop:
         from researchwiki.wiki.formation import FormationSettings, from_config
         from researchwiki.wiki.index import SearchIndex, wiki_settings
         from researchwiki.wiki.ingest import Ingestor, dedup_settings
+        from researchwiki.wiki.ledger import unanswered_settings
         from researchwiki.wiki.prior import prior_settings
         from researchwiki.wiki.store import WikiStore
         from researchwiki.wiki.verification import VerificationSettings
@@ -737,6 +760,13 @@ class AgentLoop:
         # judge 在本阶段**不注入**——run 收尾是确定性路径，零模型调用（judge 留给
         # 评测/交互式路径按需注入，见 wiki/verification.py 的 judge 约束）。
         self.verification_settings = VerificationSettings.from_config(verification_config)
+        # 未答问题台账（P4a Task 15）：与 formation / memory_update 同模式的保守默认
+        # ——None = 未配置（段缺失 = 不接线）时收尾零动作、Prior 零护栏。段内
+        # enabled=false 是逃生阀（完全禁用，零动作零留痕）；dry_run=true 是影子模式
+        # （判定与留痕照跑，不写台账笔记、不注入护栏）。
+        self.unanswered_settings = (
+            None if unanswered_config is None else unanswered_settings(unanswered_config)
+        )
 
     def _retrieve_priors(self) -> None:
         """run 开始前的 Prior 检索（PLAN §4.2）：索引新鲜检查（落后即 rebuild）→ 检索。
@@ -1033,6 +1063,8 @@ class AgentLoop:
         ]
         if self.memory_update_report is not None:
             lines.append(self._memory_update_state_line(self.memory_update_report))
+        if self.unanswered_outcome is not None:
+            lines.append(self._unanswered_state_line(self.unanswered_outcome))
         if self.forced_reason:
             lines.append(f"- 熔断：{self.forced_reason}")
         lines += ["", "## 关键发现", "", (digest[:400] or "（暂无）"), ""]
@@ -1064,14 +1096,17 @@ class AgentLoop:
 
         # ---- 阶段 0：Prior 检索（PLAN §4.2：plan 步骤之前，不污染来源池）----
         self._retrieve_priors()
-        plan_content = self.question
-        if self.prior_context is not None:
-            prior_block = self.prior_context.format()
-            if prior_block:
-                # Prior 块放在问题之前、带分隔线；自带"仅供核验"标签行。
-                # 系统提示词一字不动——稳定 prompt 前缀是阶段 3 的前提，
-                # Prior 属于动态后缀区。
-                plan_content = f"{prior_block}\n---\n\n研究问题：{self.question}"
+        # 未答问题护栏（P4a Task 15）：活跃台账里与当前问题相似的"已判证据不足"
+        # 条目，在 Prior 块之前以独立块注入（不占 [prior].top_k 配额）。
+        guard_block = self._unanswered_guard_block()
+        prior_block = self.prior_context.format() if self.prior_context is not None else ""
+        if guard_block or prior_block:
+            # 护栏块在最前、Prior 块随后，都放在问题之前、带分隔线；Prior 自带
+            # "仅供核验"标签行。系统提示词一字不动——稳定 prompt 前缀是阶段 3 的
+            # 前提，护栏与 Prior 同属动态后缀区。
+            plan_content = f"{guard_block}{prior_block}\n---\n\n研究问题：{self.question}"
+        else:
+            plan_content = self.question
         plan_messages = [Message(role="user", content=plan_content)]
 
         # ---- 阶段 1：规划（reasoning 流式转发，计划文本并入同一思考块）----
@@ -1345,6 +1380,11 @@ class AgentLoop:
         # 且在 _write_run_metrics（events() 的 try/finally）之前——state.md 的
         # 记忆更新行因此能带真实计数，而 run-metrics 的 14 字段契约不被触碰。
         self._apply_memory_updates_guarded()
+
+        # ---- 阶段 6：未答问题台账（P4a：反幻觉经验记忆，零模型调用）----
+        # 紧邻 _apply_memory_updates_guarded 之后（同为收尾辅助产物，失败只记
+        # stderr）；state.md 的台账行在下一次 _write_state("done") 里带上。
+        self._record_unanswered_guarded()
         self._write_state("done")
         yield {"type": "finish"}
 
@@ -1476,6 +1516,156 @@ class AgentLoop:
             self.run_dir / "memory-update.json",
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         )
+
+    # ---- 未答问题台账（P4a：反幻觉经验记忆，零模型调用）---------------------
+
+    def _unanswered_guard_block(self) -> str:
+        """plan 上下文的未答问题护栏块（Prior 块之前的独立块，不占 top_k 配额）。
+
+        - ``[unanswered]`` 段缺失（未接线）、enabled=false 或 dry_run（影子模式
+          不注入护栏）→ 空串；
+        - 匹配口径：活跃台账 × ``question_similarity`` ≥ ``guard_similarity``
+          （verification 尺度，维度随 [verification].similarity_dim——同一把尺），
+          最多 guard_top_k 条按相似度降序；
+        - 与 Prior 检索相互独立：[prior] 禁用（无索引）时护栏仍可注入——护栏
+          保护的是本轮报告写作，不依赖 Prior 检索通道。
+        """
+        settings = self.unanswered_settings
+        if settings is None or not settings.enabled or settings.dry_run:
+            return ""
+        from researchwiki.wiki.prior import (
+            format_unanswered_guards,
+            retrieve_unanswered_guards,
+        )
+
+        guards = retrieve_unanswered_guards(
+            self.question,
+            self.wiki_store,
+            guard_similarity=settings.guard_similarity,
+            top_k=settings.guard_top_k,
+            dim=self.verification_settings.similarity_dim,
+        )
+        return format_unanswered_guards(guards)
+
+    def _record_unanswered_guarded(self) -> None:
+        """未答问题台账的守卫入口（同记忆更新 / outcome 回填的守卫约定）。
+
+        台账是收尾期的辅助产物：报告已写盘，任何失败（判定/写盘/序列化）都只记
+        stderr——既不压过流中的原异常，也不让一次台账故障把已经完整的 run 打断
+        在 finish 之前。
+        """
+        try:
+            self._record_unanswered()
+        except Exception as exc:  # noqa: BLE001 -- 辅助产物失败不能推翻本次 run
+            print(
+                f"[agent-loop] 未答问题台账阶段失败（run 产物不受影响）："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _record_unanswered(self) -> None:
+        """run 收尾的确定性触发判定与台账写入（零模型调用）。
+
+        - ``[unanswered]`` 段缺失（None = 不接线）→ 整段不动（连 unanswered.json
+          都不写）；enabled=false 逃生阀同样零动作零留痕；
+        - 判定规则见 ``ledger.decide_unanswered_reason``：no_notes（零产出）与
+          below_min_fresh（fresh 来源低于当前模式 [retrieval.<mode>].
+          min_fresh_sources，mode 不可得时按 deep 段）；
+        - dry_run=true 影子模式：判定与留痕照跑（unanswered.json），但不写台账
+          笔记；正常路径写 kind=experience 台账（显式通道，不经 formation），
+          同 trace_id 幂等（同一 run 内同题只记一条）；
+        - 结果（含未触发的判定输入）落 run_dir/unanswered.json 并存
+          ``self.unanswered_outcome`` 供 state.md 一行。
+        """
+        settings = self.unanswered_settings
+        if settings is None or not settings.enabled:
+            return  # 段缺失 = 不接线；enabled=false 逃生阀 = 完全禁用
+        from researchwiki.wiki.ledger import decide_unanswered_reason, record_unanswered
+
+        fresh_source_count = len(self.ctx.source_pool.entries)
+        mode = self.policy_decision.mode if self.policy_decision is not None else None
+        min_fresh_sources = self._min_fresh_sources()
+        reason = decide_unanswered_reason(
+            notes_created=self.notes_created,
+            fresh_sources=fresh_source_count,
+            min_fresh_sources=min_fresh_sources,
+        )
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        note_id: str | None = None
+        if reason is not None and not settings.dry_run:
+            note = record_unanswered(
+                self.wiki_store,
+                question=self.question,
+                reason=reason,
+                trace_id=self.trace_id,
+                sources_used=fresh_source_count,
+                notes_created=self.notes_created,
+                asked_at=now,
+            )
+            note_id = note.id
+        payload = {
+            "trace_id": self.trace_id,
+            "now": now,
+            "enabled": settings.enabled,
+            "dry_run": settings.dry_run,
+            "question": self.question,
+            "mode": mode,
+            "min_fresh_sources": min_fresh_sources,
+            "fresh_source_count": fresh_source_count,
+            "notes_created": self.notes_created,
+            "reason": reason,
+            "recorded": note_id is not None,
+            "note_id": note_id,
+        }
+        self.unanswered_outcome = payload
+        atomic_write_text(
+            self.run_dir / "unanswered.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def _min_fresh_sources(self) -> int:
+        """below_min_fresh 判定的每模式下限。
+
+        模式可得（P3 判定存在）时取 ``policy_decision.limits.min_fresh_sources``
+        （即 [retrieval.<mode>].min_fresh_sources 经覆盖合并后的生效值）；mode
+        不可得（[retrieval] 缺失或 enabled=false）时按 deep 子段——段也缺失时用
+        模块默认 0（此时 below_min_fresh 恒不触发，只剩 no_notes 路径）。
+        """
+        decision = self.policy_decision
+        if decision is not None:
+            return max(0, int(decision.limits.min_fresh_sources))
+        deep = (
+            self.retrieval_config.get("deep")
+            if isinstance(self.retrieval_config, Mapping)
+            else None
+        )
+        if isinstance(deep, Mapping):
+            try:
+                return max(0, int(deep.get("min_fresh_sources") or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _unanswered_state_line(self, outcome: Mapping[str, Any]) -> str:
+        """state.md 的未答台账行（阶段未接线时这一行根本不出现）。
+
+        触发即写明原因与台账笔记 ID；dry_run 写明"未落盘"（影子模式没有台账
+        笔记，避免"已记录"被读成已写盘）；未触发也留一行判定输入，收尾判定
+        可复算。
+        """
+        reason = outcome.get("reason")
+        if reason is None:
+            return (
+                "- 未答问题台账：不触发（笔记 {notes} 条 · fresh 来源 {fresh} 个 · "
+                "模式下限 {min_fresh}）".format(
+                    notes=outcome.get("notes_created"),
+                    fresh=outcome.get("fresh_source_count"),
+                    min_fresh=outcome.get("min_fresh_sources"),
+                )
+            )
+        if outcome.get("dry_run"):
+            return f"- 未答问题台账：{reason}（dry-run，未落盘）"
+        return f"- 未答问题台账：{reason}（{outcome.get('note_id')}）"
 
     # ---- policy.json outcome 回填（P3：fresh 来源核验 + 诚实边界）-----------
 

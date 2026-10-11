@@ -196,3 +196,16 @@ max_steps = 12
 subagents = true
 report_style = "full"
 min_fresh_sources = 0
+
+[unanswered]
+# 未答问题台账（P4a 数据驱动首项，复用序列实验反幻觉证伪的回应）：run 收尾
+# 确定性判定（无模型调用）——notes_created==0 且无 fresh 来源 → no_notes；
+# fresh 来源数低于当前模式 min_fresh_sources → below_min_fresh。台账是
+# kind=experience 的高 importance 记忆，Prior 阶段对相似问题注入"不可编造"护栏。
+# 局限（诚实边界）：判定是确定性代理，"有部分证据但仍不足"的问题不在捕获范围
+# （序列实验 SEQ016 形态恰好落在 no_notes，但不是所有形态都如此）。
+# enabled=false 逃生阀；段缺失 = 不接线 = 收尾零动作、Prior 零护栏。
+enabled = true
+dry_run = false            # 影子模式：判定与留痕照跑，不写笔记、不注入护栏
+guard_similarity = 0.4     # 护栏触发的问题相似度（verification 尺度，校准项）
+guard_top_k = 2

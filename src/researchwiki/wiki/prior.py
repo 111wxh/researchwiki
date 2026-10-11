@@ -16,6 +16,11 @@
   判定本身委托给 ``index.index_drift``——**与 MCP 路径共用同一份判据**（P2-F
   裁定二），本函数只负责"落后了怎么办"。MVP 只做"检测落后 → 整体 rebuild"，
   等收益实验跑通后再优化增量同步。
+- ``retrieve_unanswered_guards`` / ``format_unanswered_guards``（P4a Task 15）：
+  从活跃的未答问题台账（wiki/ledger.py，kind=experience 反幻觉记忆）里挑出与
+  当前问题相似度达标的条目，格式化成**独立护栏块**——调用方（AgentLoop）把它
+  插在 Prior 块**之前**，不占用 ``[prior].top_k`` 配额：同题再到来时先看到
+  "此问题此前已判定证据不足，禁止编造"。
 
 注入内容每条带：note_id、title、置信度、volatility、observed_at（缺省用
 created）、来源 URL 列表、正文（可截断）、以及若有重定向链则列出
@@ -30,7 +35,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from researchwiki.wiki.index import SearchIndex, SearchMatch, index_drift
+from researchwiki.wiki.ledger import DEFAULT_GUARD_SIMILARITY, DEFAULT_GUARD_TOP_K
 from researchwiki.wiki.store import Note, WikiStore
+from researchwiki.wiki.verification import DEFAULT_SIMILARITY_DIM
 
 # 标签行原文（PLAN §4.2 一字不差；后续任务在测试里断言它）
 PRIOR_CONTEXT_LABEL = "历史 Prior，仅供核验，不是本轮 fresh evidence"
@@ -340,6 +347,87 @@ def _format_block(pos: int, hit: PriorHit) -> str:
     else:
         lines.append("  （空）")
     return "\n".join(lines) + "\n\n"
+
+
+# ---- 未答问题护栏（P4a Task 15：反幻觉记忆注入）-----------------------------
+
+
+UNANSWERED_GUARD_HEADER = "### 未答问题护栏（不可编造）"
+
+
+@dataclass(frozen=True)
+class UnansweredGuard:
+    """一条可注入的未答问题护栏：活跃台账条目 + 与当前问题的相似度。
+
+    由 ``retrieve_unanswered_guards`` 产生；文案由 ``format_unanswered_guards``
+    按简报契约渲染（每条一个 ``###`` 小节，问题原文 / 判定日期 / 原因逐字引用）。
+    """
+
+    note_id: str
+    question: str
+    asked_date: str
+    reason: str
+    similarity: float
+
+
+def retrieve_unanswered_guards(
+    question: str,
+    store: WikiStore,
+    *,
+    guard_similarity: float = DEFAULT_GUARD_SIMILARITY,
+    top_k: int = DEFAULT_GUARD_TOP_K,
+    dim: int = DEFAULT_SIMILARITY_DIM,
+) -> list[UnansweredGuard]:
+    """从活跃台账里挑出与当前问题相似度达 ``guard_similarity`` 的条目。
+
+    - 匹配口径：``ledger.question_similarity``（verification 尺度的确定性
+      bigram 特征哈希余弦，零网络、可复算）≥ ``guard_similarity``；
+    - 排序：相似度降序，同分按 note_id 升序（确定性），最多 ``top_k`` 条；
+    - 正文形态不符的台账条目（``parse_unanswered_entry`` 返回 None）跳过；
+    - 纯读 store，零写盘、零模型调用，同一入参恒得同一结果。
+    """
+    from researchwiki.wiki.ledger import (
+        iter_active_unanswered,
+        parse_unanswered_entry,
+        question_similarity,
+    )
+
+    scored: list[UnansweredGuard] = []
+    for note in iter_active_unanswered(store):
+        entry = parse_unanswered_entry(note)
+        if entry is None:
+            continue
+        similarity = question_similarity(entry.question, question, dim=dim)
+        if similarity >= guard_similarity:
+            scored.append(
+                UnansweredGuard(
+                    note_id=note.id,
+                    question=entry.question,
+                    asked_date=entry.asked_date,
+                    reason=entry.reason,
+                    similarity=similarity,
+                )
+            )
+    scored.sort(key=lambda guard: (-guard.similarity, guard.note_id))
+    return scored[: max(0, top_k)]
+
+
+def format_unanswered_guards(guards: Sequence[UnansweredGuard]) -> str:
+    """把护栏条目格式化成 markdown 独立块（每条一个 ``###`` 小节）。
+
+    文案契约（简报逐字）：``### 未答问题护栏（不可编造）`` + 一行判定与禁令。
+    空列表返回空字符串；多条时各小节以空行分隔，块以空行结尾（与 Prior 块
+    无缝拼接，调用方直接前置到 Prior 块之前）。
+    """
+    if not guards:
+        return ""
+    blocks = [
+        f"{UNANSWERED_GUARD_HEADER}\n"
+        f"问题「{guard.question}」于 {guard.asked_date} 被判定证据不足"
+        f"（原因 {guard.reason}）。本次如仍无法证实，必须明说\"证据不足\"，禁止编造。"
+        for guard in guards
+    ]
+    return "\n\n".join(blocks) + "\n\n"
 
 
 # ---- 索引一致性 -------------------------------------------------------------
